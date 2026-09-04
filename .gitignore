@@ -1,0 +1,120 @@
+# ===== Cursor / AI 工具本地配置 =====
+.cursor/
+AGENTS.md.local
+
+# ===== 环境变量与密钥 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# 类型检查 / lint 缓存
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ===== Node / 前端 =====
+node_modules/
+.pnp/
+.pnp.js
+.yarn/install-state.gz
+
+# 构建产物
+frontend/dist/
+frontend/build/
+frontend/.vite/
+*.local
+
+# openapi-typescript 自动生成的接口类型，不进 git，由 `npm run gen:api` 生成
+frontend/src/types/schema.d.ts
+
+# 日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# ===== OS =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ===== 项目相关 =====
+# 本地数据 / 上传文件 / 解析中间产物
+uploads/
+data/
+storage/local/
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志文件
+logs/
+*.log
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Alembic 本地配置（如有）
+alembic.ini.local

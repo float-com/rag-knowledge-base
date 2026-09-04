@@ -1,0 +1,28 @@
+services:
+  postgres:
+    # 选用集成 pgvector 向量扩展的 PostgreSQL 16 官方镜像
+    image: pgvector/pgvector:pg16
+    container_name: rag-kb-postgres
+    # 容器异常退出时自动重启（除非手动停止）
+    restart: unless-stopped
+    # 环境变量优先读取 .env 文件，未提供时使用 :- 后面的默认缺省值
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_kb}
+    # 端口映射：宿主机端口:容器内标准端口
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    # 数据卷持久化：防止容器销毁后数据库数据丢失
+    volumes:
+      - rag_kb_pgdata:/var/lib/postgresql/data
+    # 容器健康检查：每 5 秒检测一次数据库就绪状态
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag_kb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# 声明挂载的命名数据卷
+volumes:
+  rag_kb_pgdata:
