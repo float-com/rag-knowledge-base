@@ -88,6 +88,26 @@ class Settings(BaseSettings):
         """
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
+    # ===== 文本向量化配置（DashScope OpenAI 兼容协议） =====
+    # 阿里云百炼 API-Key，用于向量化接口鉴权
+    embedding_api_key: str = ""
+    # DashScope 提供的 OpenAI 兼容模式 API 基础请求路径
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 使用的文本向量化模型名称
+    embedding_model: str = "text-embedding-v3"
+    # 向量维度大小（注意：必须与 Alembic 迁移脚本中 Vector(N) 保持一致；改动此维度需重建表）
+    embedding_dim: int = 1024
+    # 单次请求批量向量化的最大文本切片数，避免超出模型单次请求上限
+    embedding_batch_size: int = 10
+
+    # ===== 文档上传与切分规则配置 =====
+    # 单个上传文档允许的最大文件大小（单位：MB）
+    upload_max_size_mb: int = 50
+    # 长文本拆分时的单个切片大小（字符数/Token数）
+    chunk_size: int = 600
+    # 相邻文本切片之间的重叠字符数，防止切分边界处截断关键语义
+    chunk_overlap: int = 60
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

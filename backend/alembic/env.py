@@ -13,6 +13,12 @@ from alembic import context
 from app.core.config import settings
 from app.db.base import Base
 
+# 显式导入数据模型模块，利用 Python 模块导入时的副作用（Side Effect）将 Document 与 DocumentChunk
+# 自动注册进 Base.metadata 元数据注册表，以便 Alembic 的 --autogenerate 能够比对并检测到新增的数据表结构。
+# 特殊标记 `# noqa: F401`（No Quality Assurance, 规则 F401: imported but unused）:
+# 指示代码静态检查工具（Flake8/Ruff/PyCharm）忽略“导入但未使用”警告，防止该行在代码格式化时被误删。
+from app.db import models  # noqa: F401
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
