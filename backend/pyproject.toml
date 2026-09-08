@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "langchain>=1.4.0",
     "langchain-core>=1.6.2",
+    "langchain-openai>=1.6.0",
     "langchain-text-splitters>=1.1.2",
     "pgvector>=0.5.0",
     "pydantic-settings>=2.15.0",
