@@ -165,20 +165,13 @@ async def ingest_document(document_id: UUID) -> None:
                 )
             )
 
-        # 4. 开启独立的数据库短事务会话，执行批量落盘
+        # 3. 开启独立的数据库短事务会话，执行批量落盘
         async with AsyncSessionLocal() as session:
             chunk_repo = DocumentChunkRepository(session)
             # 语法（仓储层批量持久化接口）：await chunk_repo.bulk_add(chunk_models)
             #   特性：一次性把装有所有切片实体的列表提交给仓储，内部执行 session.add_all()，杜绝在循环中逐条 INSERT 造成的网络往返浪费
             await chunk_repo.bulk_add(chunk_models)
             # 语法（事务落盘提交）：执行 SQL COMMIT 指令，将数据真正物理写入磁盘并持久化
-            await session.commit()
-
-        async with AsyncSessionLocal() as session:
-            chunk_repo = DocumentChunkRepository(session)
-            # 批量插入切片：调用仓储封装的 bulk_add 接口将切片数据批量推入数据库
-            await chunk_repo.bulk_add(chunk_models)
-            # 提交事务落盘：完成第二段短事务提交，物理持久化所有分块
             await session.commit()
 
         # ---------------------------------------------------------------------

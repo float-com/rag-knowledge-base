@@ -35,7 +35,7 @@ import {
   getStatusLabel,
   isTerminalStatus,
 } from '@/utils/documentStatus'
-import { useAuthStore } from '@/stores/authStore'
+//import { useAuthStore } from '@/stores/authStore'
 
 const { Title, Paragraph } = Typography
 
@@ -76,7 +76,8 @@ export function DocumentsPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [uploadOpen, setUploadOpen] = useState(false)
   const queryClient = useQueryClient()
-  const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
+  //const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
+  const isAdmin = true // 临时 Mock 管理员权限，放行页面管理功能，方便本地接口联调
 
   const listQuery = useQuery({
     queryKey: ['documents', page, pageSize, statusFilter],
@@ -162,7 +163,20 @@ export function DocumentsPage() {
       title: '权限标签',
       dataIndex: 'permission_tags',
       width: 200,
-      render: (tags: string[]) =>
+      // 原逻辑保留：后端完整返回 permission_tags 后可恢复
+      // render: (tags: string[]) =>
+      //   tags.length === 0 ? (
+      //     <Tag>公开</Tag>
+      //   ) : (
+      //     <Space size={4} wrap>
+      //       {tags.map((t) => (
+      //         <Tag color={t === "*" ? "gold" : "blue"} key={t}>
+      //           {t}
+      //         </Tag>
+      //       ))}
+      //     </Space>
+      //   ),
+      render: (tags: string[] = []) =>
         tags.length === 0 ? (
           <Tag>公开</Tag>
         ) : (

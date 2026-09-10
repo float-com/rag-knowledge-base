@@ -10,7 +10,7 @@ import {
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation } from 'react-router-dom'
 import { UserMenu } from '@/components/UserMenu'
-import { useAuthStore } from '@/stores/authStore'
+//import { useAuthStore } from '@/stores/authStore'
 
 const { Header, Sider, Content } = Layout
 
@@ -59,7 +59,8 @@ function resolveSelectedKey(pathname: string): string {
 export function BasicLayout() {
   const location = useLocation()
   const selectedKey = resolveSelectedKey(location.pathname)
-  const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
+  //const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
+  const isAdmin = true // 临时 Mock 管理员权限，放行页面管理功能，方便本地接口联调
 
   const menuItems = isAdmin
     ? [...baseMenuItems, ...adminMenuItems]
