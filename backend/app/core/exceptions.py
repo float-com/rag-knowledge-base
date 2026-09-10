@@ -72,3 +72,10 @@ class ConfigurationError(AppException):
     code = "configuration_error"
     message = "服务配置缺失"
     http_status = HTTPStatus.SERVICE_UNAVAILABLE
+
+class ValidationError(AppException):
+    """请求参数校验失败异常（对应 HTTP 400）。"""
+
+    code = "validation_error"
+    message = "参数校验失败"
+    http_status = HTTPStatus.BAD_REQUEST
