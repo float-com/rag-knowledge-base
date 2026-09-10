@@ -18,8 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 # 导入全局异常捕获注册函数（负责捕获代码里的 AppException 和系统崩溃）
 from app.api.error_handlers import register_error_handlers
 
-# 导入拆分好的各个业务路由模块（这里先导入系统健康检查路由）
-from app.api.routes import health
+# 语法（路由模块汇聚导入）：from app.api.routes import documents, health
+#   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 模块
+#   通俗来讲：把刚写好的文档业务接待员（documents）请到总服务台前报到。
+from app.api.routes import documents, health
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -73,6 +75,15 @@ def create_app() -> FastAPI:
     # - GET /api/health/cos
     # 方便后续统一规划版本号与反向代理（如 Nginx 将所有 /api/* 转发给后端）
     app.include_router(health.router, prefix="/api")
+
+    # 新增（业务路由级联挂载）：app.include_router(documents.router, prefix="/api")
+    #   特性：将 documents.router 动态接入主应用。
+    #   路径拼接公式：全局前缀 [/api] + 模块前缀 [/documents] + 接口子路径 [/{id} /file /chunks 等]
+    #   核心收益：
+    #     - 统一为接口加上版本/网关前缀 `/api`，方便 Nginx 反向代理与前后端分离部署；
+    #     - 自动向 Swagger UI (/docs) 与 Redoc (/redoc) 注入文档模块的 8 大标准接口定义。
+    #   通俗来讲：把文档接待窗口挂到总大厅的“/api”综合服务牌下，客人访问 /api/documents 就能办业务了。
+    app.include_router(documents.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)

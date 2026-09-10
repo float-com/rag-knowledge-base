@@ -1,14 +1,24 @@
 """
-【文档模型定义：Pydantic Schemas - 文档核心 DTO 层】
+【文档与切块模型定义：Pydantic Schemas - API 数据契约层 (DTO)】
 
 1. 核心定位：
-   定义文档主表对外暴露的数据传输对象（DTO），承担接口出入参序列化、字段数据脱敏与类型收敛。
+   统一管理文档主表（Document）与切块子表（DocumentChunk）对外暴露的数据传输对象，
+   承担接口入参安检拦截、ORM 实体脱敏映射、阶梯式性能优化与响应序列化。
 
-2. 关键设计亮点：
-   - Literal 联合字面量类型：通过 DocumentStatusValue 精确约束枚举值，
-     配合前端 openapi-typescript 工具可自动生成联合字面量类型，杜绝宽泛的 string 导致类型漂移；
-   - from_attributes 机制：开启 Pydantic V2 的 ORM 兼容开关，支持直接提取 SQLAlchemy 模型属性；
-   - 字段级安检与脱敏：仅暴露展示必需字段，屏蔽物理存储等底层敏感属性。
+2. 关键设计与安全防线：
+   - 强类型字面量约束：通过 DocumentStatusValue (Literal) 精确约束 5 态生命周期，
+     驱动前端代码生成工具产出强类型联合守卫，彻底杜绝字符串拼写漂移；
+   - 字段级脱敏隔离：通过 from_attributes=True 建立白名单输出通道，
+     主文档彻底抹除 cos_bucket 等物理存储配置，切块层坚决屏蔽高维 Embedding 向量；
+   - 阶梯式性能防爆：切块列表（DocumentChunkRead）强制执行 100 字符文本截断与省略号拼接，
+     防范超长文本打爆网络带宽与前端 DOM；全量正文严格收敛至单切块详情（DocumentChunkDetail）；
+   - 动态派生与指标聚合：利用 @classmethod 自定义转换工厂，在内存中安全派生 char_count；
+     结合 DocumentChunkStats 交付切块总数与长度分布指标，直观透传分块质量。
+
+通俗来讲：
+这是整个文档与切片模块的“出海海关条例与数据规格说明书”——
+它死死把控前端能看什么、不能看什么：翻页查切片时只放行前 100 字摘要，查详情才放行全文，
+并且把底层的腾讯云路径、高维向量全扣留在后方，既保性能又防泄密。
 """
 
 from datetime import datetime
