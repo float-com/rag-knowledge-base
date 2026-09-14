@@ -72,6 +72,120 @@ class DocumentStatus(str, Enum):
     FAILED = "failed"
 
 
+class UploadSessionStatus(str, Enum):
+    """浏览器直传会话生命周期状态。
+
+    【状态说明】：
+    - INITIATED：后端已签发 URL，等待浏览器 PUT；
+    - UPLOADED：预留状态，表示后续可在需要时记录 PUT 完成事件；
+    - FINALIZING：complete 已通过 COS 校验，后台正在哈希和建档；
+    - COMPLETED：后台 finalize 已完成；
+    - EXPIRED：超过预签名会话有效期；
+    - FAILED：后台 finalize 发生异常；
+    - ABORTED：用户主动取消或清理任务回收。
+    """
+
+    INITIATED = "initiated"
+    UPLOADED = "uploaded"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+    FAILED = "failed"
+    ABORTED = "aborted"
+
+
+class UploadSession(Base):
+    """记录 COS 预签名直传过程中的临时状态与文件元数据。
+
+    【模型职责】：
+    - 保存 init 阶段由后端确认的文件元数据；
+    - 保存一次性 Object Key 与 URL 有效期；
+    - 为 complete、后台 finalize、失败重试和过期清理提供状态依据。
+
+    【与 Document 的区别】：
+    UploadSession 是上传过程记录，Document 是上传成功且完成哈希确认后的业务实体。
+    只有 finalize 完成后才创建 Document，因此不会向 documents.file_hash 写入临时占位值。
+    """
+
+    __tablename__ = "upload_sessions"
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(PGUUID, primary_key=True, default=uuid4)
+    #   业务说明：每个直传会话的全局唯一身份证，同时作为临时 COS 路径的隔离命名空间
+    #   类型定义 (PGUUID(as_uuid=True))：使用 PostgreSQL 原生 UUID 数据类型，Python 侧绑定原生 uuid.UUID 对象
+    #   约束属性：primary_key=True 设置为物理主键，default=uuid4 在 Python 进程侧生成默认 UUIDv4
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(512), nullable=False, unique=True)
+    #   业务说明：COS 中的完整 Object Key 绝对路径，作为存储资源的物理引用锚点
+    #   约束属性：nullable=False 拒绝空值；unique=True 建立数据库唯一约束，物理级阻断多会话碰撞覆写同一个临时对象
+    object_key: Mapped[str] = mapped_column(
+        String(512), nullable=False, unique=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(512), nullable=False)
+    #   业务说明：用户上传时的原始文件名（已由 Service 剥离目录路径），用于前端展示及后续落库创建 Document 实体
+    #   约束属性：nullable=False 确保文件名必填，列宽 512 字符适配绝大多数长文件名场景
+    original_name: Mapped[str] = mapped_column(String(512), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(128), nullable=False)
+    #   业务说明：服务端白名单校准后的规范 MIME 类型，作为向 COS 签发 PUT 凭证与 HEAD 校验的强契约标准
+    #   约束属性：nullable=False，防范 Content-Type 为空的未定型多媒体资源进入系统
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(16), nullable=False)
+    #   业务说明：规整后统一小写的文件扩展名（如 .pdf、.docx），供下游文档切片、离线审计与解析引擎策略路由使用
+    #   约束属性：nullable=False，列宽 16 字符覆盖所有常见文件格式后缀
+    suffix: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(BigInteger, nullable=False)
+    #   业务说明：init 阶段由客户端预报声明、complete 阶段由云存储 HEAD 元数据反查校验的文件字节上限（Byte）
+    #   类型定义 (BigInteger)：使用 64 位大整数存储，支持大文件及超大模型权重文件的字节容量表达
+    expected_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：直传生命周期内暂存的细粒度数据权限与可见性标签集合；待落库 Document 时按需向下沉淀
+    #   类型定义 (JSONB)：采用 PostgreSQL 原生二进制 JSON 存储，支持后续基于 JSON 路径的高效 GIN 索引过滤
+    #   默认行为 (default=list)：在 Python 实体实例化时默认初始化为空列表引用
+    permission_tags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(32), default=UploadSessionStatus.INITIATED)
+    #   业务说明：标记当前直传会话的状态机节点（INITIATED / FINALIZING / COMPLETED / FAILED / ABORTED / EXPIRED）
+    #   设计权衡：使用字符串列（String(32)）而非 PostgreSQL 物理 ENUM 类型，便于后续平滑扩展状态且无需变更数据库 Schema
+    status: Mapped[UploadSessionStatus] = mapped_column(
+        String(32), nullable=False, default=UploadSessionStatus.INITIATED
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), nullable=False)
+    #   业务说明：会话操作截止时间戳（如签发后 5 分钟超时），用于定时任务清理孤儿文件及直传完工前置时效熔断
+    #   类型定义 (timezone=True)：启用带时区感知的 TIMESTAMPTZ 类型，统一以 UTC 基准时间落库
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), server_default=func.now())
+    #   业务说明：记录上传会话初始发起的创建时间戳，用于审计溯源与倒序查询
+    #   默认行为 (server_default=func.now())：由数据库端执行 NOW() 函数生成时间，避免应用层服务器时间漂移
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), nullable=True)
+    #   业务说明：直传及建档（或去重命中）彻底完工的终态时间戳，未完工前保持空值
+    #   类型定义 (nullable=True)：字段可为空，用于量化分析上传全流程的耗时性能指标
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=True)
+    #   业务说明：后台 finalize 任务或校验中断时捕获记录的错误摘要信息（截断上限通常为 2000 字符）
+    #   类型定义 (Text, nullable=True)：无固定长度上限的文本列，仅在会话遭遇 FAILED 时落库填入
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 # ==============================================================================
 # 2. Document 数据表 ORM 模型定义
 # ==============================================================================

@@ -31,6 +31,8 @@
 """
 
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
+from uuid import UUID
+from typing import Any
 
 from app.core.logging import get_logger
 from app.storage.cos_client import CosClient, get_cos_client
@@ -129,6 +131,69 @@ class FileService:
         )
 
         return key
+
+    # =========================================================================
+    # 4. 浏览器直传业务能力
+    # =========================================================================
+    # 这组方法只服务于“预签名 PUT + complete”新链路，旧的 upload() 方法继续服务
+    # multipart 上传。通过 FileService 统一屏蔽 CosClient 的具体 SDK 参数，避免路由层
+    # 直接依赖腾讯云 SDK。
+    async def create_presigned_upload(
+        self,
+        *,
+        upload_id: UUID,
+        filename: str,
+        mime_type: str,
+    ) -> tuple[str, str]:
+        """创建隔离的临时 Object Key 与浏览器直传预签名 URL。
+
+        【Object Key 设计】：
+        - upload_id 提供每次上传的唯一命名空间，避免并发同名覆盖；
+        - filename 只保留最后一段文件名，剥离路径分隔符，防止路径穿越；
+        - 原始文件名仍由 UploadSession 保存，供后续 Document 展示。
+        """
+        # 只允许文件名参与 Key 的最后一段，不能让客户端传入的目录改变 COS 路径。
+        safe_filename = filename.replace("\\", "/").rsplit("/", 1)[-1] or "upload"
+        key = f"document-uploads/{upload_id}/{safe_filename}"
+        # 预签名 URL 的 Content-Type 必须和浏览器 PUT 时发送的请求头保持一致。
+        url = await self._cos.generate_presigned_put_url(
+            key=key,
+            content_type=mime_type,
+        )
+        return key, url
+
+    async def verify_uploaded_object(
+        self,
+        *,
+        object_key: str,
+        expected_size: int,
+        expected_mime_type: str,
+    ) -> dict[str, Any]:
+        """读取并校验直传 Object 的大小与 MIME 元数据。
+
+        【防伪校验】：
+        1. expected_size 和 expected_mime_type 来自后端保存的 UploadSession；
+        2. 实际值来自 COS head_object，而不是再次信任 complete 请求体；
+        3. 校验失败时不进入 finalize，也不会创建 Document。
+        """
+        metadata = await self._cos.head_object(object_key)
+        # COS SDK 返回的 Content-Length 通常是字符串，统一转换为整数参与比较。
+        actual_size = int(metadata.get("Content-Length", -1))
+        # 某些服务端响应可能附带 charset，只比较媒体类型主体。
+        actual_mime_type = str(metadata.get("Content-Type", "")).split(";", 1)[0]
+        if actual_size != expected_size:
+            raise ValueError(
+                f"上传文件大小不匹配，预期 {expected_size}，实际 {actual_size}"
+            )
+        if actual_mime_type != expected_mime_type:
+            raise ValueError(
+                f"上传文件 MIME 不匹配，预期 {expected_mime_type}，实际 {actual_mime_type}"
+            )
+        return metadata
+
+    async def hash_object(self, object_key: str) -> str:
+        """委托 COS 客户端流式计算对象 SHA-256，供上传业务服务使用。"""
+        return await self._cos.hash_object(object_key)
 
     async def download(self, object_key: str) -> bytes:
         """读取指定 object_key 的全量二进制字节流。

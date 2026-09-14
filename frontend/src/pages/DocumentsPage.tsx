@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  Alert,
   Button,
   Form,
   Modal,
@@ -26,8 +27,8 @@ import {
   deleteDocument,
   listDocuments,
   retryDocument,
-  uploadDocument,
 } from '@/client/sdk.gen'
+import { uploadDocumentDirect } from '@/api/directDocumentUpload'
 import type { DocumentRead } from '@/client/types.gen'
 import { PermissionTagsField } from '@/components/PermissionTagsField'
 import {
@@ -75,6 +76,8 @@ export function DocumentsPage() {
   const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [uploadOpen, setUploadOpen] = useState(false)
+  // 上传失败原因：弹窗内持久展示，避免直传链路的原始错误被静默吞掉
+  const [uploadError, setUploadError] = useState<string | null>(null)
   const queryClient = useQueryClient()
   //const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
   const isAdmin = true // 临时 Mock 管理员权限，放行页面管理功能，方便本地接口联调
@@ -103,20 +106,31 @@ export function DocumentsPage() {
     queryClient.invalidateQueries({ queryKey: ['documents'] })
 
   const uploadMutation = useMutation({
-    mutationFn: async ({ file, tags }: { file: File; tags: string[] }) => {
-      const res = await uploadDocument({
-        body: {
-          file,
-          permission_tags: tags.length > 0 ? JSON.stringify(tags) : null,
-        },
-      })
-      return res.data!
+    mutationFn: ({ file, tags }: { file: File; tags: string[] }) =>
+      uploadDocumentDirect(file, tags),
+    onMutate: () => {
+      // 每次重新提交前先清掉上一次的失败提示
+      setUploadError(null)
     },
-    onSuccess: (doc) => {
-      message.success(`${doc.name} 已提交，后台处理中`)
+    onSuccess: (_, variables) => {
+      message.success(`${variables.file.name} 已上传，后台处理中`)
       invalidateList()
+      // 仅在成功时关闭弹窗：让后台任务继续跑，用户回到列表看进度。
+      // 失败时保持弹窗打开，把 Alert 里的失败原因留在屏幕上，而不是一闪而过。
+      setUploadOpen(false)
+    },
+    onError: (error: unknown) => {
+      // 直传链路有三种失败：init 接口报错、浏览器直传 COS 失败（含 CORS 预检被拒）、complete 接口报错。
+      // 原始错误来自原生 fetch，不走 client.ts 的响应拦截器，必须在这里兜住并写进 uploadError，
+      // 由弹窗内的 Alert 展示，否则用户只会看到"点了没反应"。
+      const detail =
+        error instanceof Error && error.message ? error.message : '未知错误'
+      setUploadError(detail)
     },
   })
+
+  // 旧 multipart 上传链路保留在后端，便于灰度回滚与兼容旧客户端。
+  // 原调用方式：uploadDocument({ body: { file, permission_tags } })
 
   const retryMutation = useMutation({
     mutationFn: async (id: string) => {
@@ -276,7 +290,10 @@ export function DocumentsPage() {
           <Button
             type="primary"
             icon={<InboxOutlined />}
-            onClick={() => setUploadOpen(true)}
+            onClick={() => {
+              setUploadError(null)
+              setUploadOpen(true)
+            }}
             loading={uploadMutation.isPending}
           >
             上传文档
@@ -320,6 +337,8 @@ export function DocumentsPage() {
       {isAdmin ? (
         <UploadModal
           open={uploadOpen}
+          loading={uploadMutation.isPending}
+          errorMessage={uploadError}
           onClose={() => setUploadOpen(false)}
           onUpload={(file, tags) => uploadMutation.mutate({ file, tags })}
         />
@@ -330,10 +349,14 @@ export function DocumentsPage() {
 
 function UploadModal({
   open,
+  loading,
+  errorMessage,
   onClose,
   onUpload,
 }: {
   open: boolean
+  loading: boolean
+  errorMessage: string | null
   onClose: () => void
   onUpload: (file: File, tags: string[]) => void
 }) {
@@ -355,8 +378,8 @@ function UploadModal({
         return
       }
       onUpload(file, values.permission_tags ?? [])
-      form.resetFields()
-      onClose()
+      // 这里不再关闭弹窗：由父组件在 Promise 落定后关闭。
+      // 提交期间保持弹窗打开并显示 confirmLoading，让用户看到上传正在进行；失败时弹窗内展示原因。
     } catch {
       // form 自身的校验错误会高亮，不需要 message
     }
@@ -371,8 +394,21 @@ function UploadModal({
         onClose()
       }}
       onOk={handleOk}
+      confirmLoading={loading}
+      maskClosable={!loading}
+      closable={!loading}
+      keyboard={!loading}
       destroyOnHidden
     >
+      {errorMessage ? (
+        <Alert
+          type="error"
+          showIcon
+          message="上传失败"
+          description={errorMessage}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
       <Form<UploadFormValues> form={form} layout="vertical">
         <Form.Item
           name="files"

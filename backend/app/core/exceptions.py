@@ -79,3 +79,15 @@ class ValidationError(AppException):
     code = "validation_error"
     message = "参数校验失败"
     http_status = HTTPStatus.BAD_REQUEST
+
+
+class ConflictError(AppException):
+    """资源状态冲突异常（对应 HTTP 409）。
+
+    主要用于重复 complete、会话过期、finalizing 中取消等“请求格式正确，
+    但当前资源生命周期不允许执行该动作”的场景。
+    """
+
+    code = "conflict"
+    message = "资源状态冲突"
+    http_status = HTTPStatus.CONFLICT

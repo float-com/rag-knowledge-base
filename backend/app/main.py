@@ -15,13 +15,23 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# =============================================================================
+# 第一步（必须最先执行）：注入 Hugging Face 运行环境变量
+# =============================================================================
+# huggingface_hub 在 import 阶段就会读取 HF_ENDPOINT / HF_HOME 并固化为模块常量，
+# 之后再设置无效。因此这里必须排在 langchain / docling 等任何可能间接引入
+# huggingface_hub 的导入之前 —— 哪怕只是把 import 语句挪到下面几行，都可能让镜像配置失效。
+from app.core.hf_env import setup_hf_environment
+
+setup_hf_environment()
+
 # 导入全局异常捕获注册函数（负责捕获代码里的 AppException 和系统崩溃）
 from app.api.error_handlers import register_error_handlers
 
 # 语法（路由模块汇聚导入）：from app.api.routes import documents, health
 #   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 模块
 #   通俗来讲：把刚写好的文档业务接待员（documents）请到总服务台前报到。
-from app.api.routes import documents, health
+from app.api.routes import document_uploads, documents, health
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -83,6 +93,9 @@ def create_app() -> FastAPI:
     #     - 统一为接口加上版本/网关前缀 `/api`，方便 Nginx 反向代理与前后端分离部署；
     #     - 自动向 Swagger UI (/docs) 与 Redoc (/redoc) 注入文档模块的 8 大标准接口定义。
     #   通俗来讲：把文档接待窗口挂到总大厅的“/api”综合服务牌下，客人访问 /api/documents 就能办业务了。
+    # 预签名上传路由必须先于 documents.router 注册，避免 /documents/{document_id}
+    # 抢先匹配 /documents/uploads/... 并把 uploads 误当成 UUID 参数。
+    app.include_router(document_uploads.router, prefix="/api")
     app.include_router(documents.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕

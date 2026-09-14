@@ -108,6 +108,24 @@ class Settings(BaseSettings):
     # 相邻文本切片之间的重叠字符数，防止切分边界处截断关键语义
     chunk_overlap: int = 60
 
+    # ===== Hugging Face 模型下载配置（供 Docling 解析 PDF 使用） =====
+    # 【重要】这些字段必须在 Settings 中显式声明：
+    #   model_config 里设了 extra="ignore"，未声明的键会被静默丢弃，
+    #   之前 .env 中的 HF_ENDPOINT 就是因此从未生效的。
+    # 字段名 hf_* 与别名 HF_* 的映射由 pydantic-settings 默认的大小写不敏感规则完成，
+    # 真正把它们写进 os.environ 的动作在 app/core/hf_env.py 中完成。
+    #
+    # 模型下载源：留空则使用 huggingface_hub 默认的官方地址。
+    # 国内网络直连 huggingface.co 会超时或 TLS 中断（SSLError / ConnectTimeout），
+    # 推荐配置为 https://hf-mirror.com。
+    hf_endpoint: str | None = None
+    # 模型缓存根目录：所有 Docling 权重统一落在项目自己的 models 目录下，
+    # 便于备份、迁移，以及在离线环境下复用（预热一次后可长期断网使用）。
+    hf_home: str = str(PROJECT_ROOT / "models")
+    # 是否强制离线：置 true 时 huggingface_hub 不再发起任何网络请求，
+    # 只从 hf_home 读取已预热好的模型。模型预热完成后建议开启。
+    hf_hub_offline: bool = False
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

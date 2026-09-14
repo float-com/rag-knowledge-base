@@ -24,6 +24,8 @@
 """
 
 import asyncio
+import hashlib
+from typing import Any
 
 from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
@@ -137,6 +139,82 @@ class CosClient:
             Body=body,
             ContentType=content_type,
         )
+
+    # ==========================================================================
+    # 3.1 浏览器直传辅助能力
+    # ==========================================================================
+    # 旧上传链路使用 put_object，由后端接收完整 bytes 后再转存 COS。
+    # 新上传链路只由后端生成临时签名，文件正文直接从浏览器发送至 COS。
+    # 以下方法继续遵循“同步 SDK 放入线程池”的统一异步桥接规范。
+    async def generate_presigned_put_url(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        expires: int = 300,
+    ) -> str:
+        """生成用于浏览器直传的临时 PUT 预签名 URL。
+
+        【签名头一致性】：
+        1. Content-Type 会参与签名计算；
+        2. 浏览器实际 PUT 时必须发送同一个 Content-Type；
+        3. 签名请求头不一致时，COS 会判定签名无效。
+
+        【安全边界】：URL 只具备指定 Key 的 PUT 能力，并通过 Expired 限制有效时间，
+        不向前端暴露 SecretId 或 SecretKey。
+        """
+        return await asyncio.to_thread(
+            self._client.get_presigned_url,
+            Method="PUT",
+            Bucket=self._bucket,
+            Key=key,
+            Expired=expires,
+            Headers={"Content-Type": content_type},
+        )
+
+    async def head_object(self, key: str) -> dict[str, Any]:
+        """读取指定 Object 的元数据，不下载文件正文。
+
+        complete 接口不能仅依据前端传来的“上传成功”判断文件是否完整，
+        因此必须从 COS 服务端读取 Content-Length 和 Content-Type 做第二次校验。
+        """
+        return await asyncio.to_thread(
+            self._client.head_object,
+            Bucket=self._bucket,
+            Key=key,
+        )
+
+    async def hash_object(self, key: str) -> str:
+        """在线程池中分块读取 Object，并计算 SHA-256 摘要。
+
+        【实现机制】：
+        1. get_object 只负责取得远端响应流；
+        2. 每次读取 1 MB，避免为了计算哈希额外构造完整 bytes；
+        3. 所有同步网络读取和哈希计算都在工作线程完成；
+        4. finally 中关闭流，防止后台 finalize 长时间占用 COS 连接。
+
+        直传 init 阶段后端没有文件正文，因此在 complete 后的后台 finalize 阶段计算哈希，
+        继续兼容 documents.file_hash 唯一去重约束。
+        """
+        def _hash() -> str:
+            # 将建立远端响应、分块读取和流关闭封装在同一个同步闭包中，
+            # 确保底层 SDK 的阻塞 I/O 不回到 FastAPI 事件循环线程。
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            stream = response["Body"].get_raw_stream()
+            digest = hashlib.sha256()
+            try:
+                # 固定读取块大小，控制哈希阶段的峰值内存。
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            finally:
+                # 无论读取成功还是异常，都释放 COS 返回的底层流资源。
+                stream.close()
+            return digest.hexdigest()
+
+        return await asyncio.to_thread(_hash)
 
     async def get_object(self, key: str) -> bytes:
         """读取指定 object 的全部二进制字节流。

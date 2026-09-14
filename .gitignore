@@ -108,6 +108,9 @@ storage/local/
 *.sqlite
 *.sqlite3
 
+# Docling / Hugging Face 模型权重缓存（HF_HOME 指向此处，体积达数百 MB，禁止入库）
+models/
+
 # 日志文件
 logs/
 *.log
