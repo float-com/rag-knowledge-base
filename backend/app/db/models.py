@@ -509,3 +509,274 @@ class DocumentChunk(Base):
     document: Mapped[Document] = relationship(
         back_populates="chunks"
     )
+
+# ==============================================================================
+# 4. 会话角色与对话模型定义 (Conversations & Messages)
+# ==============================================================================
+class MessageRole(str, Enum):
+    """
+    会话消息发送方角色枚举类
+
+    【核心继承机制说明】
+    - 继承 str: 保证可以直接与字符串字面量对比，且在 JSON 序列化时保持干净的纯字符串。
+    - 继承 Enum: 规范大模型对话上下文标准角色的边界，杜绝魔法字符串。
+    """
+
+    USER = "user"          # 真实用户提问
+    ASSISTANT = "assistant"  # LLM 模型生成的回答
+    SYSTEM = "system"        # 系统提示词 (Prompt / 预设规则)
+
+
+class Conversation(Base):
+    """
+    会话主表（conversations）ORM 实体映射
+
+    【模型定位】
+    代表一次独立的问答对话通道（Session），聚合管理一连串有序的问答消息流。
+    """
+
+    __tablename__ = "conversations"
+
+    # --------------------------------------------------------------------------
+    # 基础标识与元数据
+    # --------------------------------------------------------------------------
+    # 会话唯一标识 ID：
+    # - PGUUID(as_uuid=True): 声明为 PostgreSQL 原生 UUID 类型，并双向转换为 Python uuid.UUID。
+    # - primary_key=True: 主键。
+    # - default=uuid4: Python 侧生成默认 UUIDv4。
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        comment="会话全局唯一UUID主键"
+    )
+
+    # 会话标题：
+    # - 默认缺省值为 "新对话"，后续可通过提问内容自动生成并更新总结标题。
+    # - 注：预留 user_id 字段，后续引入多租户与用户体系时可平滑扩展。
+    title: Mapped[str] = mapped_column(
+        String(256),
+        nullable=False,
+        default="新对话",
+        comment="会话展示标题"
+    )
+
+    # --------------------------------------------------------------------------
+    # 审计时间戳
+    # --------------------------------------------------------------------------
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="会话创建时间"
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        comment="会话最近更新时间"
+    )
+
+    # --------------------------------------------------------------------------
+    # 关系映射
+    # --------------------------------------------------------------------------
+    # 一对多关联当前会话下的所有消息（Message）：
+    # - cascade="all, delete-orphan": 会话删除时，旗下所有消息级联物理销毁。
+    # - passive_deletes=True: 信任数据库底层的外键级联删除能力，减少应用层重复查表开销。
+    # - order_by="Message.created_at": 默认在加载会话时按消息的时间正序排列，保证对话时序正确。
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Message.created_at",
+    )
+
+
+class Message(Base):
+    """
+    会话明细消息表（messages）ORM 实体映射
+
+    【模型定位】
+    记录会话中的单条消息实体（包含用户提问、大模型流式生成结果或系统 Prompt）。
+    """
+
+    __tablename__ = "messages"
+
+    # --------------------------------------------------------------------------
+    # 主键与外键关联
+    # --------------------------------------------------------------------------
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        comment="消息全局唯一UUID主键"
+    )
+
+    # 所属会话 ID（外键级联删除）：
+    # - ForeignKey("conversations.id", ondelete="CASCADE"): 会话删除即物理清理所有历史消息。
+    # - index=True: 建立普通索引，极大提升拉取特定会话历史窗口的性能。
+    conversation_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="所属会话ID（外键级联删除）"
+    )
+
+    # --------------------------------------------------------------------------
+    # 消息内容与角色
+    # --------------------------------------------------------------------------
+    # 消息角色：映射 MessageRole 枚举，数据库层以 String(16) 落地
+    role: Mapped[MessageRole] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="消息角色 (user / assistant / system)"
+    )
+
+    # 消息完整正文文本
+    content: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="消息正文内容"
+    )
+
+    # 扩展元数据：
+    # - 【避坑规范】：规避 SQLAlchemy 的保留字 Base.metadata，ORM 侧属性使用 extra_metadata，
+    #   物理列名精准映射回 "metadata"。
+    # - 业务作用：灵活预留用于记录调用模型（model）、消耗 token 数、请求延迟（latency）等分析元数据。
+    extra_metadata: Mapped[dict] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+        comment="扩展元数据（记录模型、Token开销、耗时等）"
+    )
+
+    # --------------------------------------------------------------------------
+    # 审计时间戳
+    # --------------------------------------------------------------------------
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="消息创建时间"
+    )
+
+    # --------------------------------------------------------------------------
+    # 关系映射
+    # --------------------------------------------------------------------------
+    # 多对一关联所属会话
+    conversation: Mapped[Conversation] = relationship(
+        back_populates="messages"
+    )
+
+    # 一对多关联当前消息产生的知识溯源引用记录（仅 assistant 角色的消息会持有）
+    # - order_by="AnswerCitation.ordinal": 严格按注入大模型时的切片序号正序排布
+    citations: Mapped[list["AnswerCitation"]] = relationship(
+        back_populates="message",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="AnswerCitation.ordinal",
+    )
+
+
+# ==============================================================================
+# 5. 知识溯源与引用快照模型 (Answer Citations)
+# ==============================================================================
+class AnswerCitation(Base):
+    """
+    知识引用明细表（answer_citations）ORM 实体映射
+
+    【核心架构设计考量】
+    记录 assistant 角色在回答时具体引用的 chunk 依据。
+    - 【快照冗余机制】：冗余存储 document_name / page_no / quote 原文。因为原文 chunk 后续可能因文档重新索引或用户主动删除而被物理抹除，
+      但历史会话中的引用卡片仍然必须能够完整展示当时的溯源快照。
+    - 【软关联置空 (ON DELETE SET NULL)】：外键 document_id 与 chunk_id 必须声明为 nullable=True，
+      一旦关联的文档或分块被删除，数据库仅把外键字段置空，保全本引用历史明细本身不被级联误删。
+    """
+
+    __tablename__ = "answer_citations"
+
+    # --------------------------------------------------------------------------
+    # 主键与消息强归属外键
+    # --------------------------------------------------------------------------
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        comment="引用全局唯一UUID主键"
+    )
+
+    # 所属回答消息 ID（强外键绑定，级联删除）：
+    # - 本条引用归属于哪一条 assistant 消息；若该消息被删，引用记录无独立保留意义，直接 CASCADE 级联清理。
+    message_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="所属消息ID（级联删除）"
+    )
+
+    # --------------------------------------------------------------------------
+    # 序号与软关联定位（可空）
+    # --------------------------------------------------------------------------
+    # 对应 prompt 中给 LLM 看到的【片段 N】编号（从 1 开始递增）：
+    # - 核心业务作用：持久化该序号，前端才能将 LLM 生成文本中的角标 [N] 与底部的引用面板按序号精确绑定。
+    ordinal: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="上下文注入序号(1..N)，对应大模型生成的[N]角标"
+    )
+
+    # 所属源文档 ID：
+    # - 外键策略采用 ON DELETE SET NULL，原文档被用户删除时本列置空，历史引用仍安全存留。
+    document_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="关联文档ID（原文档被删时置空）"
+    )
+
+    # 所属原始分块 Chunk ID：
+    # - 外键策略采用 ON DELETE SET NULL，文档切片重构被删时本列置空。
+    chunk_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("document_chunks.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="关联切片ID（原切片被删时置空）"
+    )
+
+    # --------------------------------------------------------------------------
+    # 历史快照冗余字段 (Snapshot Fields)
+    # --------------------------------------------------------------------------
+    # 文档名称快照（记录引用当时的文件名，避免文档重命名或被删后丢失可读标题）
+    document_name: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        comment="文档名称快照"
+    )
+
+    # 页码快照（PDF 物理页码，纯文本或未分段文档允许为 NULL）
+    page_no: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="当时所在物理页码快照"
+    )
+
+    # 引用原文片段快照：
+    # - 记录大模型回答时命中的真实上下文正文切片，保障历史会话随时能直接展开查阅原汁原味的溯源证据
+    quote: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="引用的原始文本片段快照"
+    )
+
+    # --------------------------------------------------------------------------
+    # 关系映射
+    # --------------------------------------------------------------------------
+    # 多对一关联回所属消息
+    message: Mapped[Message] = relationship(
+        back_populates="citations"
+    )

@@ -126,6 +126,24 @@ class Settings(BaseSettings):
     # 只从 hf_home 读取已预热好的模型。模型预热完成后建议开启。
     hf_hub_offline: bool = False
 
+    # ===== Chat 对话大模型配置（DashScope OpenAI 兼容协议） =====
+    # 阿里云百炼 API-Key，用于大模型对话接口鉴权；若为空则可能复用 EMBEDDING_API_KEY
+    chat_api_key: str = ""
+    # DashScope 提供的 OpenAI 兼容协议服务基础请求地址，默认与 embedding 保持一致
+    chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 对话生成所使用的主力大语言模型（如 qwen-plus, qwen-max 等）
+    chat_model: str = "qwen-plus"
+
+    # ===== 知识检索与多轮问答控制策略 =====
+    # 检索候选数（Top-K）：单次向向量数据库召回并最终喂给 LLM 上下文的最大 Chunk 数量
+    retrieval_top_k: int = 5
+    # 拒答相似度阈值（Cosine Similarity = 1 - Cosine Distance）：
+    # 设定判定下限（默认 0.6 属于相对严格的标准）。
+    # 若召回的 Top-K 候选中最高相似度得分仍低于此阈值，则判定无相关知识依据，直接触发拒答，不再调用 LLM
+    retrieval_min_score: float = 0.6
+    # 多轮会话记忆窗口大小：在 load_context 阶段截取当前会话最近 N 条历史消息塞入 Prompt，平衡长程记忆与上下文长度限制
+    chat_history_window: int = 5
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
