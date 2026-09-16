@@ -1,19 +1,24 @@
 """
 【模块职责说明】
 本模块为知识库底层持久化层中的「切片仓储组件」（DocumentChunkRepository）。
-基于 SQLAlchemy 2.0+ 异步模型，专门负责文档细粒度切片（DocumentChunk）的高性能数据访问。
+基于 SQLAlchemy 2.0+ 异步模型与 pgvector 扩展，统一承接文档切片（DocumentChunk）的全生命周期持久化与高性能向量检索。
 核心架构机制与设计考量如下：
 
-1. 强安全多租户归属校验（Anti-IDOR / 防越权）：
-   在获取切片时强制组合 `document_id` 与 `chunk_id` 双键过滤，从数据层物理阻断越权访问其他文档切片的风险。
-2. 批量高性能写入契约（Bulk Insertion）：
-   支持通过 `Sequence` 传入切片集合并调用 `session.add_all()` + `flush()`，
-   显著降低数据库往返开销（RTT），保障大规模分块持久化的吞吐。
-3. 数据库服务端聚合推导（Server-side Aggregation）：
-   文档切片长度统计指标（count/avg/min/max）直接通过 PostgreSQL 原生 `char_length` 及聚合函数在数据库引擎内单条 SQL 完成计算，
-   避免将海量切片原始文本加载到 Python 进程二次遍历引发内存膨胀（OOM）。
-4. 统计结果载体不可变性保障：
-   定义 `ChunkStats` 数据类并启用 `frozen=True`（不可变对象），确保统计数据在业务传递过程中只读且线程安全。
+1. pgvector 余弦距离近似检索（Vector Similarity Search）：
+   利用 `embedding.cosine_distance` 运算符下推向量距离计算，高效召回高维向量空间中最相似的 Top-K 文档切片。
+2. 数据状态守卫与脏读防御（Data Integrity & Status Guard）：
+   向量检索时联表校验父级文档状态（`Document.status == "ready"`），严格排除处理中或损坏态的未完成分块，确保知识库检索内容精准有效。
+3. 关联实体预加载防 N+1 查询（Eager Loading via selectinload）：
+   检索切片时主动使用 `selectinload(DocumentChunk.document)` 批量预加载关联的父文档实体，
+   规避上层溯源读取 `chunk.document.name` 时在异步上下文中因懒加载触发 MissingGreenlet 异常及 N+1 查询风暴。
+4. 强安全多租户归属校验（Anti-IDOR / 防越权）：
+   获取单个切片时强制组合 `document_id` 与 `chunk_id` 双键过滤，从数据层物理阻断水平越权访问其他文档切片的风险。
+5. 批量高性能写入契约（Bulk Insertion & Unit of Work）：
+   支持通过 `Sequence` 集合调用 `session.add_all()` + `flush()` 批量推送 SQL 缓冲区，
+   降低数据库往返开销（RTT），且遵循仓储规范不主动 commit，将事务生命周期全权交由外层编排。
+6. 服务端聚合计算与不可变契约（Server-side Aggregation & Immutability）：
+   切片统计指标（count/avg/min/max）直接下推至 PostgreSQL 原生 SQL 引擎计算，防止进程内存膨胀（OOM）；
+   统计结果承载于 `@dataclass(frozen=True)` 的 `ChunkStats`，保障业务流转中数据只读与线程安全。
 """
 
 from collections.abc import Sequence
@@ -23,7 +28,10 @@ from uuid import UUID
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import DocumentChunk
+# 引入文档与文档分块持久层 ORM 模型
+from app.db.models import Document, DocumentChunk
+# 引入关系急加载加载策略，用于在异步环境下高效加载关联父表
+from sqlalchemy.orm import selectinload
 
 
 # 语法（Python 原生标准库装饰器）：@dataclass(frozen=True)
@@ -197,3 +205,43 @@ class DocumentChunkRepository:
             min_length=int(row.min_len or 0),
             max_length=int(row.max_len or 0),
         )
+
+    async def vector_search(
+            self,
+            query_embedding: list[float],
+            top_k: int,
+    ) -> list[tuple[DocumentChunk, float]]:
+        """
+        按 cosine 距离做 Top-K 向量检索。
+
+        - 仅检索状态为 ready 的文档（避免拿到尚未完成入库的脏 chunk）
+        - 返回 (chunk, distance) 列表，distance 越小越相似（pgvector cosine_distance）
+        - 用 selectinload 把所属 Document 一并加载，方便上层直接读 document.name 而不会再发 N 次 lazy load 查询
+
+        :param query_embedding: 待检索的浮点型向量列表
+        :param top_k: 期望返回的最相关候选分块数量
+        :return: (分块实体, 余弦距离) 的元组列表
+        """
+        # 1. 构建 pgvector 原生余弦距离计算表达式（<=> 运算符对应 cosine_distance）
+        distance = DocumentChunk.embedding.cosine_distance(query_embedding)
+
+        # 2. 编排向量检索 SQL 语句
+        stmt = (
+            select(DocumentChunk, distance.label("distance"))
+            # 内连接父级 Document 表以校验入库状态
+            .join(Document, Document.id == DocumentChunk.document_id)
+            # 状态守卫：仅检索已完成解析、索引并就绪的文档分块
+            .where(Document.status == "ready")
+            # 按余弦距离升序排列（距离越小，语义相关度越高）
+            .order_by(distance.asc())
+            # 限制召回最大条数
+            .limit(top_k)
+            # 预加载父文档实体，防止上层遍历读取 chunk.document.name 时产生 N+1 查询
+            .options(selectinload(DocumentChunk.document))
+        )
+
+        # 3. 异步执行查询并提取所有匹配行
+        rows = (await self.session.execute(stmt)).all()
+
+        # 4. 组装为强类型元组返回，将 distance 标量安全转为 Python float
+        return [(chunk, float(dist)) for chunk, dist in rows]
