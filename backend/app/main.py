@@ -28,10 +28,10 @@ setup_hf_environment()
 # 导入全局异常捕获注册函数（负责捕获代码里的 AppException 和系统崩溃）
 from app.api.error_handlers import register_error_handlers
 
-# 语法（路由模块汇聚导入）：from app.api.routes import documents, health
-#   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 模块
-#   通俗来讲：把刚写好的文档业务接待员（documents）请到总服务台前报到。
-from app.api.routes import document_uploads, documents, health
+# 语法（路由模块汇聚导入）：from app.api.routes import chat, documents, health
+#   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 与 chat 模块
+#   通俗来讲：把刚写好的文档业务接待员（documents）与问答业务接待员（chat）请到总服务台前报到。
+from app.api.routes import chat, document_uploads, documents, health
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -97,6 +97,15 @@ def create_app() -> FastAPI:
     # 抢先匹配 /documents/uploads/... 并把 uploads 误当成 UUID 参数。
     app.include_router(document_uploads.router, prefix="/api")
     app.include_router(documents.router, prefix="/api")
+
+    # 新增（问答路由级联挂载）：app.include_router(chat.router, prefix="/api")
+    #   特性：将 chat.router 动态接入主应用。
+    #   路径拼接公式：全局前缀 [/api] + 模块前缀 [/conversations] + 接口子路径 [/ /{id} /{id}/chat]
+    #   核心收益：
+    #     - 会话与流式问答统一挂在 /api/conversations 之下，便于 Nginx 反向代理统一转发；
+    #     - 自动向 Swagger UI (/docs) 注入「创建会话 / 会话详情 / SSE 流式问答」三个端点。
+    #   通俗来讲：把问答接待窗口挂到总大厅的“/api”综合服务牌下，客人访问 /api/conversations 就能办业务了。
+    app.include_router(chat.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)
