@@ -14,11 +14,13 @@ from app.workflows.nodes.generate import stream_generate
 from app.workflows.nodes.load_context import load_context
 from app.workflows.nodes.normalize_query import normalize_query
 from app.workflows.nodes.retrieve import retrieve
+from app.workflows.nodes.route_query import route_query
 
 # 显式声明模块公开导出的符号清单
 __all__ = [
     "load_context",     # 1. 历史消息加载节点
     "normalize_query",  # 2. Query 标准化与意图透传节点
-    "retrieve",         # 3. 向量检索与拒答熔断节点
-    "stream_generate",  # 4. 大模型流式输出生成节点
+    "route_query",      # 3. 查询优化策略路由节点（判定并按策略产出最终检索词）
+    "retrieve",         # 4. 向量检索与拒答熔断节点
+    "stream_generate",  # 5. 大模型流式输出生成节点
 ]
