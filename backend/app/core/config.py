@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     # 多轮会话记忆窗口大小：在 load_context 阶段截取当前会话最近 N 条历史消息塞入 Prompt，平衡长程记忆与上下文长度限制
     chat_history_window: int = 5
 
+    # ===== Query 优化配置（第 5 期） =====
+    # 策略路由总开关：
+    #   置 false 时 route_query 节点固定输出 original，方便对「有/无路由」的效果做对比。
+    #   关闭后整条链路退化回上一期的单路检索行为，是排查"优化是否真的有效"的第一手段。
+    query_route_enabled: bool = True
+    # 多查询策略生成的子查询数量（默认 3）：
+    #   数量越大召回面越广，但每条子查询都要单独算一次向量（成本与耗时随 N 线性增长）。
+    multi_query_count: int = 3
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
