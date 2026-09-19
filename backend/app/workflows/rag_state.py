@@ -13,13 +13,20 @@
    均面向统一状态进行读写，保障节点的高内聚与可插拔性。
 """
 
-from typing import TypedDict
+from typing import Literal, TypedDict
 from uuid import UUID
 
 # 引入数据库消息持久化实体（用于传递多轮会话记录）
 from app.db.models import Message
 # 引入检索层返回的不可变切片数据契约
 from app.retrieval.vector_retriever import RetrievedChunk
+
+# 查询优化策略类型别名（与前端 QueryRouteRead.route 契约严格对齐）：
+#   original    原样检索，不做任何改写
+#   rewrite     结合多轮历史改写成独立完整问句
+#   hyde        先生成假设答案，再用假设答案去检索
+#   multi_query 扩展为多条子查询，分别检索后合并
+QueryRoute = Literal["original", "rewrite", "hyde", "multi_query"]
 
 
 class RAGState(TypedDict, total=False):
@@ -37,16 +44,25 @@ class RAGState(TypedDict, total=False):
     chat_history: list[Message] # 数据库中预加载的正序最近多轮对话历史列表
 
     # --- 3. 意图与 Query 改写节点 (normalize_query 节点产出) ---
-    query: str                  # 经过标准化/改写后的检索查询词（基础版本与 question 相同）
+    query: str                  # 检索查询词（基础版本与 question 相同；route_query 会按策略覆盖本字段）
 
-    # --- 4. 知识检索与熔断判断节点 (retrieve 节点产出) ---
+    # --- 4. 查询优化策略路由节点 (route_query 节点产出) ---
+    # 实际采用的优化策略；下游 retrieve 依据它决定检索行为，service 依据它下发 query_route 事件
+    route: QueryRoute
+    # 策略选型与检索控制之外，下列三个字段用于调试与前端展示：
+    #   rewritten_query / hyde_answer 当前无节点读取，仅供前端调试面板与问题排查使用
+    rewritten_query: str | None # rewrite 策略产出的独立完整问句
+    hyde_answer: str | None     # hyde 策略产出的假设答案
+    multi_queries: list[str] | None # multi_query 策略产出的多条子查询（同时是 retrieve 多路召回的输入）
+
+    # --- 5. 知识检索与熔断判断节点 (retrieve 节点产出) ---
     retrieved_chunks: list[RetrievedChunk] # 向量数据库召回并完成相关度计算的分块列表
     # 是否触发知识库拒答（例如检索结果为空或相似度过低）。为 True 时在条件路由中直接跳过 generate 生成节点
     refused: bool
 
-    # --- 5. 大模型回答生成节点 (generate 节点产出) ---
+    # --- 6. 大模型回答生成节点 (generate 节点产出) ---
     answer: str                 # LLM 根据参考片段最终生成的回答内容（包含 [N] 引用标记）
 
-    # --- 6. 持久化后置落库节点 (chat_service 落库后回写) ---
+    # --- 7. 持久化后置落库节点 (chat_service 落库后回写) ---
     user_message_id: UUID       # 写入数据库后生成的本轮用户提问 Message 唯一主键
     assistant_message_id: UUID  # 写入数据库后生成的本轮 AI 回复 Message 唯一主键
