@@ -31,6 +31,11 @@ from app.db.models import AnswerCitation, Message
 # 用 Literal 而非 Enum，使 OpenAPI 直接输出枚举候选值字符串，前端无需额外映射
 MessageRoleValue = Literal["user", "assistant", "system"]
 
+# 查询优化策略字面量联合类型：
+# 取值必须与 app.workflows.rag_state.QueryRoute 完全一致，
+# 也与前端 QueryRouteRead.route 契约对齐（前端按它索引调试面板配置）
+QueryRouteValue = Literal["original", "rewrite", "hyde", "multi_query"]
+
 
 # =============================================================================
 # 1. 会话相关模型
@@ -103,10 +108,63 @@ class CitationRead(BaseModel):
 
 
 # =============================================================================
-# 3. 消息模型
+# 3. 查询优化路由快照模型
+# =============================================================================
+class QueryRouteRead(BaseModel):
+    """Query 优化的调试快照。仅 assistant 消息会带，前端用于渲染调试面板。
+
+    既用于流式问答的 query_route 事件载荷，也内嵌在消息响应里供历史回放使用。
+
+    【与 QueryRoute 字面量的对应关系】：
+    route 的四个取值必须与 `app.workflows.rag_state.QueryRoute` 严格一致，
+    否则前端按 route 索引的调试面板配置（ROUTE_META）会查不到而渲染异常。
+
+    【为什么四个明细字段都可空】：
+    每次只会命中一种策略，因此只有对应的那个明细字段有值，其余为 None。
+    """
+
+    route: QueryRouteValue
+    # 实际用于检索的查询词（rewrite/hyde 路径下是改写后的文本）
+    query: str
+    # 以下三项按策略产出，未产出时为 None
+    rewritten_query: str | None = None
+    hyde_answer: str | None = None
+    multi_queries: list[str] | None = None
+
+
+def _parse_query_route(metadata: dict | None) -> QueryRouteRead | None:
+    """从 messages.metadata 中提取 query_route 字段。
+
+    【为什么要三层防御】：
+    metadata 是 JSONB 自由结构，内容不受 Schema 约束，因此必须假设它可能是：
+      ① None 或空字典      → 老数据、或本功能上线前写入的历史消息
+      ② 缺少 query_route 键 → user 消息从不写该键
+      ③ 键存在但不是 dict   → 极端脏数据
+      ④ 键存在且是 dict，但结构与契约不符 → 交给 Pydantic 校验拦截
+
+    任何一种情况都【静默返回 None】，只让该条消息的调试面板不显示，
+    绝不因为一段可选元数据而让整个历史接口报错。
+
+    :param metadata: Message.extra_metadata（可为 None）
+    :return: 校验通过的 QueryRouteRead；缺失或非法时返回 None
+    """
+    if not metadata:
+        return None
+    raw = metadata.get("query_route")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        # 交给 Pydantic 校验：多余字段会被忽略，结构不符则抛错后被兜住
+        return QueryRouteRead.model_validate(raw)
+    except Exception:
+        return None
+
+
+# =============================================================================
+# 4. 消息模型
 # =============================================================================
 class MessageRead(BaseModel):
-    """单条消息响应体（含 assistant 消息的引用列表）。"""
+    """单条消息响应体（含 assistant 消息的引用列表与查询优化快照）。"""
 
     id: UUID
     role: MessageRoleValue
@@ -114,6 +172,10 @@ class MessageRead(BaseModel):
     created_at: datetime
     # 引用列表：只有 assistant 消息才会有；默认空列表，避免前端判空
     citations: list[CitationRead] = Field(default_factory=list)
+    # 查询优化快照：从消息元数据中取出，供历史回放时继续展示调试面板。
+    # 【为什么必须是顶层字段】前端 fromServerMessage 读取的是 m.query_route，
+    # 若只存在数据库的 metadata 里而不在此暴露，刷新历史后调试面板会消失。
+    query_route: QueryRouteRead | None = None
 
     @classmethod
     def from_orm(cls, message: Message) -> "MessageRead":
@@ -123,6 +185,11 @@ class MessageRead(BaseModel):
         只有 assistant 消息会产生引用（user / system 消息不会）。
         这里显式判断角色，避免用户消息因异常数据关联了引用而把脏数据透出到前端。
 
+        【查询优化快照的来源与校验】：
+        持久化时写在 metadata 的 query_route 键下，这里取出来交给 Pydantic 校验。
+        若元数据缺失该键（如 user 消息、或本功能上线前写入的历史消息），
+        则返回 None，不影响接口可用性。
+
         【前置条件】：
         调用方查询消息时必须已预加载 citations 关系
         （conversation_repo.list_messages 内部已使用 selectinload），
@@ -131,6 +198,9 @@ class MessageRead(BaseModel):
         :param message: Message 实体实例
         :return: 消息响应模型
         """
+        # 角色只判断一次并缓存：引用过滤与查询快照都依赖它，
+        # 重复写 message.role == "assistant" 容易在改动时漏改其中一处
+        is_assistant = message.role == "assistant"
         return cls(
             id=message.id,
             role=message.role,
@@ -138,8 +208,13 @@ class MessageRead(BaseModel):
             created_at=message.created_at,
             citations=(
                 [CitationRead.from_orm(c) for c in message.citations]
-                if message.role == "assistant"
+                if is_assistant
                 else []
+            ),
+            # 查询优化快照只挂在 assistant 消息上（user 消息从不写入该元数据）；
+            # 解析交给 _parse_query_route，它内部已做完整防御，不会抛异常
+            query_route=(
+                _parse_query_route(message.extra_metadata) if is_assistant else None
             ),
         )
 

@@ -47,6 +47,7 @@ from app.workflows.nodes import (
     load_context,
     normalize_query,
     retrieve,
+    route_query,
     stream_generate,
 )
 from app.workflows.rag_state import RAGState
@@ -83,6 +84,29 @@ def _serialize_citation(chunk: RetrievedChunk, ordinal: int) -> dict:
         "score": round(chunk.score, 4),
         # 引用原文：供前端展开查看「这句话出自哪一段」
         "quote": chunk.content,
+    }
+
+
+def _build_query_route_payload(state: RAGState) -> dict:
+    """构造 query_route SSE 事件载荷，与 /metadata 共用同一份字段结构。
+
+    【为什么始终携带 4 个可选字段（值为 None 也保留）】：
+    前端按 `route` 决定渲染哪种调试面板，但 TypeScript 类型里这几个字段都是
+    `T | null`——**显式下发 null 比省略字段更利于前端类型推断**：
+    字段存在且为 null 时，TS 能确定"这个键存在，只是没有值"；
+    字段缺失时，类型上仍是可选的，前端仍需额外判断键是否存在。
+
+    :param state: 当前工作流状态（route / query / 各策略明细）
+    :return: 可直接下发的 query_route 事件载荷
+    """
+    return {
+        # 路由结果：缺省视为 original（未开启优化或未接入时的安全默认）
+        "route": state.get("route", "original"),
+        "query": state.get("query", ""),
+        # 以下三项按策略产出，未产出时为 None；前端据此决定面板明细怎么渲染
+        "rewritten_query": state.get("rewritten_query"),
+        "hyde_answer": state.get("hyde_answer"),
+        "multi_queries": state.get("multi_queries"),
     }
 
 
@@ -199,10 +223,12 @@ class ChatService:
                     "question": question,
                 }
 
-                # 3. 装载上下文（取历史消息）与查询标准化。
+                # 3. 装载上下文（取历史消息）、查询标准化与策略路由。
                 #    注意：这一步必须早于用户提问落库，否则 load_context 会把本轮提问也当成历史读回来。
                 state.update(await load_context(state, session))
                 state.update(await normalize_query(state))
+                # 策略路由：判定并按策略产出最终检索词（内部已保证失败降级 original，不会抛异常）
+                state.update(await route_query(state))
 
                 # 4. 落库用户提问并 commit。
                 #    此处单独提交一次，是为了让「用户提问」这条记录先于大模型调用持久化：
@@ -216,10 +242,23 @@ class ChatService:
                     "data": {"user_message_id": str(state["user_message_id"])},
                 }
 
-                # 6. 向量检索 + 拒答熔断（判定结果由 retrieve 节点写入 state["refused"]）
+                # 6. 下发策略路由事件，把路由结果推给前端调试面板。
+                #    【为什么放在检索之前】：
+                #    用户提问那一刻前端先收到 message_start，紧接着就能拿到路由结果并渲染面板；
+                #    而检索需要先做一次向量化（约 1 秒），若等检索完再发，面板会白白空等。
+                #    【为什么无论什么策略都发】：
+                #    route=original 时前端 QueryRoutePanel 自身不渲染，
+                #    因此后端无需特判，契约更简单（少一个分支就少一处可能不一致的地方）。
+                yield {
+                    "event": "query_route",
+                    "data": _build_query_route_payload(state),
+                }
+
+                # 7. 向量检索 + 拒答熔断（判定结果由 retrieve 节点写入 state["refused"]）
+                #    多路召回在 retrieve 内部完成，本层无需感知路径差异。
                 state.update(await retrieve(state, session))
 
-                # 7. 引用回填：ordinal 用 enumerate(start=1) 生成，与 prompt 中给模型的「片段 N」编号一致
+                # 8. 引用回填：ordinal 用 enumerate(start=1) 生成，与 prompt 中给模型的「片段 N」编号一致
                 citations_payload = [
                     _serialize_citation(chunk, ordinal=i)
                     for i, chunk in enumerate(state.get("retrieved_chunks", []), start=1)
@@ -229,7 +268,7 @@ class ChatService:
                     "data": {"citations": citations_payload},
                 }
 
-                # 8. 生成分支：拒答时直接把预置文案作为唯一 token 下发，完全不调用大模型
+                # 9. 生成分支：拒答时直接把预置文案作为唯一 token 下发，完全不调用大模型
                 if state.get("refused"):
                     yield {
                         "event": "token",
@@ -243,10 +282,10 @@ class ChatService:
                         yield {"event": "token", "data": {"delta": delta}}
                     state["answer"] = "".join(answer_parts)
 
-                # 9. 落库助手回复 + 引用记录（两者在同一事务内提交，保证原子性）
+                # 10. 落库助手回复 + 引用记录（两者在同一事务内提交，保证原子性）
                 await self._persist_assistant_message(state, session)
 
-                # 10. 收尾事件：下发 assistant_message_id 与拒答标志，前端据此结束流式状态并回填正式消息
+                # 11. 收尾事件：下发 assistant_message_id 与拒答标志，前端据此结束流式状态并回填正式消息
                 yield {
                     "event": "message_end",
                     "data": {
@@ -324,8 +363,14 @@ class ChatService:
         assistant_msg = ConversationRepository.make_assistant_message(
             state["conversation_id"],
             content=state["answer"],
-            # 把拒答标志写入消息元数据，历史回看时无需再推断
-            extra_metadata={"refused": bool(state.get("refused"))},
+            # 把 query 路由结果持久化到 metadata 字段，刷新历史时前端调试面板还能继续展示。
+            # 注意：这里复用 _build_query_route_payload，与 SSE 事件共用同一份字段结构，
+            # 避免"实时展示"与"历史回看"两条路径的载荷格式各自演化而不一致。
+            extra_metadata={
+                # 拒答标志：历史回看时无需再推断
+                "refused": bool(state.get("refused")),
+                "query_route": _build_query_route_payload(state),
+            },
         )
         await conv_repo.add_messages([assistant_msg])
 
