@@ -65,6 +65,38 @@ class ConversationRead(BaseModel):
 # =============================================================================
 # 2. 引用快照模型
 # =============================================================================
+class RetrievalMeta(BaseModel):
+    """混合检索调试元数据。
+
+    【六个字段的语义与"能不能横向比较"】：
+    - sources: 该 chunk 命中的检索路（vector / keyword）；两路都命中即"混合"
+    - *_rank: 在该路召回结果中的名次（从 1 开始），用于复盘排序
+    - vector_score: cosine similarity，**绝对值有意义**，做拒答阈值用
+    - keyword_score: ts_rank，**相对值**，跨 query 不可比
+      （实测同一查询下第 2~5 名分数完全相同，且不同查询间尺度会变）
+    - rrf_score: 两路融合分，**仅在同一次检索内可比**
+      （k=60 时上限为 2/(k+1) ≈ 0.0328，与余弦相似度不是一个量纲）
+
+    【为什么全部字段都有默认值】：
+    来源不同的 chunk 只填自己那一路的字段（仅向量命中时 keyword_* 为 None，
+    反之亦然），因此每个字段都必须可缺省。默认值让"只填一部分"的构造方式成立，
+    也让前端类型不必声明为可选键——键一定在，值可能为 None。
+    """
+
+    # 命中来源：列表而非单个字符串，因为两路都命中时会有两个元素
+    sources: list[str] = Field(default_factory=list)
+    # 向量路名次（1 起）；未命中该路为 None
+    vector_rank: int | None = None
+    # 余弦相似度：绝对值有意义，是拒答判定的依据
+    vector_score: float | None = None
+    # 关键词路名次（1 起）；未命中该路为 None
+    keyword_rank: int | None = None
+    # ts_rank：只在本路内部有相对意义，跨查询不可比
+    keyword_score: float | None = None
+    # RRF 融合分：只在同一次检索内可比
+    rrf_score: float | None = None
+
+
 class CitationRead(BaseModel):
     """assistant 消息引用的 chunk 快照。
 
@@ -88,6 +120,9 @@ class CitationRead(BaseModel):
     document_name: str
     page_no: int | None = None
     quote: str
+    # 混合检索调试元数据；历史消息（第 6 期之前写入的）没有这个字段，
+    # 解析失败时静默为 None，前端按缺失隐藏 Tag
+    retrieval_meta: RetrievalMeta | None = None
 
     @classmethod
     def from_orm(cls, citation: AnswerCitation) -> "CitationRead":
@@ -104,7 +139,27 @@ class CitationRead(BaseModel):
             document_name=citation.document_name,
             page_no=citation.page_no,
             quote=citation.quote,
+            retrieval_meta=_parse_retrieval_meta(citation.retrieval_meta),
         )
+
+
+def _parse_retrieval_meta(raw: dict | None) -> RetrievalMeta | None:
+    """历史消息没有 retrieval_meta，非法/缺失静默返回 None。
+
+    与上一期 `_parse_query_route` 相同的兜底风格：反序列化路径上的解析函数
+    **绝不能向上抛异常**——一条历史脏数据不应让整个会话详情接口 500。
+    因此这里做两层防御：先判类型（不是 dict 直接返回 None），
+    再用 try 包住模型校验（字段类型不符时也返回 None，而不是抛 ValidationError）。
+    """
+    # 第一层：None（历史消息）与非 dict（脏数据）直接放行
+    if not isinstance(raw, dict):
+        return None
+    try:
+        # 第二层：字段类型不符时静默降级，不阻断整个响应
+        return RetrievalMeta.model_validate(raw)
+    except Exception:
+        return None
+
 
 
 # =============================================================================
