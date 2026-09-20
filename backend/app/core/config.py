@@ -153,6 +153,18 @@ class Settings(BaseSettings):
     #   数量越大召回面越广，但每条子查询都要单独算一次向量（成本与耗时随 N 线性增长）。
     multi_query_count: int = 3
 
+    # ===== 混合检索配置（第 6 期） =====
+    # RRF 平滑常数 k（默认 60，沿用原论文与工业界事实标准）：
+    #   公式 score(d) = Σ 1/(k + rank_i(d))
+    #   作用：压平高排名条目的优势，避免"某一路的第 1 名"直接碾压其余候选。
+    #   k 越小越偏向两路都排前几名的条目；k 越大越平滑、越依赖"两路都命中"这件事本身。
+    rrf_k: int = 60
+    # 混合检索单路召回宽度（recall_top_k）：
+    #   每一条腿各自召回的候选数，必须【大于】retrieval_top_k，
+    #   否则两路根本没有足够候选参与融合，RRF 退化成"对同一批结果重排"。
+    #   默认 20 = retrieval_top_k(5) 的 4 倍，兼顾召回面与两路各一次查询的开销。
+    retrieval_recall_top_k: int = 20
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
