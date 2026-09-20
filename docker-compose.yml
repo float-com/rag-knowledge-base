@@ -1,7 +1,12 @@
 services:
   postgres:
-    # 选用集成 pgvector 向量扩展的 PostgreSQL 16 官方镜像
-    image: pgvector/pgvector:pg16
+    # 选用【同时集成 pgvector 与 zhparser】的 PostgreSQL 16 镜像：
+    #   - pgvector  : 向量检索（第 3 期已用，提供 vector 扩展）
+    #   - zhparser  : 中文全文检索（第 6 期混合检索所需）
+    # 说明：默认的 pgvector/pgvector:pg16 只带 vector，不含中文解析器，
+    #       且官方没有维护 pgvector + zhparser 的镜像，故改用预构建镜像。
+    # 注意：镜像名带 postgres- 前缀，教程里写的 leikooo/pgvector-zhparser 并不存在。
+    image: leikooo/postgres-pgvector-zhparser:latest
     container_name: rag-kb-postgres
     # 容器异常退出时自动重启（除非手动停止）
     restart: unless-stopped
