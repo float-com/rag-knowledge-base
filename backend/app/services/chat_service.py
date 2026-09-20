@@ -56,6 +56,47 @@ from app.workflows.rag_state import RAGState
 logger = get_logger(__name__)
 
 
+def _build_retrieval_meta(chunk: RetrievedChunk) -> dict:
+    """构建混合检索调试元数据。
+
+    【为什么需要它】：
+    混合检索把两条腿（向量 + 中文全文）的结果融合成一份，最终排序依据是 RRF 融合分。
+    但"为什么这段被选中"无法从最终分数反推——它可能来自向量路第 1、也可能只来自
+    关键词路第 8。把每条腿的排名与原始分都留下来，线上排查与前端调试面板才有据可依。
+
+    【为什么 all-None 字段也要保留键】：
+    显式下发 null 比省略字段更利于前端类型推断——字段存在且为 null 时，
+    TS 能确定"这个键存在，只是这条路没召回它"；字段缺失时类型上仍是可选的，
+    前端还得额外判断键是否存在。这与 query_route 载荷的处理方式一致。
+
+    【精度取舍】：
+    - 相似度 / ts_rank 保留 4 位：前端展示足够，避免浮点尾数抖动；
+    - rrf_score 保留 6 位：因为它本身量级很小（k=60 时约 0.015~0.033），
+      若只留 4 位，0.0163 与 0.0164 这类真实差距会被抹平，排序信息丢失。
+
+    :param chunk: 融合后的检索切片
+    :return: 可直接 JSON 序列化并落库（JSONB）的调试元数据字典
+    """
+    return {
+        # 命中来源：list() 把 tuple 转成列表，JSON 里数组比元组更自然
+        "sources": list(chunk.sources),
+        "vector_rank": chunk.vector_rank,
+        # 原始余弦相似度：仅向量路命中时有值，否则为 None
+        "vector_score": (
+            round(chunk.vector_score, 4) if chunk.vector_score is not None else None
+        ),
+        "keyword_rank": chunk.keyword_rank,
+        # 原始 ts_rank：仅关键词路命中时有值
+        "keyword_score": (
+            round(chunk.keyword_score, 4) if chunk.keyword_score is not None else None
+        ),
+        # RRF 融合分：两位小数不够用，故保留 6 位
+        "rrf_score": (
+            round(chunk.rrf_score, 6) if chunk.rrf_score is not None else None
+        ),
+    }
+
+
 def _serialize_citation(chunk: RetrievedChunk, ordinal: int) -> dict:
     """把检索切片转换为 citations SSE 事件载荷（与前端约定一致）。
 
@@ -84,6 +125,9 @@ def _serialize_citation(chunk: RetrievedChunk, ordinal: int) -> dict:
         "score": round(chunk.score, 4),
         # 引用原文：供前端展开查看「这句话出自哪一段」
         "quote": chunk.content,
+        # 检索调试元数据：与落库到 AnswerCitation.retrieval_meta 的是同一份结构，
+        # 保证"实时展示"与"历史回看"两条路径看到的信息完全一致
+        "retrieval_meta": _build_retrieval_meta(chunk),
     }
 
 
@@ -254,9 +298,12 @@ class ChatService:
                     "data": _build_query_route_payload(state),
                 }
 
-                # 7. 向量检索 + 拒答熔断（判定结果由 retrieve 节点写入 state["refused"]）
-                #    多路召回在 retrieve 内部完成，本层无需感知路径差异。
-                state.update(await retrieve(state, session))
+                # 7. 混合检索（向量 + 中文全文，RRF 融合）+ 拒答熔断
+                #    （判定结果由 retrieve 节点写入 state["refused"]）
+                #    【为什么这里不再传 session】：
+                #    检索器要并发跑两条腿，而一个 AsyncSession 只能对应一个连接与一个事务，
+                #    共用会互相毒化。因此 retrieve 内部自建两个独立会话，与调用方的写事务解耦。
+                state.update(await retrieve(state))
 
                 # 8. 引用回填：ordinal 用 enumerate(start=1) 生成，与 prompt 中给模型的「片段 N」编号一致
                 citations_payload = [
@@ -386,6 +433,11 @@ class ChatService:
                     document_name=chunk.document_name,
                     page_no=chunk.page_no,
                     quote=chunk.content,
+                    # 检索调试元数据落库（JSONB 列，迁移 8c44f95568ad 已建）：
+                    # 与 citations 事件里下发给前端的是同一份结构，保证实时展示与
+                    # 历史回看看到的信息一致。该列可空，因此第 4~5 期的历史引用
+                    # 读出来是 NULL——它如实表示"当时系统还没有这个能力"。
+                    retrieval_meta=_build_retrieval_meta(chunk),
                 )
                 for ordinal, chunk in enumerate(
                     state.get("retrieved_chunks", []), start=1

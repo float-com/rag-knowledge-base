@@ -711,9 +711,9 @@ git diff --stat  1 file changed, 83 insertions(+), 0 deletions(-)
 
 **教训**：报 bug 前必须先跑可执行复现。这是连续第二次因"读半截代码就下结论"而误判（前一次是 `rank` / `rank_score`）。
 
-### 9.2 ⚠️ 拒答口径不改会**恒拒答**（实测证据）
+### 9.2 ⚠️ 拒答口径必须改（实测证据）—— 第 9 步已修复
 
-`retrieve` 节点当前判定式（`app/workflows/nodes/retrieve.py` L55）：
+**本模块产出后，`retrieve` 节点的原判定式会失效**（`app/workflows/nodes/retrieve.py` 当时的 L55）：
 
 ```python
 refused = not chunks or chunks[0].score < settings.retrieval_min_score   # 0.6
@@ -723,9 +723,9 @@ refused = not chunks or chunks[0].score < settings.retrieval_min_score   # 0.6
 
 ```
 当前拒答阈值 retrieval_min_score = 0.6
-当前判定式: refused = not chunks or chunks[0].score < 0.6
+原判定式: refused = not chunks or chunks[0].score < 0.6
 
-query           top1.score   top1.vector_score   用score判定   用vector_score判定
+query           top1.score   top1.vector_score   原判定(用score)   正确判定(用vector_score)
 '接口'            0.03201844            0.658601   拒答 ← 错！     放行
 'B200'          0.03278689            0.66772    拒答 ← 错！     放行
 'DDR5-4800'     0.03278689            0.64756    拒答 ← 错！     放行
@@ -743,31 +743,113 @@ query           top1.score   top1.vector_score   用score判定   用vector_scor
         ↓
 ③ 但 0.6 这个阈值是按【余弦相似度】标定的
         ↓
-④ score 的量级从 [0,1] 掉到 [0,0.033]
+④ score 的量级从 [0,1] 掉到 [0,0.033]（上限为 2/(k+1) = 0.03278689）
         ↓
 ⑤ score < 0.6 恒成立 → 全拒答
 ```
 
-**第 9 步必须改成**：
+#### 9.2.1 第 9 步的实际修法（教程写法）
 
 ```python
-top1 = chunks[0]
-refused = not chunks or (
-    top1.vector_score is not None and top1.vector_score < settings.retrieval_min_score
-)
+    # 场景 A：一条都没召回 → 无任何依据，必然拒答
+    if not chunks:
+        return True
+
+    top = chunks[0]
+
+    # 场景 B：Top1 仅命中关键词路，缺乏语义佐证 → 保守拒答
+    if top.vector_score is None:
+        return True
+
+    # 场景 C：向量路命中了，但语义相似度低于阈值 → 不达标，拒答
+    return top.vector_score < settings.retrieval_min_score
 ```
 
-**`vector_score is None` 必须放行的理由**：
+**实测确认已修复**（`retrieve.py` L86-115）：
+
+```
+'接口'                  refused=False  top1 v_score=0.6586
+'B200'                refused=False  top1 v_score=0.6677
+'DDR5-4800'           refused=False  top1 v_score=0.6476
+'上传 报错'               refused=True   top1 v_score=0.5855   ← 低于 0.6，正确拒答
+'学分是多少啊这个东西'        refused=True   top1 v_score=0.5465   ← 语料中无此内容，正确拒答
+```
+
+#### 9.2.2 ⚠️ 更正：`vector_score is None` 时是**拒答**，不是放行
+
+**本归档初版在此处写过一句错误结论**：
+
+> ~~`vector_score is None` 必须**放行**。因为如果按"没有向量分就不达标"拒答，
+> 等于把本期新增的关键词能力直接关掉。~~
+
+**这句话是错的。** 教程代码（`_should_refuse` L110-112）与流程图均为**拒答**：
+
+```python
+    if top.vector_score is None:
+        return True          # 保守拒答
+```
+
+**而且流程图当初的读法也是错的**。重新读那张 `retrieve` 节点流程图：
+
+```
+Top1 vector_score is None   →  ↓  ┐
+Top1 vector_score < 阈值     →  ↓  ├→ 拦截拒答 (REFUSAL_ANSWER)
+                                ┘  │
+Top1 vector_score >= 阈值    →  放行处理
+```
+
+**三条线里的两条（`None` 与 `< 阈值`）都汇进"拦截拒答"**，只有 `>= 阈值` 一条走向放行。**图与代码一致，是当初把图读反了。**
+
+**修正后的三种情形对照表**：
 
 | `chunks[0].vector_score` | 含义 | 决策 |
 | --- | --- | --- |
 | 有值 ≥ 0.6 | 向量语义相关 | 放行 |
 | 有值 < 0.6 | 向量语义不相关 | 拒答 |
-| **`None`** | **向量路压根没召回它，只有关键词路命中** | **放行** |
+| **`None`** | **向量路压根没召回它，只有关键词路命中** | **拒答（保守）** |
 
-**第三行为什么必须放行**：如果按"没有向量分就不达标"拒答，等于**把本期新增的关键词能力直接关掉** —— 而字面精确命中（型号 `B200`、接口路径、错误码）**恰恰是向量检索的盲区**，正是做这一期的全部理由。
+#### 9.2.3 那么关键词腿的价值体现在哪（修正后的正确理解）
 
-**一句话**：`score` 是给**排序**用的，`vector_score` 才是给**阈值**用的。两者在混合模式下**不再相等**。
+不在于"让纯关键词命中的切片通过"，而在于**三条更细的实际作用**：
+
+| 作用 | 机制 | 实测证据 |
+| --- | --- | --- |
+| **① 提升正确切片的排名** | 两路都命中 → 融合分翻倍 | `B200` 第 1 名 `rrf = 0.03278689 = 2/(60+1)` |
+| **② 把向量路排位靠后的捞上来** | 关键词路名次高即可上浮 | `B200` 第 2 名：向量路**第 6**、关键词路第 2 → 升至第 2 |
+| **③ 对字面唯一命中的切片做交叉验证** | 弱向量分 + 高关键词分 = "字面 + 语义"双重佐证 | `DDR5-4800` 唯一关键词命中恰是向量路第 1 → 融合分翻倍 |
+
+**这三条发挥作用的前提都是 Top1 同时被向量路召回。** 纯关键词命中的切片被拒答，并不影响这三条。
+
+**保守拒答的工程理由**：关键词召回**"精确但脆弱"** —— 它找的是**包含这个词的片段**，而不是**回答这个问题的片段**。用户问"B200 的散热设计"，关键词路可能召回十条都含 `B200`、但讲的是价格 / 供货 / 包装的切片。
+
+#### 9.2.4 ⭐ 这个 guard 是**必需的**（否则会崩）
+
+如果不写 `if top.vector_score is None: return True` 这个 guard，直接执行最后一行：
+
+```python
+return top.vector_score < settings.retrieval_min_score    # None < 0.6
+```
+
+**`None < 0.6` 在 Python 3 会抛**：
+
+```
+TypeError: '<' not supported between instances of 'NoneType' and 'float'
+```
+
+所以这个分支同时做了两件事，**必须把两者分开看**：
+
+| 事项 | 性质 |
+| --- | --- |
+| **必须处理 `None`** | **语言约束**（不处理就崩） |
+| **处理方式是"拒答"还是"放行"** | **业务选择**（教程选保守拒答） |
+
+> **一般性结论**：`None` 参与比较运算在 Python 里必然崩。任何"可选分数"进入阈值判断前，
+> 都**必须**有一个显式的 `None` 分支——这个分支无论如何都要写；
+> 区别只在于"放行还是拒答"是业务选择，而"必须处理 `None`"是语言约束。
+
+#### 9.2.5 一句话记住
+
+**`score` 是给「排序」用的，`vector_score` 才是给「阈值」用的。两者在混合模式下不再相等**（`vector_retriever.py` L108 / L113 的等式只在单路成立，详见 §9.3）。
 
 ### 9.3 `score` 与 `vector_score` 的等式只在单路成立
 
@@ -864,7 +946,7 @@ X 是 Y 的 2.03 倍
 
 RRF 分的值域 `≈[0, 0.033]`，**永远小于 0.6**。
 
-**改成**：判定依据从 `score` 换成 `vector_score`，并放行 `vector_score is None`（仅关键词命中）。详见 §9.2。
+**改成**：判定依据从 `score` 换成 `vector_score`；且 **`vector_score is None`（仅关键词命中）时保守拒答**——注意这个 `None` 分支无论如何都必须写，否则会抛 `TypeError`。详见 §9.2。
 
 | 作答情况 | 评价 |
 | --- | --- |
@@ -941,7 +1023,7 @@ RRF 分的值域 `≈[0, 0.033]`，**永远小于 0.6**。
 ✅ HybridRetriever（两路并发 + RRF 融合）                  ← 第 8 步
 ✅ config: rrf_k=60 / retrieval_recall_top_k=20
 ⬜ retrieve 节点：VectorRetriever → HybridRetriever 切换   ← 第 9 步
-⬜ 拒答口径：score → vector_score，并放行 None             ← 第 9 步（见 §9.2）
+⬜ 拒答口径：score → vector_score（None 时保守拒答）      ← 第 9 步（见 §9.2，已完成）
 ⬜ retrieval_meta 打包 + 落库到 answer_citations           ← 第 9 步
 ⬜ 关键词腿静默归零的可观测性（记 keyword_hits 数）           ← 待定
 ⬜ 宽兜底的告警层（连续 N 次降级报警）                       ← 技术债
@@ -960,7 +1042,8 @@ RRF 分的值域 `≈[0, 0.033]`，**永远小于 0.6**。
 > 「仅关键词命中」的入口**，没有它关键词腿就无法引入向量路的盲区文档；
 > **③ 三处工具函数都把 `score` 改写成 `rrf_score`**（契约上正确），
 > **但这直接导致 `retrieve` 节点用 `score < 0.6` 判拒答会恒拒答**（实测 RRF 分仅 0.016~0.033），
-> 第 9 步必须改用 `vector_score` 并放行 `None`；
+> 第 9 步必须改用 `vector_score`，且 **`vector_score is None`（仅关键词命中）时保守拒答**
+> ——该 `None` 分支无论如何都必须写，否则 `None < 0.6` 会抛 `TypeError`；
 > 已实测到的缺口有两处：**关键词腿在 AND 语义下会静默归零**（`'上传 报错'` → 0 命中），
 > 以及**宽兜底缺告警层**，会让"某一路长期全挂"被伪装成正常降级。
 
