@@ -14,7 +14,7 @@
    全面适配异步编程范式，向量生成与底层数据库检索均基于 `async/await` 非阻塞执行，杜绝阻塞主事件循环。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 # 引入异步数据库会话类，用于支持 async/await 异步数据库操作
@@ -31,9 +31,15 @@ from app.ingestion.embedder import get_embeddings
 class RetrievedChunk:
     """
     检索结果中单个 chunk 的展示视图（DTO 数据传输对象）。
-    统一各模块之间传递的检索数据契约，后续可扩展 rerank 分数等字段。
+    统一各模块之间传递的检索数据契约。
 
-    score 是 cosine similarity（已统一成“越大越相似”），便于上层做阈值判断。
+    【score 字段的兼容语义】：
+    score 恒为"越大越相似"，但它的**具体含义随召回路径变化**：
+    - 向量单路：等价于 vector_score（余弦相似度，值域 [0,1]）；
+    - 关键词单路：等价于 keyword_score（ts_rank，无固定上界）；
+    - 混合检索：等价于 rrf_score（RRF 融合分）。
+    score 与 vector_score 两个字段并存，是为了让下游能分别按
+    「统一排序位」或「特定路的原始分」取值，语义更清晰不产生歧义。
     """
     chunk_id: UUID  # 分块的全局唯一标识
     document_id: UUID  # 分块所属文档的全局唯一标识
@@ -41,7 +47,18 @@ class RetrievedChunk:
     content: str  # 切分出的文本分块原始内容
     page_no: int | None  # 分块所在的页码（若无页码概念则为 None）
     section_path: str | None  # 分块在文档结构中的章节层级路径（如：第1章/1.1节）
-    score: float  # 余弦相似度分数，值越大表示相关度越高
+    score: float  # 排序用的统一分数，值越大表示相关度越高
+
+    # --- 以下 6 个字段为第 6 期新增：承载双路召回与 RRF 融合的调试信息 ---
+    # sources / vector_rank / keyword_rank / rrf_score 是双路检索的调试字段，
+    # 用于让前端调试面板与问题排查能看清"这条是从哪一路召回来的、各排第几"。
+    # 单路检索时只有该路自己的 rank 有值，混合检索时多个字段会同时填上。
+    sources: tuple[str, ...] = field(default_factory=tuple)  # 命中来源，如 ("vector",) 或 ("vector","keyword")
+    vector_rank: int | None = None  # 在向量一路里的排名（1 起）；未命中为 None
+    vector_score: float | None = None  # 原始余弦相似度（仅向量路命中时填充）
+    keyword_rank: int | None = None  # 在关键词一路里的排名（1 起）；未命中为 None
+    keyword_score: float | None = None  # 原始 ts_rank（仅关键词路命中时填充）
+    rrf_score: float | None = None  # RRF 融合分（Σ 1/(k + rank)），仅混合检索时填充
 
 
 class VectorRetriever:
@@ -84,7 +101,16 @@ class VectorRetriever:
                 # 4. 距离转相似度分数：
                 #    pgvector 的 cosine_distance 范围在 [0, 2]（标准化向量为 [0, 1]），距离越小越相似；
                 #    通过 1.0 - distance 将其转换为相似度（范围 [0, 1]），数值越大代表越相似。
+                #    【为什么 score 与 vector_score 写成同一个表达式】：
+                #    历史上 score 就等价于向量余弦相似度，retrieve 节点的拒答阈值
+                #    （settings.retrieval_min_score）与前端引用卡片的 score 展示都依赖这个语义。
+                #    单路向量检索时二者必须严格相等，否则阈值判定会与新字段悄悄脱钩。
                 score=1.0 - distance,
+                # 5. 填充第 6 期新增的调试字段：
+                #    enumerate(..., start=1) 让 rank 从 1 起，与 RRF 公式里的 rank 口径一致
+                sources=("vector",),
+                vector_rank=rank,
+                vector_score=1.0 - distance,
             )
-            for chunk, distance in rows
+            for rank, (chunk, distance) in enumerate(rows, start=1)
         ]

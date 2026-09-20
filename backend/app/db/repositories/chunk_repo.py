@@ -27,7 +27,6 @@ from uuid import UUID
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 # 引入文档与文档分块持久层 ORM 模型
 from app.db.models import Document, DocumentChunk
 # 引入关系急加载加载策略，用于在异步环境下高效加载关联父表
@@ -245,3 +244,64 @@ class DocumentChunkRepository:
 
         # 4. 组装为强类型元组返回，将 distance 标量安全转为 Python float
         return [(chunk, float(dist)) for chunk, dist in rows]
+
+    async def keyword_search(
+            self,
+            query: str,
+            top_k: int,
+    ) -> list[tuple[DocumentChunk, float]]:
+        """
+        基于 PostgreSQL 全文检索召回与用户输入最相关的 Top-K 文档切片。
+
+        核心设计与工作流程：
+        1. 中文分词（chinese_zh）：
+           - 使用 Alembic 迁移预建好的 'chinese_zh' 全文检索配置（底层集成 zhparser 分词插件）。
+        2. 智能容错与语义解析（plainto_tsquery）：
+           - 将用户输入当作纯文本处理，切词后自动按逻辑 AND（&）组装；
+           - 智能容错：例如无论用户搜「差旅 报销」还是「差旅报销」，都会切成同一组 token；
+           - 规避崩溃：自动过滤 &、!、:、* 等特殊字符，防止畸形输入触发 SQL 语法错误。
+        3. 状态校验（status = 'ready'）：
+           - 严格仅召回入库完成的有效文档，避免拿到正在解析或失败的脏 chunk（与向量检索保持一致）。
+        4. 分值与排序（ts_rank）：
+           - 基于词频（TF）和词项稀缺度打分，分数越大代表字面匹配度越高；
+           - 【注意】ts_rank 与向量检索的余弦相似度数值体系完全不同，不能直接比大小，
+             多路混合检索时需在后续业务层统一交由 RRF（倒数排名融合）算法排序。
+
+        :param query: 用户原始输入的搜索文本（支持任意特殊字符与空格）
+        :param top_k: 期望返回的最相关切片最大条数
+        :return: (DocumentChunk 实体, ts_rank 相关度得分) 的元组列表，按分值降序排列
+        """
+        # 1. 查询词解析：切词并生成数据库匹配表达式（tsquery）
+        #    【说明】func 是 SQLAlchemy 的动态工厂（通过 __getattr__ 映射底层 SQL 函数），
+        #    IDE 提示“找不到要转到的声明”属正常现象，不影响运行。
+        tsquery = func.plainto_tsquery("chinese_zh", query)
+
+        # 2. 构造评分表达式：计算切片全文向量与查询表达式的匹配得分
+        #    【避坑】SQLAlchemy 未在方言顶层直接封装 ts_rank 函数，必须通过 func.ts_rank 动态调用，
+        #    否则显式 import 会抛出 ImportError。
+        rank_expr = func.ts_rank(DocumentChunk.content_tsv, tsquery)
+
+        # 3. 编排检索 SQL 语句
+        stmt = (
+            select(DocumentChunk, rank_expr.label("rank"))
+            # 关联父级 Document 表，用于校验整篇文档的状态
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .where(
+                # 状态守卫：仅检索就绪状态的文档，过滤脏数据
+                Document.status == "ready",
+                # 全文命中：@@ 操作符判断切片分词向量（content_tsv）是否满足 tsquery
+                DocumentChunk.content_tsv.op("@@")(tsquery),
+            )
+            # 按全文匹配分降序排列（最相关的排在最前）
+            .order_by(rank_expr.desc())
+            # 限制召回最大条数
+            .limit(top_k)
+            # 预加载父文档实体：通过 JOIN 一并查出 document，防止后续访问 chunk.document 时产生 N+1 查询
+            .options(selectinload(DocumentChunk.document))
+        )
+
+        # 4. 异步执行查询并取出所有命中行
+        rows = (await self.session.execute(stmt)).all()
+
+        # 5. 组装返回：将数据库数值安全转为 Python 原生 float
+        return [(chunk, float(rank)) for chunk, rank in rows]

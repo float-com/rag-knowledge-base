@@ -16,12 +16,16 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 
 from datetime import datetime
 from enum import Enum
+from typing import Any
 from uuid import UUID, uuid4
 
 # 向量检索扩展：用于支持 pgvector 的 Vector 字段类型
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    # 生成列（GENERATED ALWAYS AS ... STORED）构造器：
+    # 声明后 SQLAlchemy 会把它从 INSERT / UPDATE 语句中自动剔除，交给数据库维护
+    Computed,
     DateTime,
     ForeignKey,
     Integer,
@@ -30,7 +34,8 @@ from sqlalchemy import (
     func,
 )
 # PostgreSQL 方言类型：支持 JSONB 高效二进制存储及原生 UUID 映射
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+# TSVECTOR：全文检索向量列类型，对应 PostgreSQL 原生 tsvector
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID as PGUUID
 # SQLAlchemy 2.0 现代声明式语法核心：
 # Mapped 用于 Python 侧类型注解（提供 IDE 智能提示与静态类型检查）
 # mapped_column 用于底层数据库字段定义（生成 DDL 约束与列类型）
@@ -488,6 +493,34 @@ class DocumentChunk(Base):
     )
 
     # --------------------------------------------------------------------------
+    # 中文全文检索向量列（第 6 期新增）
+    # --------------------------------------------------------------------------
+    # content_tsv: 存放 content 文本中文分词后的 tsvector 检索向量
+    #
+    # 1. 为什么用 Computed(..., persisted=True)？
+    #    - 它是 SQLAlchemy 对应 PostgreSQL "GENERATED ALWAYS AS ... STORED"（生成列）的声明。
+    #    - 【核心作用】：向 ORM 明确声明“该列完全由数据库自动算、自动存，代码切勿碰它”。
+    #    - 【代码零改动】：有了它，SQLAlchemy 生成 INSERT / UPDATE 语句时会自动忽略本列，
+    #      既不会把原有的 chunk_repo.bulk_add 破坏，也避免了向生成列写入 NULL 导致数据库报错。
+    #
+    # 2. 为什么显式指定 TSVECTOR 类型？
+    #    - Python 注解写的是 Mapped[Any]，SQLAlchemy 无法据此自动反推出底层的数据库类型。
+    #    - 显式写明 TSVECTOR，才能与 PG 原生的 tsvector 字段类型精准对齐，
+    #      避免 Alembic 数据库迁移工具误报“模型与数据库类型不一致”。
+    #
+    # 3. 表达式必须与数据库迁移脚本（Alembic Migration）保持完全一致：
+    #    - 分词配置必须同为 'chinese_zh'，否则 `alembic check` 会判定存在模型漂移。
+    # --------------------------------------------------------------------------
+    content_tsv: Mapped[Any] = mapped_column(
+        # 显式指定 PostgreSQL 原生全文检索向量类型
+        TSVECTOR,
+        # 生成规则：由数据库调用 chinese_zh 分词器自动生成，并物理持久化存储到磁盘
+        Computed("to_tsvector('chinese_zh', content)", persisted=True),
+        nullable=False,
+        comment="中文全文检索向量（数据库自动维护）"
+    )
+
+    # --------------------------------------------------------------------------
     # 审计时间戳
     # --------------------------------------------------------------------------
     # 记录创建时间：
@@ -771,6 +804,30 @@ class AnswerCitation(Base):
         Text,
         nullable=False,
         comment="引用的原始文本片段快照"
+    )
+
+    # --------------------------------------------------------------------------
+    # 检索调试元数据（第 6 期新增）
+    # --------------------------------------------------------------------------
+    # 作用：记录当前切片（Chunk）被召回的全过程参数，用于线上排查
+    #      （例如分析：某片段到底凭什么排到前列？是被语义模型相中，还是纯粹撞上了关键词？）
+    #
+    # 字段结构 (以 JSON 存储在 PostgreSQL JSONB 列中)
+    # 1. 命中来源：
+    #    - sources: list[str]，可能的值：["vector"]、["keyword"] 或 ["vector", "keyword"]
+    # 2. 向量语义路 (Dense Retrieval)
+    #    - vector_rank  : 向量路排名（从 1 开始）；未命中该路则为 None
+    #    - vector_score : 余弦相似度 (Cosine Sim，范围通常在 0~1，越高语义越贴近)；未命中为 None
+    # 3. 关键词全文路 (Sparse Retrieval)
+    #    - keyword_rank : 关键词路排名（从 1 开始）；未命中该路则为 None
+    #    - keyword_score: PG 原生全文检索匹配分 (ts_rank，代表词频命中密度)；未命中为 None
+    # 4. 综合仲裁 (RRF Fusion)
+    #    - rrf_score    : 双路排名通过 RRF 融合公式计算出的最终得分，决定最终输出顺序
+    # --------------------------------------------------------------------------
+    retrieval_meta: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="检索调试元数据（召回来源、单路排名与分数、RRF融合分）"
     )
 
     # --------------------------------------------------------------------------
