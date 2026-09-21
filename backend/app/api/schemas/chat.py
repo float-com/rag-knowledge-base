@@ -216,6 +216,74 @@ def _parse_query_route(metadata: dict | None) -> QueryRouteRead | None:
 
 
 # =============================================================================
+# 3.1 Agentic 循环决策轨迹（第 7 期）
+# =============================================================================
+# 决策动作字面量联合类型：
+# 取值必须与 app.llm.agent_planner.AgentAction 一致，另加首轮的 "initial"
+# （首轮不是 planner 给的，而是"沿用 route_query 决策"，因此单独列出）
+AgentActionValue = Literal[
+    "initial", "proceed", "rewrite_query", "switch_route", "refuse"
+]
+
+
+class AgentStep(BaseModel):
+    """Agentic 循环单轮决策 + 观察快照。
+
+    与 state 里 `agent_steps` 的 dict 结构【逐字段对应】：
+    - `plan_retrieval` 先填决策字段（round / action / reason / route / query）；
+    - `retrieve` 之后由 `observe_context` 回填观察字段
+      （retrieved_count / top_score / sufficient）。
+    前端 TypeScript 类型由 OpenAPI 自动生成，因此字段名不允许随意改。
+
+    【观察字段为什么可空】：
+    回填只发生在 `observe_context` 执行之后。若图在 `plan_retrieval` 的 refuse 分支
+    直接结束（不经过检索与观察），这条记录就只有决策字段、观察字段为 None。
+    这不是"缺数据"，而是如实表达"这一轮没有执行检索"。
+    """
+
+    round: int
+    action: AgentActionValue
+    reason: str
+    route: QueryRouteValue
+    query: str
+    # 以下三个字段由 observe_context 回填；未执行检索时为 None
+    retrieved_count: int | None = None
+    top_score: float | None = None
+    sufficient: bool | None = None
+
+
+def _parse_agent_steps(metadata: dict | None) -> list[AgentStep] | None:
+    """从 messages.metadata 解析 agent_steps：缺失 / 非法静默返回 None。
+
+    与 `_parse_query_route` / `_parse_retrieval_meta` 同样的兜底风格，
+    但多一层"逐条过滤"：agent_steps 是【数组】，不能因为其中一条脏数据
+    就丢掉整条决策链。因此这里逐条校验、跳过非法项，而不是整体失败。
+
+    :param metadata: Message.extra_metadata（可为 None）
+    :return: 校验通过的决策列表；缺失或非法时返回 None
+    """
+    # 第一层：元数据本身缺失（老数据 / user 消息）
+    if not metadata:
+        return None
+    raw = metadata.get("agent_steps")
+    # 第二层：必须是【非空】列表 —— 空列表与 None 都视为"没有决策轨迹"
+    if not isinstance(raw, list) or not raw:
+        return None
+    # 第三层：逐条校验，跳过不是 dict 的项，再交给 Pydantic
+    parsed: list[AgentStep] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            parsed.append(AgentStep.model_validate(item))
+        except Exception:
+            # 单条非法只跳过这一条，不影响其余决策的展示
+            continue
+    return parsed or None
+
+
+
+# =============================================================================
 # 4. 消息模型
 # =============================================================================
 class MessageRead(BaseModel):
@@ -231,6 +299,9 @@ class MessageRead(BaseModel):
     # 【为什么必须是顶层字段】前端 fromServerMessage 读取的是 m.query_route，
     # 若只存在数据库的 metadata 里而不在此暴露，刷新历史后调试面板会消失。
     query_route: QueryRouteRead | None = None
+    # Agentic 循环决策轨迹：同样只挂在 assistant 消息上。
+    # user 消息 / 旧消息 / 关闭 agent loop 时为 None，前端按缺失隐藏折叠面板。
+    agent_steps: list[AgentStep] | None = None
 
     @classmethod
     def from_orm(cls, message: Message) -> "MessageRead":
@@ -270,6 +341,10 @@ class MessageRead(BaseModel):
             # 解析交给 _parse_query_route，它内部已做完整防御，不会抛异常
             query_route=(
                 _parse_query_route(message.extra_metadata) if is_assistant else None
+            ),
+            # 决策轨迹同理：只取 assistant 消息的元数据，解析失败静默为 None
+            agent_steps=(
+                _parse_agent_steps(message.extra_metadata) if is_assistant else None
             ),
         )
 

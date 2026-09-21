@@ -43,17 +43,23 @@ from app.db.repositories.citation_repo import AnswerCitationRepository
 from app.db.repositories.conversation_repo import ConversationRepository
 from app.db.session import AsyncSessionLocal
 from app.retrieval.vector_retriever import RetrievedChunk
-from app.workflows.nodes import (
-    load_context,
-    normalize_query,
-    retrieve,
-    route_query,
-    stream_generate,
-)
+from app.workflows.graph import get_rag_graph
+from app.workflows.nodes import load_context, stream_generate
 from app.workflows.rag_state import RAGState
 
 # 初始化模块级业务日志记录器
 logger = get_logger(__name__)
+
+
+def _serialize_agent_steps(state: RAGState) -> list[dict]:
+    """SSE / metadata 共用的 agent_steps 载荷格式。
+
+    把每一条决策记录浅拷贝成新 dict 再下发，避免两种后果：
+    ① 下游（前端或落库序列化）意外就地改动 state 里的原始记录；
+    ② 后续节点继续追加字段时，与已发出的载荷共享同一份对象引用。
+    """
+    return [dict(step) for step in state.get("agent_steps", [])]
+
 
 
 def _build_retrieval_meta(chunk: RetrievedChunk) -> dict:
@@ -270,9 +276,17 @@ class ChatService:
                 # 3. 装载上下文（取历史消息）、查询标准化与策略路由。
                 #    注意：这一步必须早于用户提问落库，否则 load_context 会把本轮提问也当成历史读回来。
                 state.update(await load_context(state, session))
-                state.update(await normalize_query(state))
-                # 策略路由：判定并按策略产出最终检索词（内部已保证失败降级 original，不会抛异常）
-                state.update(await route_query(state))
+
+                # 3.1 图执行：加载上下文之后、检索之前。
+                #     按最初设计，load_context 与 stream_generate 仍由 service 直接调用 ——
+                #     前者需要 AsyncSession（唯一带 DB IO 的节点），后者要逐 token yield 给 SSE；
+                #     两者都不适合放进图。图内只负责
+                #     normalize_query → route_query → plan_retrieval → retrieve → observe_context
+                #     这条带分支与循环的决策链路。
+                #    【这不是"固定公式"】：从手写 await 三个节点收缩成一次 ainvoke，
+                #     图里有几个节点、走了几轮，本层都不需要感知。
+                final_state = await get_rag_graph().ainvoke(state)
+                state.update(final_state)  # type: ignore[arg-type]
 
                 # 4. 落库用户提问并 commit。
                 #    此处单独提交一次，是为了让「用户提问」这条记录先于大模型调用持久化：
@@ -298,18 +312,33 @@ class ChatService:
                     "data": _build_query_route_payload(state),
                 }
 
-                # 7. 混合检索（向量 + 中文全文，RRF 融合）+ 拒答熔断
-                #    （判定结果由 retrieve 节点写入 state["refused"]）
-                #    【为什么这里不再传 session】：
-                #    检索器要并发跑两条腿，而一个 AsyncSession 只能对应一个连接与一个事务，
-                #    共用会互相毒化。因此 retrieve 内部自建两个独立会话，与调用方的写事务解耦。
-                state.update(await retrieve(state))
+                # 6.1 下发 Agentic 循环的决策轨迹，供前端渲染"每一轮检索做了什么"。
+                #     放在 query_route 之后：前端先拿到策略面板，再逐轮展开决策链。
+                yield {
+                    "event": "agent_steps",
+                    "data": _serialize_agent_steps(state),
+                }
 
+                # 7. 检索与观察已由第 3.1 步的图执行完成 —— 原先这里手写的
+                #    `state.update(await retrieve(state))` 已被删除：
+                #    检索（retrieve）与观测（observe_context）都是图内节点，
+                #    在 ainvoke 时一并跑完，本层不再需要、也无法单独调用它们。
+                #
                 # 8. 引用回填：ordinal 用 enumerate(start=1) 生成，与 prompt 中给模型的「片段 N」编号一致
-                citations_payload = [
-                    _serialize_citation(chunk, ordinal=i)
-                    for i, chunk in enumerate(state.get("retrieved_chunks", []), start=1)
-                ]
+                #    【拒答路径不下发引用】：
+                #    state["retrieved_chunks"] 可能还留着循环中间轮召回到的片段，
+                #    但拒答本身就意味着"这些片段不足以作为依据"，
+                #    因此拒答时不下发引用 —— 否则前端会展示出与实际结论相矛盾的"参考资料"。
+                citations_payload = (
+                    []
+                    if state.get("refused")
+                    else [
+                        _serialize_citation(chunk, ordinal=i)
+                        for i, chunk in enumerate(
+                            state.get("retrieved_chunks", []), start=1
+                        )
+                    ]
+                )
                 yield {
                     "event": "citations",
                     "data": {"citations": citations_payload},
@@ -417,6 +446,9 @@ class ChatService:
                 # 拒答标志：历史回看时无需再推断
                 "refused": bool(state.get("refused")),
                 "query_route": _build_query_route_payload(state),
+                # Agentic 循环的决策轨迹：与 agent_steps SSE 事件共用同一份序列化函数，
+                # 保证"实时展示"与"历史回看"看到的是同一条链（与 query_route 同一原则）。
+                "agent_steps": _serialize_agent_steps(state),
             },
         )
         await conv_repo.add_messages([assistant_msg])

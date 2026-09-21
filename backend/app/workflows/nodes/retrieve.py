@@ -76,9 +76,15 @@ async def retrieve(state: RAGState) -> RAGState:
         "refused": refused,
     }
 
-    # 6. 若触发熔断，直接置入标准拒答文案，下游无需再调用大模型推理
-    if refused:
-        update["answer"] = REFUSAL_ANSWER
+    # 6. 按拒答与否写入 answer（第 7 期修正：两个分支都要写）
+    #    【为什么"不拒答"时也要显式写空串】：
+    #    Agentic 循环里本节点会被执行多轮，而 LangGraph 的状态是【跨轮累积】的 ——
+    #    若第 1 轮熔断写了拒答文案、第 2 轮不熔断却不覆盖它，
+    #    这段上一轮的文案就会残留在 state 里，最终出现
+    #    「refused=False 却带着拒答文案」的矛盾状态，
+    #    而服务层在非拒答路径会把 state["answer"] 当模型答案用。
+    #    所以不熔断时必须显式清空 —— 与 plan_retrieval 的 rewrite 分支"显式写 None 清残留"同一手法。
+    update["answer"] = REFUSAL_ANSWER if refused else ""
 
     return update
 
