@@ -288,3 +288,75 @@ def build_multi_query_messages(question: str, n: int) -> list[BaseMessage]:
     :return: 可直接送入 LLM 的消息列表
     """
     return list(MULTI_QUERY_PROMPT.invoke({"question": question, "n": n}).to_messages())
+
+
+# =============================================================================
+# 第 7 期：Agentic RAG 决策器 prompt
+# =============================================================================
+# 决策器的职责：让模型看「原始问题 + 当前 query/route + 前几轮的检索观察」，
+# 输出一个 JSON 决策，告诉节点下一步该做什么。
+#
+# ⚠️ 下面两处 JSON 示例里的花括号必须写成【双花括号】{{ }}。
+#    ChatPromptTemplate 会把单个 {xxx} 当成变量占位符：写成单括号时
+#    from_messages() 能正常编译，但每次 invoke() 都会抛
+#    KeyError: 'Input to ChatPromptTemplate is missing variables {"action"}'
+#    —— 延迟到运行时才炸，是最难查的一类错误。占位符（如 {question}）用单括号。
+_AGENT_PLAN_SYSTEM = """你是 RAG 系统的检索决策器。系统会基于检索到的片段回答用户问题，
+但上一轮检索的结果不够好（Top1 语义相似度过低或没有命中）。请基于"前几轮的检索观察"，决定下一步：
+
+可选 action:
+- proceed: 当前候选已经足够回答问题，直接进入答案生成。
+- rewrite_query: 当前 query 不够清晰 / 过于口语化 / 含指代，需要换一个表达再检索；必须给出 new_query。
+- switch_route: 换一种检索策略。可选 new_route: original / rewrite / hyde / multi_query。
+- refuse: 多轮都召回不到相关内容，知识库可能不覆盖，提前拒答。
+
+策略选择建议:
+- 已经尝试过 rewrite 仍未命中 -> 试 hyde（抽象问题）或 multi_query（多角度）。
+- 已经尝试过 multi_query 仍未命中 -> 试 refuse。
+- 问题里包含明确实体 / 编号但都没检索到 -> 优先 refuse，避免无意义改写。
+
+只输出**单行 JSON**，键固定为 action / reason / new_query / new_route，缺失字段填 null。
+示例: {{"action": "rewrite_query", "reason": "原 query 含指代", "new_query": "差旅住宿标准", "new_route": null}}"""
+
+
+# 供 LangChain / LLM 使用的对话模板：
+# 四个占位符全部是单花括号，与 build_agent_plan_messages 传入的键一一对应
+_AGENT_PLAN_HUMAN = """用户原始问题: {question}
+
+当前 query: {current_query}
+当前 route: {current_route}
+
+历史轮次观察:
+{history}
+
+请输入下一步决策的 JSON。"""
+
+AGENT_PLAN_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", _AGENT_PLAN_SYSTEM), ("human", _AGENT_PLAN_HUMAN)]
+)
+
+
+def build_agent_plan_messages(
+    question: str,
+    current_query: str,
+    current_route: str,
+    history: str,
+) -> list[BaseMessage]:
+    """组装 Agentic RAG 决策器 messages，期望模型返回单行决策 JSON。
+
+    :param question: 用户原始提问（始终以它为准，避免被改写后的 query 带偏）
+    :param current_query: 当前这一轮实际用于检索的查询词
+    :param current_route: 当前生效的检索策略（original / rewrite / hyde / multi_query）
+    :param history: 前几轮检索观察的文本摘要（由节点从 agent_steps 拼出）
+    :return: 可直接送入 LLM 的消息列表
+    """
+    return list(
+        AGENT_PLAN_PROMPT.invoke(
+            {
+                "question": question,
+                "current_query": current_query,
+                "current_route": current_route,
+                "history": history,
+            }
+        ).to_messages()
+    )

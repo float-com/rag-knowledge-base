@@ -165,6 +165,19 @@ class Settings(BaseSettings):
     #   （公式 score(d) = Σ 1/(k + rank_i(d))；k 越大越平滑、越依赖"两路都命中"）
     rrf_k: int = 60
 
+    # ===== Agentic RAG =====
+    # 关掉后图退化为单轮检索，作为单轮 vs agent 循环的对比开关。
+    #   agent_loop_enabled=False 时整个图退化成「跑一轮就出图」，
+    #   方便对比开 / 关 agent 循环的效果（与第 5 期 query_route_enabled 同一思路：
+    #   给一条"退化回上一期行为"的退路，是排查"优化是否真的有效"的第一手段）。
+    agent_loop_enabled: bool = True
+    # 最大检索轮次（含首轮）。LLM 决策最多触发 max_rounds-1 次再检索，避免循环调用。
+    #   【为什么必须是硬上限】：
+    #   没有它，一个"永远觉得召回不够好"的决策器会让循环无限转下去，
+    #   每轮一次 LLM 调用 + 两路检索，成本与延迟都会失控。
+    #   有了它，最坏情况也有界：3 轮意味着最多 1 次首轮 + 2 次 LLM 决策。
+    agent_max_rounds: int = 3
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

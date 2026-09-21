@@ -60,9 +60,21 @@ class RAGState(TypedDict, total=False):
     # 是否触发知识库拒答（例如检索结果为空或相似度过低）。为 True 时在条件路由中直接跳过 generate 生成节点
     refused: bool
 
-    # --- 6. 大模型回答生成节点 (generate 节点产出) ---
+    # --- 6. Agentic RAG 循环 (plan_retrieval / observe_context 产出) ---
+    # agent_steps 每一项形如：
+    #   {round, action, reason, route, query, retrieved_count, top_score}
+    # 由 plan_retrieval 追加「决策」字段、observe_context 回填「观察」字段，
+    # 避免同一轮分两条记录（否则轮次与观测的对应关系要靠下标去猜，极易错位）。
+    agent_steps: list[dict]
+    # 当前轮次（从 1 开始）。observe_context 用它和 agent_max_rounds 比较来判断是否收敛；
+    # 注意它必须每轮自增，否则「轮次用尽」这个出口永远不触发 → 死循环。
+    retrieval_round: int
+    # observe_context 判定本轮候选是否足够；True 时图走向 END
+    context_sufficient: bool
+
+    # --- 7. 大模型回答生成节点 (generate 节点产出) ---
     answer: str                 # LLM 根据参考片段最终生成的回答内容（包含 [N] 引用标记）
 
-    # --- 7. 持久化后置落库节点 (chat_service 落库后回写) ---
+    # --- 8. 持久化后置落库节点 (chat_service 落库后回写) ---
     user_message_id: UUID       # 写入数据库后生成的本轮用户提问 Message 唯一主键
     assistant_message_id: UUID  # 写入数据库后生成的本轮 AI 回复 Message 唯一主键
