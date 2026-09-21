@@ -316,7 +316,11 @@ class ChatService:
                 #     放在 query_route 之后：前端先拿到策略面板，再逐轮展开决策链。
                 yield {
                     "event": "agent_steps",
-                    "data": _serialize_agent_steps(state),
+                    # 【为什么包一层对象】与 citations 的 {"citations": [...]} 保持同一风格。
+                    # 成品前端 chatStream.ts 的解析是 `data.steps`，若这里直接发裸数组，
+                    # data.steps 会是 undefined → 前端拿到空数组 → 【实时对话时面板不渲染】
+                    # （历史回看不受影响：MessageRead.agent_steps 是顶层字段、形状本来就对）。
+                    "data": {"steps": _serialize_agent_steps(state)},
                 }
 
                 # 7. 检索与观察已由第 3.1 步的图执行完成 —— 原先这里手写的
