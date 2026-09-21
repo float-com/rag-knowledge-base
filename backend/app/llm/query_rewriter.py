@@ -161,19 +161,34 @@ class QueryRewriter:
         #         clean_queries.append(q)
         # return clean_queries
 
-    async def optimize(self, question: str, multi_query_count: int) -> QueryRouteResult:
-        """**统一入口**：按「路由 → 调用对应策略 → 返回结果」串起四种策略。
+    async def apply_route(
+        self,
+        question: str,
+        route: QueryRoute,
+        multi_query_count: int,
+    ) -> QueryRouteResult:
+        """**已知目标 route 时，按 route 执行对应改写链路并填充 QueryRouteResult。**
 
-        任何一步失败都降级为 original，绝不向调用方抛异常。
+        【与同类中 optimize 的关系】：
+         - `optimize`（本类 L241，第 5 期的对外唯一入口）
+              = 调 decide_route 判定 route  →  再委派给本方法分发；
+         - `apply_route`（本方法）
+              = 跳过判定，直接按调用方给定的 route 执行。
+         两条路径共用同一套分发与降级逻辑，只是"route 从哪来"不同。
 
-        :param question: 用户原始提问
+        【为什么抽出本方法（第 7 期 Agentic RAG）】：
+        `plan_retrieval` 的 `switch_route` 决策由 **planner 直接指定** route，
+        而不是让模型再判一次。此时若复用 `optimize`，就会"先判定、再把判定结果丢掉"，
+        白跑一次判定用的 LLM 调用。抽出本方法后：
+        - 复用同一套分发逻辑与降级兜底；
+        - 避免在 `plan_retrieval` 节点里再写一遍 if/elif 与异常处理。
+
+        :param question: 用户原始提问（各策略都以它为输入基准）
+        :param route: 已知要执行的策略（来自 planner 的决策）
         :param multi_query_count: multi_query 策略的子查询条数
-        :return: 结构化优化结果（不可变）
+        :return: 结构化优化结果；任何失败都降级为 original
         """
         try:
-            # 第一步：先判定策略
-            route = await self.decide_route(question)
-
             if route == "rewrite":
                 rewritten = await self.rewrite(question)
                 if not rewritten:
@@ -210,12 +225,36 @@ class QueryRewriter:
                     route="multi_query", query=question, multi_queries=queries
                 )
 
+            # 兜底：route 不在枚举内（如上游给了意料外的字符串）时，
+            # 既不改写也不生成，直接用原问题检索 —— 与 optimize 的末位 return 语义一致
             return QueryRouteResult(route="original", query=question)
 
         except Exception:
             # 任何异常（模型抖动、网络错误、上游 5xx、解析失败）都收敛到 original
-            logger.exception("query_optimize 失败，降级 original: question=%r", question)
+            logger.exception(
+                "apply_route 失败，降级到 original: route=%s question=%r",
+                route,
+                question,
+            )
             return QueryRouteResult(route="original", query=question)
+
+    async def optimize(self, question: str, multi_query_count: int) -> QueryRouteResult:
+        """**完整 4 选 1**：先判定路由，再分发到 `apply_route`。
+
+        任何一步失败都降级为 original，绝不向调用方抛异常。
+
+        :param question: 用户原始提问
+        :param multi_query_count: multi_query 策略的子查询条数
+        :return: 结构化优化结果（不可变）
+        """
+        # 第一步：判定策略（decide_route 内部已做失败降级，这里再兜一层防御）
+        try:
+            route = await self.decide_route(question)
+        except Exception:
+            logger.exception("query route 判定失败，降级到 original: question=%r", question)
+            return QueryRouteResult(route="original", query=question)
+        # 第二步：按判定结果执行对应链路（分发与降级都在 apply_route 内闭环）
+        return await self.apply_route(question, route, multi_query_count)
 
 
 # =============================================================================
