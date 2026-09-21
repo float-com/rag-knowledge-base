@@ -13,6 +13,8 @@
 from app.workflows.nodes.generate import stream_generate
 from app.workflows.nodes.load_context import load_context
 from app.workflows.nodes.normalize_query import normalize_query
+from app.workflows.nodes.observe_context import observe_context
+from app.workflows.nodes.plan_retrieval import plan_retrieval
 from app.workflows.nodes.retrieve import retrieve
 from app.workflows.nodes.route_query import route_query
 
@@ -21,6 +23,8 @@ __all__ = [
     "load_context",     # 1. 历史消息加载节点
     "normalize_query",  # 2. Query 标准化与意图透传节点
     "route_query",      # 3. 查询优化策略路由节点（判定并按策略产出最终检索词）
-    "retrieve",         # 4. 向量检索与拒答熔断节点
-    "stream_generate",  # 5. 大模型流式输出生成节点
+    "plan_retrieval",   # 4. Agentic 循环决策节点（决定本轮用什么 query / route）
+    "retrieve",         # 5. 混合检索与拒答熔断节点
+    "observe_context",  # 6. Agentic 循环观察节点（判定是否足够、回填观察字段）
+    "stream_generate",  # 7. 大模型流式输出生成节点
 ]
