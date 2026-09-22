@@ -17,8 +17,6 @@
 from app.core.config import settings
 # 引入决策器单例（第 5 章封装）
 from app.llm.agent_planner import get_agent_planner
-# 引入拒答兜底文案常量
-from app.llm.prompts import REFUSAL_ANSWER
 # 引入改写器单例（switch_route 要真正补齐策略字段）
 from app.llm.query_rewriter import get_query_rewriter
 # 引入策略字面量类型与图状态契约
@@ -123,10 +121,12 @@ async def plan_retrieval(state: RAGState) -> RAGState:
     )
     update["agent_steps"] = steps
 
-    # 8. refuse 时直接终止图：retrieve 不再跑，answer 也要在这里兜底，
-    #    否则 service 看到 refused=True 但 state["answer"] 缺失会发送空 token
+    # 8. refuse 决议【只做标记，不写文案】：
+    #    文案由 refuse 节点统一输出（第 8 期收敛），本节点只声明"该走拒答出口了"。
+    #    图的条件边 _after_plan 会读到 action == "refuse"，把控制权交给 refuse 节点。
+    #    【为什么这样可以】服务层按 state["refused"] 分流，而文案由 refuse 节点写入，
+    #    两者最终都会落到 state 上，不存在"标记了却没文案"的窗口。
     if decision.action == "refuse":
         update["refused"] = True
-        update["answer"] = REFUSAL_ANSWER
 
     return update

@@ -1,12 +1,16 @@
-"""retrieve: 执行混合检索（向量 + 中文全文，RRF 融合），并判断是否触发拒答。
+"""retrieve: 执行混合检索（向量 + 中文全文，RRF 融合）。
 
 multi_query 路径下需要多路召回 → 去重；其他路径走单路。
+
+【第 8 期职责收窄】：本节点【只负责召回】，不再判拒答、不再写 answer。
+- 拒答判定移交给 `judge_context`（精排后按精排分裁定）；
+- 拒答文案统一由 `refuse` 节点输出。
+因此出口从 `retrieval_top_k` 【放大】到 `retrieval_recall_top_k` ——
+把全部候选交给下游 rerank 精排，由精排决定最终留下哪几条。
 """
 
 # 引入全局系统配置单例
 from app.core.config import settings
-# 引入拒答兜底文案常量
-from app.llm.prompts import REFUSAL_ANSWER
 # 引入混合检索器：内部完成两路并发召回 + RRF 融合 + 取最终 Top-K
 from app.retrieval.hybrid_retriever import HybridRetriever
 # 引入切片数据契约（_merge_chunks 的类型标注与返回值需要）
@@ -16,7 +20,7 @@ from app.workflows.rag_state import RAGState
 
 
 async def retrieve(state: RAGState) -> RAGState:
-    """RAG 工作流节点：执行混合检索并进行语义置信度校验与拒答熔断。
+    """RAG 工作流节点：执行混合检索，产出候选切片。
 
     【双路径设计】：
     - multi_query 路径：对各条子查询逐路召回，合并去重后取全局 Top-K；
@@ -28,17 +32,22 @@ async def retrieve(state: RAGState) -> RAGState:
     （一个 AsyncSession 只对应一个连接和一个事务状态，共用会让两路互相毒化）。
     因此本节点不再需要数据库会话参数，也就不再与调用方的写事务耦合。
 
+    【本期只做召回，不判拒答】：
+    召回阶段的口径是"宁滥勿缺"——尽量多地把可能有用的都捞回来。
+    截断需要一个"相关性"判据，而本阶段手里只有 RRF 融合分，它只反映排名；
+    真正的相关性判据来自下游的 rerank（成对打分），所以截断也放到那里做。
+
     :param state: 当前工作流状态（需包含 "query"；multi_query 时还需 "multi_queries"）
-    :return: 增量状态更新字典，包含 retrieved_chunks、refused 及可能的 answer
+    :return: 增量状态更新字典，仅含 retrieved_chunks
     """
     # 1. 实例化混合检索器：它自身无状态、不持有会话，可以放心在此新建
     retriever = HybridRetriever()
 
-    # 2. 两个不同的召回口径（必须区分，写反不会报错但会静默少召回）：
-    #    - recall_top_k：每条腿各自召回的候选宽度，必须够宽，融合才有素材；
-    #    - final_top_k ：融合之后真正交给 LLM 的切片数，受 prompt Token 预算约束。
+    # 2. 本期只保留一个召回口径：recall_top_k。
+    #    【为什么不再需要 final_top_k】：
+    #    融合之后不再截断——全部候选交给 rerank 精排后再裁，
+    #    这样"哪几条最终进 prompt"由精排分决定，而不是由融合分决定。
     recall_top_k = settings.retrieval_recall_top_k
-    final_top_k = settings.retrieval_top_k
 
     # 3. 按策略决定召回路径
     if state.get("route") == "multi_query" and state.get("multi_queries"):
@@ -55,70 +64,20 @@ async def retrieve(state: RAGState) -> RAGState:
                 await retriever.search(
                     sub_query,
                     recall_top_k=recall_top_k,
-                    final_top_k=final_top_k,
+                    final_top_k=recall_top_k,
                 )
             )
-        chunks = _merge_chunks(bundles, top_k=final_top_k)
+        chunks = _merge_chunks(bundles, top_k=recall_top_k)
     else:
-        # 单查询:  query → 1 次混合检索 → 融合后 Top-K 条 chunks
+        # 单查询:  query → 1 次混合检索 → 融合后的候选（不截断）
         chunks = await retriever.search(
             state["query"],
             recall_top_k=recall_top_k,
-            final_top_k=final_top_k,
+            final_top_k=recall_top_k,
         )
 
-    # 4. 拒答熔断判定（判定口径见 _should_refuse 的说明）
-    refused = _should_refuse(chunks)
-
-    # 5. 组装基础增量更新数据
-    update: RAGState = {
-        "retrieved_chunks": chunks,
-        "refused": refused,
-    }
-
-    # 6. 按拒答与否写入 answer（第 7 期修正：两个分支都要写）
-    #    【为什么"不拒答"时也要显式写空串】：
-    #    Agentic 循环里本节点会被执行多轮，而 LangGraph 的状态是【跨轮累积】的 ——
-    #    若第 1 轮熔断写了拒答文案、第 2 轮不熔断却不覆盖它，
-    #    这段上一轮的文案就会残留在 state 里，最终出现
-    #    「refused=False 却带着拒答文案」的矛盾状态，
-    #    而服务层在非拒答路径会把 state["answer"] 当模型答案用。
-    #    所以不熔断时必须显式清空 —— 与 plan_retrieval 的 rewrite 分支"显式写 None 清残留"同一手法。
-    update["answer"] = REFUSAL_ANSWER if refused else ""
-
-    return update
-
-
-def _should_refuse(chunks: list[RetrievedChunk]) -> bool:
-    """混合检索后的拒答判定，仅看 Top1 的语义相关度。
-
-    【为什么不能再用 chunks[0].score 比阈值】：
-    混合检索之后 score 字段存的是 RRF 融合分，量级约为 [0, 0.033]，
-    而 retrieval_min_score（0.6）是按余弦相似度标定的——两者量纲完全不同，
-    直接比较会让所有查询都恒拒答。所以必须回到"向量路的原始相似度" vector_score 上判断。
-
-    【为什么 Top1 的 vector_score 为 None 时要拒答】：
-    None 表示"向量路压根没召回它"，也就是仅由关键词路命中的切片。
-    这类切片虽然字面精确（型号 / 接口路径 / 错误码），但它缺少语义层面的证据：
-    无从判断这段文字是否真的在回答当前问题，可能只是恰好命中了同一个词。
-    因此采取保守策略——宁可拒答，也不在没有语义佐证的情况下让模型开口。
-
-    :param chunks: 融合后的切片列表（已按 rrf_score 降序）
-    :return: True 表示应触发拒答熔断
-    """
-    # 场景 A：一条都没召回 → 无任何依据，必然拒答
-    if not chunks:
-        return True
-
-    # 取融合后的首位：排序依据是 RRF 分，因此它就是"两条腿综合看最相关"的那一条
-    top = chunks[0]
-
-    # 场景 B：Top1 仅命中关键词路，缺乏语义佐证 → 保守拒答
-    if top.vector_score is None:
-        return True
-
-    # 场景 C：向量路命中了，但语义相似度低于阈值 → 不达标，拒答
-    return top.vector_score < settings.retrieval_min_score
+    # 4. 只写召回结果 —— refused / answer 都不再由本节点负责
+    return {"retrieved_chunks": chunks}
 
 
 def _merge_chunks(
