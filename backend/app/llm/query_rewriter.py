@@ -27,8 +27,10 @@ from dataclasses import dataclass
 from typing import get_args
 
 from app.core.logging import get_logger
+from app.db.models import Message, MessageRole
 from app.llm.models import get_chat_model
 from app.llm.prompts import (
+    build_contextualize_messages,
     build_hyde_messages,
     build_multi_query_messages,
     build_rewrite_messages,
@@ -42,6 +44,36 @@ logger: logging.Logger = get_logger(__name__)
 # 后续所有路由返回值都拿它做白名单校验，避免模型输出污染 state。
 # 用元组而非集合，是为了让校验顺序与 QueryRoute 定义顺序一致，便于日志阅读。
 VALID_ROUTES: tuple[str, ...] = get_args(QueryRoute)
+
+# 角色 → 中文标签。给上下文化 prompt 看的人话版历史。
+# 【为什么用 MessageRole 枚举作键、而不是字母串】：
+# MessageRole 继承自 str，枚举成员与它的字符串值 __eq__ 且 __hash__ 相同（实测），
+# 因此 ORM 里读出来的 "user" 字符串也能命中这个字典；
+# 这样键既"类型安全"（只能用合法角色）又"实际可用"（字符串照常命中）。
+# 【⚠️ 为什么【不】放 MessageRole.SYSTEM】：
+# 下方的过滤条件写作 `if not role_label`，依赖"不在表里 → 被过滤"。
+# 若把 SYSTEM 也放进来，它就永远通不过过滤，与 docstring 声明的"过滤 system"矛盾。
+# system 是系统提示词、不是对话内容，塞进"对话历史"只会浪费 token 并干扰指代消解。
+_ROLE_LABEL: dict[MessageRole, str] = {
+    MessageRole.USER: "用户",
+    MessageRole.ASSISTANT: "助手",
+}
+
+
+def _format_history_text(history: list[Message]) -> str:
+    """把历史 Message 压成给 contextualize prompt 看的纯文本。
+
+    只取 user / assistant，过滤 system；空内容跳过，避免把空消息塞进 prompt 浪费 token。
+    """
+    lines: list[str] = []
+    for msg in history:
+        role_label = _ROLE_LABEL.get(msg.role)
+        # 过滤两类：角色不在白名单（如 system）、或内容为空白
+        if not role_label or not msg.content.strip():
+            continue
+        lines.append(f"{role_label}: {msg.content.strip()}")
+    # 用换行连接：prompt 里 {history} 占位符会原样嵌入这段文本
+    return "\n".join(lines)
 
 
 # 将数据类实例设为不可变（只读保护），并自动生成 __hash__ 方法以支持作为字典键或集合元素
@@ -84,6 +116,40 @@ def _extract_text(content: str | list[str | dict]) -> str:
 
 class QueryRewriter:
     """Query 优化的统一协同入口，所有 LLM 调用都是非流式 ChatOpenAI。"""
+
+    async def contextualize(self, question: str, history: list[Message]) -> str:
+        """基于多轮历史把当前问题改写成独立完整的问句。
+
+        消解"它/这个/上面提到的"等指代、补全省略，让后续 route_query / retrieve
+        看到的 query 已经独立可检索。空历史直接回原问题；任何异常 / 改写为空 → 降级回原问题。
+
+        【为什么放在 QueryRewriter 而不是 normalize_query 节点里】：
+        本类已经是"所有 LLM 改写能力"的收敛点（route / rewrite / hyde / multi_query），
+        上下文化本质是第五种改写，放进来即可复用单例、日志与降级约定。
+
+        :param question: 用户当前这一轮的原始提问
+        :param history: 数据库预加载的正序历史消息
+        :return: 改写后的独立问句；无需改写或失败时返回原问题
+        """
+        history_text = _format_history_text(history)
+        # 没有可用历史 → 没有指代可消解，直接回原问题，省一次 LLM 调用
+        if not history_text:
+            return question
+
+        try:
+            messages = build_contextualize_messages(
+                question=question, history=history_text
+            )
+            response = await get_chat_model().ainvoke(messages)
+            rewritten = _extract_text(response.content).strip()
+            # `or question`：模型偶尔返回空串，此时回退到原问题
+            return rewritten or question
+        except Exception:
+            # 与其它改写方法一致：任何失败都降级，不让 LLM 抖动阻断检索链路
+            logger.exception(
+                "contextualize 调用失败，降级回原问题: question=%r", question
+            )
+            return question
 
     async def decide_route(self, question: str) -> QueryRoute:
         """判定该走哪种优化策略，并把非法输出降级为 original。

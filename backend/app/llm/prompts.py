@@ -360,3 +360,45 @@ def build_agent_plan_messages(
             }
         ).to_messages()
     )
+
+
+# =============================================================================
+# 第 8 期：多轮上下文化 prompt
+# =============================================================================
+
+_CONTEXTUALIZE_SYSTEM = """你是一个多轮对话查询改写助手。请基于对话历史把用户当前问题改写成
+**独立完整、可单独检索**的问句：
+
+- 消解指代："它"、"这个"、"上面提到的…"、"刚才那个…"等
+- 补全省略：用户在追问场景里经常省略主语或宾语，需要从历史里把缺失成分补全
+- 不要回答问题，不要扩展含义，不要改变用户的真实意图
+- 不要加任何引号、编号、解释，只输出单行改写后的问句
+- 如果当前问题已经独立完整，直接原样输出
+
+【对话历史】
+{history}"""
+
+_CONTEXTUALIZE_HUMAN = "{question}"
+
+CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", _CONTEXTUALIZE_SYSTEM), ("human", _CONTEXTUALIZE_HUMAN)]
+)
+
+
+def build_contextualize_messages(question: str, history: str) -> list[BaseMessage]:
+    """组装多轮上下文化改写的 messages。
+
+    【为什么 history 是【已格式化好的纯文本】而不是 Message 列表】：
+    把 Message → 纯文本的转换放在调用方（query_rewriter 的 _format_history_text），
+    让 prompt 层保持"只认字符串"的简单契约 ——
+    与 build_agent_plan_messages 的 history 参数同一做法。
+
+    :param question: 用户当前这一轮的原始提问
+    :param history: 已格式化的对话历史文本（每行形如"用户: xxx"）
+    :return: 可直接送入 LLM 的消息列表
+    """
+    return list(
+        CONTEXTUALIZE_PROMPT.invoke(
+            {"question": question, "history": history}
+        ).to_messages()
+    )

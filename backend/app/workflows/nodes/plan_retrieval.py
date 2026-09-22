@@ -58,8 +58,11 @@ async def plan_retrieval(state: RAGState) -> RAGState:
         return {"agent_steps": steps}
 
     # 4. 后续轮：由 LLM planner 决定如何重试
+    #    【第 8 期起传 state["query"] 而不是 state["question"]】：
+    #    query 是"已消解指代、补全省略"的当前检索词，planner 应基于它判断
+    #    "这一轮的召回为什么不够"，再决定怎么改 —— 而不是回到残缺的原话。
     decision = await get_agent_planner().plan(
-        question=state["question"],
+        question=state["query"],
         current_route=current_route,
         current_query=current_query,
         previous_steps=steps,
@@ -91,7 +94,8 @@ async def plan_retrieval(state: RAGState) -> RAGState:
         # 例：original 切到 hyde，必须真的去生成假设答案，否则检索行为与 original 无异
         rewriter = get_query_rewriter()
         result = await rewriter.apply_route(
-            question=state["question"],
+            # 同样用 state["query"]：切换策略时要重跑的是"当前检索词"的改写链路
+            question=state["query"],
             route=decision.new_route,
             multi_query_count=settings.multi_query_count,
         )

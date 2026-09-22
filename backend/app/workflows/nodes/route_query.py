@@ -54,8 +54,12 @@ async def route_query(state: RAGState) -> RAGState:
     # 2. 委托给统一入口：策略判定、明细产出与失败降级都在 QueryRewriter 内部闭环。
     #    本节点不 try/except——优化器已保证"任何失败都降级 original 且不抛异常"，
     #    在这里再包一层异常处理反而是重复防御。
+    #    【第 8 期起传 state["query"] 而不是 state["question"]】：
+    #    normalize_query 已把"消解了指代、补全了省略"的独立问句写进 query，
+    #    策略路由应当基于那个【已经完整】的问句判定与改写 ——
+    #    否则「它怎么配置」这类残缺问句会被判成 original，改写能力白白浪费。
     result = await get_query_rewriter().optimize(
-        question=state["question"],
+        question=state["query"],
         multi_query_count=settings.multi_query_count,
     )
 
