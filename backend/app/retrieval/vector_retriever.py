@@ -60,6 +60,14 @@ class RetrievedChunk:
     keyword_score: float | None = None  # 原始 ts_rank（仅关键词路命中时填充）
     rrf_score: float | None = None  # RRF 融合分（Σ 1/(k + rank)），仅混合检索时填充
 
+    # --- 以下 1 个字段为第 8 期新增：承载精排阶段的成对相关性分 ---
+    # reranker query-chunk 成对打分的相关度，越大越相关。
+    #   【为什么单独一个字段而不是覆盖 score】：
+    #   score 是"统一排序键"，其含义随召回路径变化（向量路=余弦、关键词路=ts_rank、混合=RRF）；
+    #   而 rerank_score 是【精排模型给出的绝对相关性】，量纲与前几者都不同。
+    #   单独存放才能让下游既按 rerank_score 排序，又保留原始向量分 / 召回来源等调试信息。
+    rerank_score: float | None = None  # qwen3-rerank 输出的 relevance_score ∈ [0, 1]
+
 
 class VectorRetriever:
     """

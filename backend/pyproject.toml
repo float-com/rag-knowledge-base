@@ -10,6 +10,7 @@ dependencies = [
     "cos-python-sdk-v5>=1.9.44",
     "docling>=2.126.0",
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "langchain>=1.4.0",
     "langchain-core>=1.6.2",
     "langchain-openai>=1.6.0",
