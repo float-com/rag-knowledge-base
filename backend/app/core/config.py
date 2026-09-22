@@ -178,6 +178,41 @@ class Settings(BaseSettings):
     #   有了它，最坏情况也有界：3 轮意味着最多 1 次首轮 + 2 次 LLM 决策。
     agent_max_rounds: int = 3
 
+    # ===== Reranker（DashScope qwen3-rerank，第 8 章）=====
+    # 关掉后 rerank 节点直接透传，作为「有 / 无精排」的对比开关。
+    #   与 agent_loop_enabled / query_route_enabled 同一思路：
+    #   给一条"退化回上一期行为"的退路，才能量化"精排到底带来了多少提升"。
+    rerank_enabled: bool = True
+    # DashScope rerank 端点：不是标准 OpenAI API。
+    #   【为什么端点路径不同】OpenAI 兼容协议里没有 rerank 这一类接口，
+    #   百炼为精排单独提供了 /api/v1/services/rerank/... 形态的端点，
+    #   因此不能复用 embedding_base_url / chat_base_url 那两个 compatible-mode 地址。
+    rerank_base_url: str = (
+        "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+    )
+    rerank_model: str = "qwen3-rerank"
+    # 留空时复用 chat_api_key（同一份 DashScope key，避免重复配置）。
+    #   实际取值请用下面的 effective_rerank_api_key 属性，不要直接用本字段。
+    rerank_api_key: str = ""
+    # rerank Top1 相关度阈值：低于此值视为"上下文不足"由 judge_context 触发拒答。
+    #   【⚠️ 为什么必须与 retrieval_min_score 分开】：
+    #   qwen3-rerank 输出的是 relevance_score ∈ [0, 1]（精排模型给出的成对相关性），
+    #   而 retrieval_min_score 比较的是 embedding 余弦相似度 —— 两者【量纲不同、不可比】。
+    #   0.3 是经验值：精排分整体偏高，若沿用 0.6 会导致拒答几乎不触发。
+    rerank_min_score: float = 0.3
+    # 请求超时（秒）：rerank 是同步调用主链路，超时短路比拖慢回答更好。
+    rerank_timeout: float = 8.0
+
+    # ===== 答案校验（第 8 章）=====
+    # 关掉后跳过 verify_answer 调用，方便对比"有 / 无引用支撑校验"的效果。
+    verify_answer_enabled: bool = True
+
+    # 将方法伪装成属性调用（getter），允许通过 obj.effective_rerank_api_key 形式只读访问，无需加括号 ()
+    @property
+    def effective_rerank_api_key(self) -> str:
+        """rerank_api_key 留空时回落到 chat_api_key。二者本来就是同一份 DashScope key。"""
+        return self.rerank_api_key or self.chat_api_key
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
