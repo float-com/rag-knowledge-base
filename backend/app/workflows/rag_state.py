@@ -69,8 +69,16 @@ class RAGState(TypedDict, total=False):
     # 当前轮次（从 1 开始）。observe_context 用它和 agent_max_rounds 比较来判断是否收敛；
     # 注意它必须每轮自增，否则「轮次用尽」这个出口永远不触发 → 死循环。
     retrieval_round: int
-    # observe_context 判定本轮候选是否足够；True 时图走向 END
+    # observe_context 判定本轮候选是否足够；True 时图走出循环进入 rerank
+    #   【第 8 期语义变化】：此前 True 时图【直接 END】，本期改为【走向 rerank】——
+    #   observe 只负责"这一轮还要不要再试"，"到底能不能回答"交给 judge_context 裁定。
     context_sufficient: bool
+
+    # rerank 后基于 Top1 score 的拒答闸门
+    #   False 时图走向 refuse 节点；True 时图走向 END。
+    #   【与 context_sufficient 的区别】：前者是循环内部节奏（要不要再试），
+    #   本字段是对外最终结论（能不能回答）—— 两个字段、两个判定时点。
+    context_is_enough: bool
 
     # --- 7. 大模型回答生成节点 (generate 节点产出) ---
     answer: str                 # LLM 根据参考片段最终生成的回答内容（包含 [N] 引用标记）
