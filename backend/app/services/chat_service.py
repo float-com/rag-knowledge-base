@@ -36,12 +36,15 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.core.logging import get_logger
 from app.db.models import AnswerCitation, Conversation, Message
 from app.db.repositories.citation_repo import AnswerCitationRepository
 from app.db.repositories.conversation_repo import ConversationRepository
 from app.db.session import AsyncSessionLocal
+from app.llm.answer_verifier import VerifyResult, get_answer_verifier
+from app.llm.prompts import REFUSAL_ANSWER
 from app.retrieval.vector_retriever import RetrievedChunk
 from app.workflows.graph import get_rag_graph
 from app.workflows.nodes import load_context, stream_generate
@@ -59,6 +62,30 @@ def _serialize_agent_steps(state: RAGState) -> list[dict]:
     ② 后续节点继续追加字段时，与已发出的载荷共享同一份对象引用。
     """
     return [dict(step) for step in state.get("agent_steps", [])]
+
+
+def _build_verify_payload(
+    result: VerifyResult, *, replacement_answer: str | None
+) -> dict:
+    """verify_result SSE / metadata 共用载荷。
+
+    replacement_answer 仅在 verified=False 时携带：前端按它整段替换流式出来的答案，
+    与 PRD"verify 失败 → 拒答替换"语义对齐。
+
+    【为什么用关键字参数（`*`）】：
+    replacement_answer 是可选且语义敏感的参数（它决定前端是否整段改文案），
+    强制关键字传参能杜绝"位置传错把 reason 当 replacement"这类事故。
+    """
+    payload: dict = {
+        "verified": result.verified,
+        # verified=True 时 reason 通常是空串，统一转成 None 下发：
+        # 空串在 JSON 里没有信息量，null 更利于前端判断"没有理由可展示"。
+        "reason": result.reason or None,
+    }
+    # 只有"校验不通过"才带替换文案 —— 通过时带一个 null 字段反而让前端多一次判断
+    if not result.verified and replacement_answer is not None:
+        payload["replacement_answer"] = replacement_answer
+    return payload
 
 
 
@@ -99,6 +126,12 @@ def _build_retrieval_meta(chunk: RetrievedChunk) -> dict:
         # RRF 融合分：两位小数不够用，故保留 6 位
         "rrf_score": (
             round(chunk.rrf_score, 6) if chunk.rrf_score is not None else None
+        ),
+        # 精排成对相关性分（第 8 期新增）：保留 4 位。
+        #   为什么不用 6 位：它的值域是 [0,1]（不是 RRF 那种 0.0x 量级），
+        #   4 位已能区分 0.3508 与 0.3509 这类相邻结果，再多位只是浮点尾数抖动。
+        "rerank_score": (
+            round(chunk.rerank_score, 4) if chunk.rerank_score is not None else None
         ),
     }
 
@@ -243,14 +276,18 @@ class ChatService:
         【执行的六个阶段，每一步对应下方相应位置的 SSE 事件】：
         1. 校验会话存在性（复用非流式的 self.session，本阶段仍是短请求）
         2. 开启独立数据库会话（与请求生命周期解耦，长连接专用）
-        3. 装载上下文 → 标准化查询（改写后的检索词）
+        3. 装载上下文 → 图执行（标准化/路由/循环检索/精排/裁定）
         4. 落库并提交用户提问（必须在 load_context 之后，避免本轮提问混进历史）
-        5. 向量检索 → 回填引用 → 把拒答判定前置到生成之前
-        6. 流式生成（或走拒答分支）→ 落库助手回复与引用 → 收尾
+        5. 下发路由 / 决策轨迹 → 回填引用 → 拒答分支或流式生成
+        6. 答案校验（第 8 期新增）→ 落库助手回复与引用 → 收尾
 
         【事件协议（与前端约定）】：
-        正常顺序为 message_start → citations → token… → message_end；
-        其中 token 事件在拒答分支只有一次，且直接下发预置的拒答文案。
+        message_start → query_route → agent_steps → citations → token…
+            → [verify_result] → message_end
+        - **拒答路径不发 verify_result**（拒答本身已经是终态，再校验一次毫无意义）；
+        - `verify_result.verified=False` 时携带 `replacement_answer`，前端按它**整段替换**
+          流式出来的答案，与 PRD"校验失败 → 拒答替换"对齐；
+        - 任何阶段出错则 `yield error` 并提前结束。
 
         【异常处理】：
         流式响应一旦开始返回，HTTP 状态码已固定为 200，后续异常无法再用 4xx/5xx 表达，
@@ -349,6 +386,7 @@ class ChatService:
                 }
 
                 # 9. 生成分支：拒答时直接把预置文案作为唯一 token 下发，完全不调用大模型
+                verify_result: VerifyResult | None = None
                 if state.get("refused"):
                     yield {
                         "event": "token",
@@ -362,14 +400,49 @@ class ChatService:
                         yield {"event": "token", "data": {"delta": delta}}
                     state["answer"] = "".join(answer_parts)
 
-                # 10. 落库助手回复 + 引用记录（两者在同一事务内提交，保证原子性）
-                await self._persist_assistant_message(state, session)
+                    # 10. 答案校验（第 8 期新增）：必须等 token 流跑完、拿到【完整答案】才能校验，
+                    #     所以放在这里而不是放进 LangGraph 图。
+                    #     【为什么只在非拒答路径执行】：拒答路径的 answer 本来就是标准拒答文案，
+                    #     再拿它去校验毫无意义（还会白花一次模型调用）。
+                    if settings.verify_answer_enabled:
+                        verify_result = await get_answer_verifier().verify(
+                            # 用 query 而不是 question：校验的是"这段回答有没有答到
+                            # 实际检索/生成所依据的那个问题上"，与生成阶段的口径一致。
+                            question=state["query"],
+                            answer=state["answer"],
+                            chunks=list(state.get("retrieved_chunks", [])),
+                        )
+                        # 校验失败 → 整段替换为统一拒答文案并标记拒答，
+                        # 让"落库内容 / 前端展示 / 拒答标志"三者保持一致
+                        replacement = (
+                            REFUSAL_ANSWER if not verify_result.verified else None
+                        )
+                        if not verify_result.verified:
+                            # 严格按 PRD：替换成统一拒答文案 + 标 refused。
+                            # 前端按 replacement_answer 覆盖正文，同时清空引用（下面 citations 已发过，
+                            # 由前端依据 replaced 状态决定是否隐藏）。
+                            state["answer"] = REFUSAL_ANSWER
+                            state["refused"] = True
+                        yield {
+                            "event": "verify_result",
+                            "data": _build_verify_payload(
+                                verify_result, replacement_answer=replacement
+                            ),
+                        }
 
-                # 11. 收尾事件：下发 assistant_message_id 与拒答标志，前端据此结束流式状态并回填正式消息
+                # 11. 落库助手回复 + 引用记录（两者在同一事务内提交，保证原子性）
+                #     注意必须在【校验与替换之后】调用，否则落库的是替换前的旧答案。
+                await self._persist_assistant_message(
+                    state, session, verify_result=verify_result
+                )
+
+                # 12. 收尾事件：下发 assistant_message_id 与拒答标志，前端据此结束流式状态并回填正式消息
                 yield {
                     "event": "message_end",
                     "data": {
                         "message_id": str(state["assistant_message_id"]),
+                        # 这里用替换后的真实值：verify 失败会把 refused 置 True，
+                        # 前端据此把这条消息当拒答处理（与落库结果一致）。
                         "refused": bool(state.get("refused")),
                     },
                 }
@@ -425,6 +498,8 @@ class ChatService:
         self,
         state: RAGState,
         session: AsyncSession,
+        *,
+        verify_result: VerifyResult | None = None,
     ) -> None:
         """流式生成结束后落库助手回复消息及其引用，用单事务保证两者原子。
 
@@ -436,9 +511,31 @@ class ChatService:
         【拒答时不写引用】：
         拒答路径没有可溯源的原文依据，因此跳过 AnswerCitation 写入，
         只落一条带 refused 标记的助手消息。
+
+        【verify_result 为什么默认 None 且用关键字传参】：
+        拒答路径根本不会做校验（answer 本就是拒答文案），因此允许不传；
+        用 `*` 强制关键字传参，避免与 RAGState / session 位置参数混淆。
         """
         conv_repo = ConversationRepository(session)
         citation_repo = AnswerCitationRepository(session)
+
+        # 元数据先攒成变量，最后统一传给 make_assistant_message ——
+        # 这样"要落哪些键"一眼可见（比在构造函数里内联一个多层 dict 更好审）
+        extra_metadata: dict = {
+            # 拒答标志：历史回看时无需再推断
+            "refused": bool(state.get("refused")),
+            "query_route": _build_query_route_payload(state),
+            # Agentic 循环的决策轨迹：与 agent_steps SSE 事件共用同一份序列化函数，
+            # 保证"实时展示"与"历史回看"看到的是同一条链（与 query_route 同一原则）。
+            "agent_steps": _serialize_agent_steps(state),
+        }
+        if verify_result is not None:
+            # verify_result 复用 SSE 的载荷格式，但 metadata【不需要】replacement_answer：
+            # 它是"流式 UI 的特殊需求"（前端要拿它整段改文案），
+            # 而落库的 answer 已经是替换后的最终文本，历史回看时再带一份重复文案没有意义。
+            extra_metadata["verify_result"] = _build_verify_payload(
+                verify_result, replacement_answer=None
+            )
 
         assistant_msg = ConversationRepository.make_assistant_message(
             state["conversation_id"],
@@ -446,14 +543,7 @@ class ChatService:
             # 把 query 路由结果持久化到 metadata 字段，刷新历史时前端调试面板还能继续展示。
             # 注意：这里复用 _build_query_route_payload，与 SSE 事件共用同一份字段结构，
             # 避免"实时展示"与"历史回看"两条路径的载荷格式各自演化而不一致。
-            extra_metadata={
-                # 拒答标志：历史回看时无需再推断
-                "refused": bool(state.get("refused")),
-                "query_route": _build_query_route_payload(state),
-                # Agentic 循环的决策轨迹：与 agent_steps SSE 事件共用同一份序列化函数，
-                # 保证"实时展示"与"历史回看"看到的是同一条链（与 query_route 同一原则）。
-                "agent_steps": _serialize_agent_steps(state),
-            },
+            extra_metadata=extra_metadata,
         )
         await conv_repo.add_messages([assistant_msg])
 

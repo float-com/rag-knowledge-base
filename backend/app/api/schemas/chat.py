@@ -76,6 +76,10 @@ class RetrievalMeta(BaseModel):
       （实测同一查询下第 2~5 名分数完全相同，且不同查询间尺度会变）
     - rrf_score: 两路融合分，**仅在同一次检索内可比**
       （k=60 时上限为 2/(k+1) ≈ 0.0328，与余弦相似度不是一个量纲）
+    - rerank_score: 精排模型输出的成对相关性分（第 8 期新增），值域 [0,1]，
+      **绝对值有意义**，是 judge_context 判定拒答的依据
+      （注意它与 vector_score 虽同为 [0,1]，但【量纲不同、不可比】：
+       0.35 的精排分已经算达标，而 0.35 的余弦相似度远不达标）
 
     【为什么全部字段都有默认值】：
     来源不同的 chunk 只填自己那一路的字段（仅向量命中时 keyword_* 为 None，
@@ -95,6 +99,9 @@ class RetrievalMeta(BaseModel):
     keyword_score: float | None = None
     # RRF 融合分：只在同一次检索内可比
     rrf_score: float | None = None
+    # 精排成对相关性分（第 8 期新增）：[0,1]，绝对值有意义，judge_context 判拒答的依据
+    #   rerank 被短路或降级时为 None（此时 judge_context 回退比 vector_score）
+    rerank_score: float | None = None
 
 
 class CitationRead(BaseModel):
@@ -282,6 +289,46 @@ def _parse_agent_steps(metadata: dict | None) -> list[AgentStep] | None:
     return parsed or None
 
 
+# =============================================================================
+# 3.2 答案可信度校验快照（第 8 期）
+# =============================================================================
+class VerifyResultRead(BaseModel):
+    """答案校验结果快照（历史回放用）。
+
+    与 SSE 的 verify_result 载荷【同一形状】，但 replacement_answer 在落库时是 None：
+    它是"流式 UI 的特殊需求"（前端拿它整段改文案），而落库的 content 已经是替换后的最终文本，
+    历史回看时再带一份重复文案没有意义。
+
+    :param verified: 是否通过真实性校验
+    :param reason: 校验不通过时的原因；通过时通常为 None
+    """
+
+    verified: bool
+    reason: str | None = None
+    # 仅 SSE 场景携带；历史回看恒为 None（保留字段是为了与 SSE 载荷共用同一个模型）
+    replacement_answer: str | None = None
+
+
+def _parse_verify_result(metadata: dict | None) -> VerifyResultRead | None:
+    """从 messages.metadata 解析 verify_result：缺失 / 非法静默返回 None。
+
+    与 `_parse_query_route` 同样的三层防御：
+    ① 元数据本身缺失（老数据 / user 消息 / 拒答路径不做校验）
+    ② 键不存在或不是 dict
+    ③ 结构与契约不符 → 交给 Pydantic 拦截
+    任何一种情况都静默返回 None，绝不因为一段可选元数据让整个历史接口报错。
+    """
+    if not metadata:
+        return None
+    raw = metadata.get("verify_result")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return VerifyResultRead.model_validate(raw)
+    except Exception:
+        return None
+
+
 
 # =============================================================================
 # 4. 消息模型
@@ -302,6 +349,11 @@ class MessageRead(BaseModel):
     # Agentic 循环决策轨迹：同样只挂在 assistant 消息上。
     # user 消息 / 旧消息 / 关闭 agent loop 时为 None，前端按缺失隐藏折叠面板。
     agent_steps: list[AgentStep] | None = None
+    # 答案可信度校验快照（第 8 期）：拒答路径不校验，因此该字段为 None。
+    # 【为什么必须是顶层字段】与 query_route / agent_steps 同一原因：
+    # 前端读的是 m.verify_result；只存在 metadata 里而不在此暴露，刷新历史后校验结果就消失了
+    # （注意：content 已是替换后的最终文本，所以历史回看看到的是"已改过的答案"）。
+    verify_result: VerifyResultRead | None = None
 
     @classmethod
     def from_orm(cls, message: Message) -> "MessageRead":
@@ -345,6 +397,10 @@ class MessageRead(BaseModel):
             # 决策轨迹同理：只取 assistant 消息的元数据，解析失败静默为 None
             agent_steps=(
                 _parse_agent_steps(message.extra_metadata) if is_assistant else None
+            ),
+            # 答案校验快照同理：拒答路径不写该键 → 解析返回 None
+            verify_result=(
+                _parse_verify_result(message.extra_metadata) if is_assistant else None
             ),
         )
 
