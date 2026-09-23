@@ -3,15 +3,45 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 
 【模块核心职责】
 本模块基于 SQLAlchemy 2.0 现代声明式映射（Mapped/mapped_column）规范与 PostgreSQL 原生扩展，
-定义系统核心持久化数据模型及生命周期状态机：
-1. DocumentStatus: 基于 (str, Enum) 实现的文档处理状态枚举，支持状态约束与零成本 JSON 序列化。
-2. Document: 原始文档元数据实体表（documents），负责文件防重哈希、对象存储（COS）定位、状态追踪及审计时间戳。
-3. DocumentChunk: 语义检索切片明细表（document_chunks），承载正文内容、pgvector 高维嵌入向量、层级面包屑与扩展 JSONB 元数据。
+集中定义系统全部持久化实体与生命周期状态机，是数据库结构的【唯一真实来源】。
+按业务域分为四组，共 8 张表：
+
+一、文档接入域（第 1-3 期）
+1. UploadSessionStatus: 预签名直传会话状态枚举。
+2. UploadSession: 预签名上传会话表（upload_sessions），承载分片直传的会话级状态与过期控制。
+3. DocumentStatus: 文档处理状态枚举，基于 (str, Enum) 实现，支持状态约束与零成本 JSON 序列化。
+4. Document: 原始文档元数据表（documents），负责文件防重哈希、对象存储（COS）定位、状态追踪及审计时间戳。
+5. DocumentChunk: 语义检索切片明细表（document_chunks），承载正文内容、pgvector 高维嵌入向量、
+   层级面包屑与检索调试元数据（JSONB）。
+
+二、对话问答域（第 4-5 期）
+6. MessageRole: 消息角色枚举（user / assistant / system）。
+7. Conversation: 会话主表（conversations），一轮多轮问答的容器与标题。
+8. Message: 消息表（messages），存用户提问与模型回答；调试卷（查询路由、决策轨迹、校验结果、
+   trace_id）统一收纳在其 metadata JSONB 列中。
+
+三、可溯源域（第 6-9 期）
+9. AnswerCitation: 答案引用溯源表（answer_citations），一条回答对应多条原文依据；
+   冗余快照文档名与原文片段，使原文被删除后引用仍可展示。
+
+四、评测域（第 10 期）
+10. EvaluationRunStatus: 评测执行状态枚举（running / completed / failed）。
+11. EvaluationRun: 评测执行表（evaluation_runs），一次跑一遍评测集，
+    存进度、聚合指标与状态；单条 case 失败不改变整轮状态。
+12. EvaluationItem: 评测明细表（evaluation_items），每条 case 的输入快照、实际输出、
+    各项指标与 Bad Case 归因。
 
 【架构设计特性】
 - 向量对齐：通过 pgvector.sqlalchemy.Vector 严格对齐 settings.embedding_dim 配置维度。
 - 级联清理：采用数据库层外键 ON DELETE CASCADE 与 ORM passive_deletes=True 配合，保障父子表清理的高吞吐。
 - 属性避坑：规避 SQLAlchemy 保留字 Base.metadata，在 ORM 侧使用 extra_metadata 并精准映射至物理列 "metadata"。
+- 输入快照：需要"跨时间对比"的数据一律复制而非引用（引用快照原文片段、评测快照题目与标准答案），
+  避免上游数据变更后历史记录失去可解释性。
+- 调试卷随行：查询路由 / 决策轨迹 / 校验结果 / trace_id 这批调试卷在 messages 与 evaluation_items
+  各存一份，让实时对话与离线评测都能完整回看当时链路。
+- 索引显式声明：DocumentChunk 的 GIN 与 HNSW 索引写在 __table_args__ 里（含 postgresql_using / ops）。
+  【必须如此】：模型侧不声明时，Alembic 自动比对看不见这两类索引，
+  每次 autogenerate 都会生成 drop_index 把它们误删。
 """
 
 from datetime import datetime
@@ -23,11 +53,18 @@ from uuid import UUID, uuid4
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    # 布尔列类型：第 10 期评测模型用来存"是否拒答 / 是否 Bad Case"等开关位
+    Boolean,
     # 生成列（GENERATED ALWAYS AS ... STORED）构造器：
     # 声明后 SQLAlchemy 会把它从 INSERT / UPDATE 语句中自动剔除，交给数据库维护
     Computed,
     DateTime,
+    # 浮点列类型：第 10 期评测模型用来存 RAGAS 四项指标与自定义业务指标
+    Float,
     ForeignKey,
+    # 索引声明构造器：第 10 期补 DocumentChunk 的 __table_args__ 时用到，
+    # 目的是让"表达式索引 / 特定索引方法（GIN、HNSW）"也能被 Alembic 的自动比对【看见】。
+    Index,
     Integer,
     String,
     Text,
@@ -380,6 +417,30 @@ class DocumentChunk(Base):
 
     # 映射物理表名
     __tablename__ = "document_chunks"
+
+    # --------------------------------------------------------------------------
+    # 表级参数：显式声明两个【表达式 / 专用索引方法】的索引（第 10 期补）
+    # --------------------------------------------------------------------------
+    # 【为什么必须在这里声明】这两个索引在数据库迁移脚本里已经建好，但模型侧原先
+    # 没有任何声明。于是 `alembic revision --autogenerate` 的自动比对【看不见它们】，
+    # 每次都会生成两条 `op.drop_index(...)`——若照抄执行，会真的把全文检索索引
+    # 与向量近邻索引删掉，检索能力当场失效且不报错。
+    # 在这里声明后，模型与数据库两侧的"认知"一致，漂移消失，以后 autogenerate 不再误删。
+    __table_args__ = (
+        # 向量近邻检索索引：HNSW + 余弦距离算子类
+        Index(
+            "ix_document_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        # 中文全文检索索引：GIN（配合 content_tsv 生成列）
+        Index(
+            "ix_document_chunks_content_tsv",
+            "content_tsv",
+            postgresql_using="gin",
+        ),
+    )
 
     # --------------------------------------------------------------------------
     # 主键与外键关联
@@ -837,3 +898,375 @@ class AnswerCitation(Base):
     message: Mapped[Message] = relationship(
         back_populates="citations"
     )
+
+
+# ==============================================================================
+# 第 10 期：评测与 Bad Case 分析（两张表对应「一次执行」与「一次执行下的每条 case」）
+# ==============================================================================
+class EvaluationRunStatus(str, Enum):
+    """评测 run 生命周期：BackgroundTasks 跑完前 RUNNING；正常结束 COMPLETED；
+    主流程异常（不是单条 case 异常）置 FAILED 并写 error_message。
+
+    【状态粒度为什么只到 run 级】
+    单条 case 失败不影响整轮 —— 它的错误写在 evaluation_items.error_message 里，
+    整轮照常跑完并 COMPLETED。只有【主流程本身】崩了（数据库连不上、
+    评测集加载不了等）才算整轮失败。
+    """
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class EvaluationRun(Base):
+    """一次评测执行（跑一遍评测集）。
+
+    【模型职责】：
+    - 记录一次完整评测作业的生命周期状态、执行配置与进度追踪；
+    - 聚合回填全量 Case 跑完后的 RAGAS 四项指标与自研业务评测指标；
+    - 统计平均端到端延迟与首 Token 延迟，为 RAG 架构调优提供基准对比数据；
+    - 级联管理属于当前 Run 的所有 EvaluationItem 实体。
+
+    【与 EvaluationItem 的关系】：
+    一对多强从属关系。EvaluationRun 存储“这一轮执行的宏观上下文”——进度流水、
+    Run 级别聚合统计值与主流程健康度；每条 Case 的明细快照、中间链路步骤与单点归因下沉在 EvaluationItem 中。
+    """
+
+    __tablename__ = "evaluation_runs"
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(PGUUID, primary_key=True, default=uuid4)
+    #   业务说明：单次评测任务（Run）的全局唯一标识，前端路由定位与指标看板汇总的物理主键
+    #   类型定义 (PGUUID(as_uuid=True))：使用 PostgreSQL 原生 UUID 数据类型，Python 侧绑定原生 uuid.UUID 对象
+    #   约束属性：primary_key=True 设置为物理主键，default=uuid4 在 Python 进程侧生成默认 UUIDv4
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(256), nullable=False)
+    #   业务说明：用户创建评测任务时填写的友好语义名称（如 "v2.1-hybrid-search-baseline"），便于历史回溯与橫向对比
+    #   约束属性：nullable=False 确保评测标识非空，String(256) 长度能够容纳包含版本号、模型名及变更说明的长命名
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(128), nullable=False)
+    #   业务说明：本轮评测所绑定的评测集文件名（不含 .jsonl 后缀），用于定位数据源及标识评测基线类型
+    #   约束属性：nullable=False，锁定该 Run 与评测集文件的强从属契约，列宽 128 字符适配标准命名规范
+    dataset_name: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False)
+    #   业务说明：创建 Run 时从评测集静态固化的总 Case 数，作为当前轮次的基准容量，避免因评测集文件动态变动导致进度分母漂移
+    #   约束属性：nullable=False，配合 progress_* 字段为前端提供精确计算执行进度百分比的静态依据
+    dataset_size: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(16), nullable=False)
+    #   业务说明：标记当前评测 Run 的生命周期状态（RUNNING / COMPLETED / FAILED）
+    #   设计权衡：采用 String(16) 而非 PostgreSQL 物理 ENUM 类型，防止后续新增暂停、排队等中间状态时触发数据库 DDL 锁表
+    status: Mapped[EvaluationRunStatus] = mapped_column(
+        String(16), nullable=False
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
+    #   业务说明：后台任务派发的计划执行总 Case 数（通常等同于 dataset_size），提供进度统计的计数器上界
+    #   约束属性：nullable=False，default=0 保证初始化状态下数值完备，避免聚合或计算时产生空指针异常
+    progress_total: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
+    #   业务说明：后台任务已顺利执行完毕（包含判定为 Bad Case 但 RAG 流程正常走完）的 Case 累计计数器
+    #   业务联动：由 Worker 每跑完一条原子累加，前端轮询通过 (progress_completed + progress_failed) / progress_total 驱动进度条
+    progress_completed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
+    #   业务说明：单条 Case 执行期间抛出未捕获异常、调用下游大模型接口硬性超时崩溃的失败用例累计计数器
+    #   约束属性：nullable=False，default=0，用于监控任务异常率，若失败占比过高可供运维策略触发告警
+    progress_failed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：RAGAS 指标 - 忠实度（Faithfulness）均值，评估生成内容是否完全推导自检索上下文，用于量化模型“幻觉”程度
+    #   类型定义 (Float, nullable=True)：单精度浮点数，Run 未跑完或聚合前保持 NULL；取值区间通常为 [0.0, 1.0]
+    faithfulness: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：RAGAS 指标 - 答案相关度（Answer Relevancy）均值，评估回答是否切题、是否存在答非所问或废话连篇
+    #   设计约束：可为空，全量执行完成后由 Worker 离线计算各子项算术平均值并一次性回填落库
+    answer_relevancy: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：RAGAS 指标 - 上下文精确率（Context Precision）均值，评估检索回来的 Chunks 中相关知识是否排在最前列
+    #   业务价值：衡量 Rerank 重排能力的核心指标，得分低通常意味着需要微调或优化重排模型与相关性阈值
+    context_precision: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：RAGAS 指标 - 上下文召回率（Context Recall）均值，评估标准答案所需的事实点被检索切片覆盖的比例
+    #   业务价值：衡量检索向量化与切片分块（Chunking）策略的关键指标，低召回通常意味着知识库存在切片撕裂或召回通道不足
+    context_recall: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：自研业务指标 - 引用命中率（Citation Hit Rate），衡量实际角标引用文档与期望来源的交集比率
+    #   计算口径：仅计算正常作答 case（should_refuse=False），拒答 case 自动排除在分母之外
+    citation_hit_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：自研业务指标 - 拒答准确率（Refusal Accuracy），衡量系统对于越界、无答案、违规场景该拒答时是否坚决拒答
+    #   设计约束：当且仅当评测集中存在 should_refuse 样本时生效，取值区间 [0.0, 1.0]，为空代表无拒答样本或未跑完
+    refusal_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：整轮评测中所有 Case 的端到端执行耗时平均值（毫秒 ms），反映整体 RAG 链路（检索+生成）的吞吐水平
+    #   约束属性：nullable=True，评测完成后聚合落库，辅助排查模型降级或网络波动对系统整体性能的影响
+    avg_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：整轮评测首 Token 延迟平均值（毫秒 ms），反映用户感知维度的首字等待体验
+    #   计算口径：仅统计正常流式输出用例，拒答拦截 Case 不计入；该值暴涨通常预示 Embedding、Milvus 向量检索或 Rerank 链路存在性能瓶颈
+    avg_first_token_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=True)
+    #   业务说明：评测 Run 主流程发生不可恢复硬中断时的根因异常栈信息（如评测集 JSONL 解析崩溃、数据库连接池枯竭）
+    #   设计权衡：仅记录影响整轮 Run 的致命错误，单条 Case 的异常下沉至 EvaluationItem.error_message 记录
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), nullable=True)
+    #   业务说明：评测后台任务脱离调度队列、正式开始消费第一条 Case 的物理时间戳
+    #   类型定义 (timezone=True)：带有时区信息的 UTC 时间戳，用于精确计算整个任务的周转耗时（Turnaround Time）
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), nullable=True)
+    #   业务说明：评测任务最终进入终态（COMPLETED 或 FAILED）的时间戳，未结束前保持 NULL
+    #   约束属性：nullable=True，配合 started_at 可用于评估整批用例离线评测任务的实际并发效率
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), server_default=func.now())
+    #   业务说明：记录评测任务在数据库初始创建的时间戳，用于列表按时间倒序排列与任务审计
+    #   默认行为 (server_default=func.now())：交由数据库引擎通过当前时间戳生成，防止服务实例时钟不一致
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # 语法（SQLAlchemy 2.0 关系映射）：relationship(...)
+    #   业务说明：与 EvaluationItem 构成 1:N 级联关联，支持从 Run 便捷导航获取全部子用例
+    #   级联设计：cascade="all, delete-orphan" 在 ORM 侧维护孤儿删除，passive_deletes=True 配合数据库 ondelete="CASCADE" 避免内存全量加载开销
+    items: Mapped[list["EvaluationItem"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class EvaluationItem(Base):
+    """单条 case 的输入快照 + 实际输出 + 指标 + Bad Case 归因。
+
+    【模型职责】：
+    - 固化评测集当次执行的输入数据镜像（快照解耦，杜绝外部数据集变更导致历史基线失真）；
+    - 完整落盘 RAG 单次请求执行的真实输出、中间决策路由及性能指标；
+    - 记录 RAGAS 及自研指标的单 Case 打分结果；
+    - 承载 Bad Case 规则自动初判结果以及研发/标注人员的人工审查修正与标注笔记。
+
+    【快照设计原则】：
+    所有 expected_* 与 question 字段从评测集 JSONL 解析并直接冗余落表，不与外部评测集文件建立动态外键关连，
+    确保每一次评测历史都是闭环且完全可重现的静态沙盒。
+    """
+
+    __tablename__ = "evaluation_items"
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(PGUUID, primary_key=True, default=uuid4)
+    #   业务说明：单条评测明细记录的全局唯一身份证，作为前端 Bad Case 标注详情页的寻址主键
+    #   类型定义 (PGUUID(as_uuid=True))：使用 PostgreSQL 原生 UUID 数据类型，Python 侧绑定原生 uuid.UUID 对象
+    #   约束属性：primary_key=True，default=uuid4 在实体初始化时由 Python 端生成
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(PGUUID, ForeignKey(...), nullable=False, index=True)
+    #   业务说明：关联所属评测执行任务（EvaluationRun）的主键 ID
+    #   约束属性：nullable=False 拒绝孤儿记录；index=True 建立 B-Tree 索引，确保按 Run 检索全量 Case 或进行批量统计时的高性能
+    #   外键行为 (ondelete="CASCADE")：数据库级级联删除，父 Run 记录抹除时自动清理下游关联的全部 Item
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("evaluation_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # --- 输入快照（从评测集 jsonl 复制，见类文档说明）---
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(64), nullable=False)
+    #   业务说明：原评测集中标识单条测试用例的业务编号（如 "QA-LAW-0023"），便于在评测集迭代版本间比对同一 Case 的表现演进
+    #   约束属性：nullable=False，列宽 64 字符容纳业务语义编码
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=False)
+    #   业务说明：送入 RAG 问答链路的原始用户提问 Prompt 文本快照
+    #   类型定义 (Text)：无固定长度限制的文本字段，适配多轮对话拼接、包含大段上下文前置的超长问题
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=False)
+    #   业务说明：评测集预设的标准参考答案（Ground Truth），用于作为 RAGAS 评估指标（如 Context Recall）与人工判定的基准
+    #   约束属性：nullable=False，即使是拒答 Case 也需提供标准说明（例如“对不起，根据已有资料无法回答该问题”）
+    expected_answer: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：预期回答该问题必须命中的核心文档名称列表，用于计算 Citation Hit Rate 与检索召回精准度
+    #   类型定义 (JSONB)：PostgreSQL 原生 JSONB 类型，支持包含数组操作符（如 `@>`、`?|`）的原生高效查询过滤
+    #   默认行为 (default=list)：新建实体默认为空数组
+    expected_document_names: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：预期答案中必须覆盖的关键事实实体、专业术语或关键命题短语列表，供规则匹配引擎作初筛验证
+    #   类型定义 (JSONB)：采用 JSONB 数组格式存储字符串列表
+    expected_keywords: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Boolean, nullable=False)
+    #   业务说明：标注该 Case 是否属于“越界/无依据/敏感违规”因而必须触发系统拒答拦截的真值预期
+    #   业务联动：作为 refusal_correct 准确率判定的核心条件基准
+    should_refuse: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：测试用例的维度属性标签集合（如 ["长文本", "多跳推理", "跨表格"]），用于评测大盘按标签做细分维度下钻分析
+    #   类型定义 (JSONB)：方便后续基于标签进行灵活的切片多维过滤与报表聚类
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+
+    # --- 实际输出（跑完 RAG 链路后回填）---
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=False, default="")
+    #   业务说明：RAG 系统针对该问题端到端生成的最终实际回答文本（包含流式组装完毕后的全量内容）
+    #   约束属性：nullable=False，default="" 保证无响应或异常时非空，避免展示层抛出 NullReference
+    actual_answer: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Boolean, nullable=False, default=False)
+    #   业务说明：记录实际运行中系统是否判定并执行了“主动拒答”（如触发低置信度防御机制或安全策略）
+    #   约束属性：nullable=False，default=False，配合 should_refuse 计算系统在负样本上的防御召回水平
+    actual_refused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：生成答案中实际携带的角标引用来源明细列表（如 `[{"index": 1, "doc_name": "xxx.pdf", "chunk_id": "..."}]`）
+    #   业务价值：与 expected_document_names 进行比对，作为自动计算 citation_hit 的物理依据
+    citations: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=False, default=list)
+    #   业务说明：检索及重排阶段召回并真正喂给大模型上下文窗口的 Top-K 文档切片元数据快照（包含 chunk 内容摘要、得分、源文件信息）
+    #   设计权衡：全量固化切片元数据，便于在排查 Bad Case 时直接还原上下文现场，无需反查切片底表
+    retrieved_chunks_meta: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=True)
+    #   业务说明：意图识别与路由决策节点的结构化输出快照（如判断为直接回答、向量检索、混合检索、或走结构化 SQL 路由）
+    #   数据来源：与线上问答链路中的 MessageRead.query_route 保持统一的数据结构与协议标准
+    query_route: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=True)
+    #   业务说明：若走多跳 Agent 规划链路，记录每一步思考、动作工具调用与观察结果的轨迹明细（Agent Trajectory）
+    #   类型定义 (JSONB, nullable=True)：动态保存步骤列表，仅在启用 Agent 模式的 RAG 链路上存在有效值
+    agent_steps: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(JSONB, nullable=True)
+    #   业务说明：事实自校验与一致性检查节点（Fact-Checker/Critic）的执行结果快照，包含自检置信度分值与警告提示
+    #   类型定义 (JSONB, nullable=True)：可为空，未挂载验证器时置空
+    verify_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(64), nullable=True)
+    #   业务说明：链路追踪系统的全局 Trace ID（如 LangSmith / Langfuse / OpenTelemetry Trace ID）
+    #   业务价值：建立离线评测与链路可视化平台的直接穿透跳链，研发可通过该 ID 一键定位底层每个 LLM 调用的 Token 消耗与原始 IO
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
+    #   业务说明：该条用例走完检索、重排、Prompt 组装、大模型生成全过程的端到端耗时（毫秒 ms）
+    #   约束属性：nullable=False，default=0，用于定位尾部高延迟 Case 进行性能专项攻坚
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=True)
+    #   业务说明：流式输出场景下，从请求发出到收到大模型返回第一个有效 Token 的耗时（毫秒 ms）
+    #   设计约束：可为空；若整条链路发生异常或非流式输出时为 NULL，其数值直接衡量了检索+重排阶段的延迟开销
+    first_token_latency_ms: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=True)
+    #   业务说明：单条 Case 在执行或打分期间捕获的错误堆栈信息（如 LLM 网关超时、上下文超长截断异常）
+    #   设计权衡：单条 Case 报错仅记录在此字段中，不阻断整轮 Run 的推进，实现单点错误物理隔离
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- 指标评估 ---
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：单条 Case 的 RAGAS 忠实度（Faithfulness）得分，判定答案是否完全来自于检出的上下文片段
+    #   异常处理：打分模型调用超时或报错时保持为 None，前端按缺失友好呈现（如显示短横线 `-`）
+    faithfulness: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：单条 Case 的 RAGAS 答案相关度（Answer Relevancy）得分，判定输出内容针对原问题的解答匹配程度
+    #   设计约束：可为空，取值范围通常在 [0.0, 1.0] 区间
+    answer_relevancy: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：单条 Case 的 RAGAS 上下文精确率（Context Precision）得分，评估命中真正关键证据的切片是否排在检索前列
+    #   设计约束：可为空，用于分析重排算法是否存在劣质切片挤占有效切片窗口问题
+    context_precision: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Float, nullable=True)
+    #   业务说明：单条 Case 的 RAGAS 上下文召回率（Context Recall）得分，衡量检索切片对参考答案知识点的覆盖程度
+    #   设计约束：可为空，低分通常直接导向切片丢失、Embedding 语义断层等 Bad Case 归因
+    context_recall: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Boolean, nullable=True)
+    #   业务说明：自研指标 - 角标命中判定布尔值，标识 actual citations 是否准确命中了 expected_document_names
+    #   边界处理：当 should_refuse=True 时固定为 NULL，因为拒答用例不应产生引用，严禁拉低或计入正常引用命中率的分母
+    citation_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Boolean, nullable=False, default=False)
+    #   业务说明：自研指标 - 拒答一致性布尔判定，判定公式为 `actual_refused == should_refuse`
+    #   业务价值：不仅考核该拒答的是否拒答，也考核不该拒答的是否被误杀（False Refusal）
+    refusal_correct: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    # --- Bad Case 归因 ---
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Boolean, nullable=False, default=False)
+    #   业务说明：核心筛选标记，标识当前 Case 是否被认定为问题用例（Bad Case）
+    #   生命周期：初始由规则引擎自动初判（如 RAGAS 指标低于阈值或拒答错误），研发与质检人员后续可通过 PATCH 接口人工覆写修正
+    is_bad_case: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(String(64), nullable=True)
+    #   业务说明：Bad Case 的细分技术归因分类字面量（如 RETRIEVAL_MISSING、RERANK_DEMOTED、HALLUCINATION、REFUSAL_LEAK 等 13 种规范枚举）
+    #   约束属性：可为空（仅在 is_bad_case=True 时有实际业务意义），与 API Schemas 及前端呈现规范保持强契约对齐
+    bad_case_category: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Text, nullable=True)
+    #   业务说明：研发、Prompt 算法工程师针对该 Bad Case 填写的自由排查笔记、根因定性与后续优化方向规划
+    #   类型定义 (Text, nullable=True)：大文本类型，容纳深度的复盘论证与上下文推演记录
+    bad_case_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(DateTime(timezone=True), server_default=func.now())
+    #   业务说明：记录评测条目落库的初始物理时间戳
+    #   默认行为 (server_default=func.now())：由数据库端生成带有时区信息的当前时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # 语法（SQLAlchemy 2.0 关系映射）：relationship(...)
+    #   业务说明：反向关联父级 EvaluationRun 实体，便于从单条 Case 快速反查其执行批次的整体上下文
+    run: Mapped[EvaluationRun] = relationship(back_populates="items")
