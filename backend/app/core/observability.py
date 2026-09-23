@@ -96,9 +96,18 @@ def build_trace_url(trace_id: str | None) -> str | None:
     【容错设计】：
     1. 前缀选配：URL 前缀包含用户的租户组织 ID，无法在后端自动推导。若用户未配，
        直接返回 None 让前端展示纯文本/复制按钮，防止展示“点不开的死链接”。
-    2. 路径清洗：使用 `rstrip("/")` 裁掉尾部斜杠，防止拼出类似 `//runs/` 的畸形地址。
+    2. 路径清洗：使用 `rstrip("/")` 裁掉尾部斜杠，防止拼出类似 `//r/` 的畸形地址。
+
+    【路径段为什么是 /r/ 而不是 /runs/】：
+    对齐官方 SDK 的拼接方式（见依赖源码 `langsmith/client.py` 的 `_construct_run_url`）：
+        f"{host}/o/{tenant_id}/projects/p/{session_id}/r/{run.id}"
+    写成 `/runs/` 会 404 —— 这是本项目实测踩过的坑。
+
+    【前缀里 project 那段是 UUID 而不是项目名】：
+    官方 `langsmith/schemas.py` 的 `Run.url` 同样拼的是 `self.id`（项目主键）。
+    用户配成项目名会打不开。
     """
     if not trace_id or not settings.langsmith_run_url_prefix:
         return None
 
-    return f"{settings.langsmith_run_url_prefix.rstrip('/')}/runs/{trace_id}"
+    return f"{settings.langsmith_run_url_prefix.rstrip('/')}/r/{trace_id}"

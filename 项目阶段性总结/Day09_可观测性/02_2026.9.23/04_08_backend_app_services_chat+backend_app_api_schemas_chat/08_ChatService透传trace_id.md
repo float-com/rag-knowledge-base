@@ -204,13 +204,17 @@ trace_url 是 None 而不是空串？ True
 message_start 载荷 = {
   'user_message_id': '368e9a91-...',
   'trace_id': '01a0cd28-59c9-75f3-ba9e-5c919b74cb15',
-  'trace_url': 'https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/runs/01a0cd28-...'
+  'trace_url': 'https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/r/01a0cd28-...'
 }
 trace_url 拼对？ True
 落库 trace_id  = 01a0cd28-59c9-75f3-ba9e-5c919b74cb15
-落库 trace_url = https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/runs/01a0cd28-...
+落库 trace_url = https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/r/01a0cd28-...
 与实时下发一致？ True
 ```
+
+> 📌 **本档实测输出中的 `trace_url` 已按后续修正更新为 `/r/` 段**（原文为 `/runs/`）。
+> 当时那条 URL 能拼出来、格式自洽，**但点开会 404** —— 直到第 9 章接前端链接时
+> 对照官方 SDK 源码才发现官方用的是 `/r/`。详见第 9 章归档的"🔧 后续修订"小节。
 
 ### 汇总
 

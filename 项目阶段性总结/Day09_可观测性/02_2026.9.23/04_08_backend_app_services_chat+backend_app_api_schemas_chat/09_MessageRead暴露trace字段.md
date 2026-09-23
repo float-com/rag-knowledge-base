@@ -242,11 +242,11 @@ def _parse_trace_id(metadata: dict | None) -> str | None:
 
 ```
 [实时] trace_id  = 01a0cd44-7c9a-7c03-b56a-e357cf3a797b
-[实时] trace_url = https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/runs/01a0cd44-...
+[实时] trace_url = https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/r/01a0cd44-...
 
 [历史] role=user      trace_id=None
 [历史] role=assistant trace_id='01a0cd44-7c9a-7c03-b56a-e357cf3a797b'
-[历史] role=assistant trace_url='https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/runs/01a0cd44-...'
+[历史] role=assistant trace_url='https://smith.langchain.com/o/probe-org/projects/p/rag-knowledge-base/r/01a0cd44-...'
 
 [一致] 实时与历史 trace_id 相同？ True
 [一致] 实时与历史 trace_url 相同？ True
@@ -255,6 +255,8 @@ def _parse_trace_id(metadata: dict | None) -> str | None:
 [落库] 含 trace_url 吗？ False（符合预期）
 （临时会话已删除）
 ```
+
+> 📌 上面输出里的 `trace_url` 已按本档 §十 的修正更新为 `/r/` 段（原文为 `/runs/`）。
 
 **四条关键结论**：
 
@@ -288,14 +290,78 @@ trace_id / trace_url ┤                                                        
 
 ---
 
-## 九、本档遗留
+## 十、🔧 后续修订：跳转链接有两个坑（本章接通前端链路时实测暴露）
+
+接到前端之后**点那个「在 LangSmith 中查看」打不开**，追查官方 SDK 源码后确认是**两处拼写/认知错误**，都已修正。
+
+### 坑 ① 路径段是 `/r/`，不是 `/runs/`
+
+**官方 SDK 的权威依据**（依赖源码，不是猜的）：
+
+```python
+# langsmith/client.py  →  Client._construct_run_url（本地拼 URL，不调后端）
+f"{self._host_url}/o/{self._get_tenant_id()}/projects/p/{session_id_}/r/{run.id}?poll=true"
+#                                                                      ^^^ 是 /r/
+
+# langsmith/schemas.py  →  Run.url
+f"{self._host_url}/o/{self.tenant_id}/projects/p/{self.id}"
+```
+
+| 段 | 官方 | 本档初版 | 修正 |
+| --- | --- | --- | --- |
+| 连接段 | `/r/` | **`/runs/`** ❌ | ✅ 改为 `/r/` |
+
+### 坑 ② 前缀里 project 那段是**项目 UUID**，不是项目名
+
+`Run.url` 里拼的是 `self.id`（**项目主键**），所以前端配置的 `LANGSMITH_RUN_URL_PREFIX` 形如：
+
+```
+https://smith.langchain.com/o/{org_id}/projects/p/{project_id}
+                                └ UUID ┘         └ UUID ┘
+```
+
+**两个都是 UUID。** 本档初版在 `.env` 注释里写的是 `{project_name}` ——
+**会把人误导成填项目名**（我一开始就误判了用户的正确配置）。
+
+### 修正清单
+
+| 文件 | 修正 |
+| --- | --- |
+| `backend/app/core/observability.py` L104 | `/runs/` → **`/r/`**，并在 docstring 里写明两条依据（含 SDK 源码出处） |
+| `.env` / `.env.example` | 注释里 `{project_name}` → **`{project_id}`**，并补"获取方法"四步说明 |
+| 本档 §七 输出、第 8 章归档输出、04-05 归档代码块 | 同步更新为 `/r/`（并加"后续修订"批注） |
+
+### 实测验证（修正后）
+
+```
+② build_trace_url 拼接结果
+  https://smith.langchain.com/o/8d759a3a-.../projects/p/ed18bad7-.../r/01a0cd51-...
+  含 /r/ 段   ? True
+  含 /runs/ ? False   ✅
+③ 边界：前缀带尾斜杠 -> 无双斜杠 ✅   前缀为空 -> None ✅   空 trace_id -> None ✅
+④ 真实 API：message_start 载荷 = {user_message_id, trace_id, trace_url}
+  trace_url 用 /r/ ? True    结尾是 trace_id ? True
+```
+
+### 💡 这条坑的通用教训
+
+> **"格式自洽"不等于"能用"。**
+> `/runs/` 拼出来是一条**语法完全合法**的 URL，测试里也能断言"拼接正确"，
+> **但点开是 404** —— 而**只有真人点一下才会发现**。
+>
+> → **凡是"给用户点的链接"，验证标准必须是"点得开"，而不是"拼得对"。**
+> → 这次的发现路径正是：**用户配好后点了一下** → 才发现。**这就是"必须真跑一遍"的价值。**
+
+---
+
+## 十一、本档遗留
 
 | # | 遗留项 | 说明 |
 | --- | --- | --- |
 | 1 | 未配 `LANGSMITH_RUN_URL_PREFIX` 时无跳转链接 | 设计如此；两条通路都只显示"复制"按钮 |
 | 2 | `cache_hit` 仍未实现 | 属第 12 期语义缓存；本章不补 |
 | 3 | `load_context` 仍未加装饰器 | 第 6 章遗留 |
-| 4 | 停止后遗留的 `agent_steps` 等字段无变化 | — |
+
 
 ---
 
