@@ -17,6 +17,10 @@
 from dataclasses import dataclass, field
 from uuid import UUID
 
+# 第 9 期：观测 SDK 的装饰器。本模块走裸 SQLAlchemy，SDK 自动捕获不到，
+# 必须手动打点才能让 trace 树里出现"向量召回"这一层。
+from langsmith import traceable
+
 # 引入异步数据库会话类，用于支持 async/await 异步数据库操作
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -80,6 +84,9 @@ class VectorRetriever:
         """
         self.chunk_repo = DocumentChunkRepository(session)
 
+    # 【第 9 期】手动打点：与混合检索同理，本方法走裸 SQLAlchemy。
+    #   它是 trace 树里 HybridRetriever 的子节点，两路并发召回因此可以分别看耗时。
+    @traceable(name="VectorRetriever.search", run_type="retriever")
     async def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
         """
         根据文本 query 进行向量近似检索，返回最相似的 Top-K 个分块。

@@ -34,11 +34,18 @@
 from collections.abc import AsyncIterator
 from uuid import UUID
 
+# 第 9 期：观测 SDK 的装饰器。本服务是"编排者"，内部是普通 Python 方法，
+# SDK 自动捕获不到 —— 不装饰的话 trace 树会缺少【根节点】，所有子 span 变成散落的孤儿。
+from langsmith import traceable
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.core.logging import get_logger
+# 【第 9 期】可观测性工具：本章只落地 import 与类上的装饰器，
+# 真正"取号 + 拼链接 + 下发落库"在第 8 章接入 —— 放在这里是为了让 import 与用法同处一处。
+from app.core.observability import build_trace_url, get_current_trace_id
 from app.db.models import AnswerCitation, Conversation, Message
 from app.db.repositories.citation_repo import AnswerCitationRepository
 from app.db.repositories.conversation_repo import ConversationRepository
@@ -300,6 +307,9 @@ class ChatService:
     # 流式问答主链路：按「校验 → 装历史 → 落库提问 → 检索 → 生成 → 落库回复」顺序驱动
     # =========================================================================
 
+    # 【第 9 期】trace 树的根 span：本方法是整个问答链路的入口，
+    #   不装饰的话下面所有子 span 会变成互不相连的孤儿，看不到"一次问答"这个整体。
+    @traceable(name="ChatService.stream_answer", run_type="chain")
     async def stream_answer(
         self, conversation_id: UUID, question: str
     ) -> AsyncIterator[dict]:

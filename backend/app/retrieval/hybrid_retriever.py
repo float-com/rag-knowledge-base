@@ -24,6 +24,10 @@
 import asyncio
 from uuid import UUID
 
+# 第 9 期：观测 SDK 的装饰器。本模块走裸 SQLAlchemy，SDK 自动捕获不到，
+# 必须手动打点才能让 trace 树里出现"检索"这一层。
+from langsmith import traceable
+
 # 引入全局系统配置单例（读取 rrf_k 等融合参数）
 from app.core.config import settings
 # 引入统一日志工厂
@@ -53,6 +57,9 @@ class HybridRetriever:
     # 两个原因：① 会话是每次 search 现场创建的，不能长期挂在实例上（否则并发调用会互相污染）；
     #          ② 无状态对象天然线程/协程安全，可以被路由层安全地复用或每次 new 一个。
 
+    # 【第 9 期】手动打点：本方法内部是裸 SQLAlchemy 查询，不是 LangChain 对象，
+    #   不装饰则 trace 树里"混合检索"这一层缺失，也看不到它耗了多久。
+    @traceable(name="HybridRetriever.search", run_type="retriever")
     async def search(
         self,
         query: str,

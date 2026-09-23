@@ -86,3 +86,11 @@ class RAGState(TypedDict, total=False):
     # --- 8. 持久化后置落库节点 (chat_service 落库后回写) ---
     user_message_id: UUID       # 写入数据库后生成的本轮用户提问 Message 唯一主键
     assistant_message_id: UUID  # 写入数据库后生成的本轮 AI 回复 Message 唯一主键
+
+    # --- 9. 可观测性 (第 9 期) ---
+    # LangSmith trace_id：未启用观测 / 取不到 run tree 时为 None。
+    # 【为什么必须声明在状态里】LangGraph 会静默丢弃状态模式中未声明的键 ——
+    #   不写在这里，服务层塞进来的 trace_id 会在 ainvoke 之后凭空消失，且不报任何错。
+    # 【为什么由服务层写、节点不写】它来自服务层 stream_answer 的运行上下文，
+    #   图内节点既看不到也拿不到，全链路所有节点只是"随着状态往后传"。
+    trace_id: str | None

@@ -21,6 +21,10 @@
 from app.db.repositories.chunk_repo import DocumentChunkRepository
 from app.retrieval.vector_retriever import RetrievedChunk
 
+# 第 9 期：观测 SDK 的装饰器。本模块走裸 SQLAlchemy，SDK 自动捕获不到，
+# 必须手动打点才能让 trace 树里出现"关键词召回"这一层。
+from langsmith import traceable
+
 # 引入异步数据库会话类，用于支持 async/await 异步数据库操作
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +43,9 @@ class KeywordRetriever:
         """
         self.chunk_repo = DocumentChunkRepository(session)
 
+    # 【第 9 期】手动打点：与向量路对称，本方法走裸 SQLAlchemy 全文检索。
+    #   两路都打点后，才能对比"向量路慢还是关键词路慢"。
+    @traceable(name="KeywordRetriever.search", run_type="retriever")
     async def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
         """
         根据文本 query 进行中文全文检索，返回最相关的 Top-K 个分块。

@@ -23,6 +23,11 @@ from typing import Any
 # 引入 httpx 异步客户端（精排是主链路上的同步调用，用异步客户端避免阻塞事件循环）
 import httpx
 
+# 第 9 期：观测 SDK 的装饰器，标成 tool 类型（对外部服务的一次工具调用）。
+#   【为什么必须手动打点】qwen3-rerank 不走 OpenAI 兼容协议，这里用的是裸 httpx，
+#   对观测 SDK 而言它就是个普通 Python 方法 —— 不装饰的话 trace 树里精排这一层是空的。
+from langsmith import traceable
+
 # 引入全局系统配置单例（读 rerank 相关配置）
 from app.core.config import settings
 # 引入配置错误异常：API Key 缺失属于"部署配置问题"，应当明确抛出而不是静默降级
@@ -54,6 +59,9 @@ class Reranker:
             self._client = httpx.AsyncClient(timeout=settings.rerank_timeout)
         return self._client
 
+    # 【第 9 期】手动打点：本方法用裸 httpx 调 DashScope（qwen3-rerank 不走 OpenAI 兼容协议），
+    #   SDK 认不出它是模型调用，故标成 tool；不装饰则 trace 树里看不到精排耗时。
+    @traceable(name="Reranker.rerank", run_type="tool")
     async def rerank(
             self,
             query: str,

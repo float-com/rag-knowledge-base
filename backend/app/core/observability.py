@@ -2,7 +2,7 @@
 
 【设计思路：隔离底层细节】：
 将所有与 LangSmith SDK 强相关的脏活（改写系统环境变量、从运行上下文抓 ID、拼接 URL 等）
-全部收敛在当前文件中。业务代码只需引用 `@traceable` 装饰函数，或调用 `get_trace_id`、
+全部收敛在当前文件中。业务代码只需引用 `@traceable` 装饰函数，或调用 `get_current_trace_id`、
 `build_trace_url` 两个简单函数即可，无需在各处散落第三方 SDK 复杂的内部细节。
 
 【为什么启动时要将 Settings 显式写回 os.environ】：
@@ -56,7 +56,7 @@ def configure_observability() -> None:
         )
 
 
-def get_trace_id() -> str | None:
+def get_current_trace_id() -> str | None:
     """获取当前执行链路中的 trace_id。
 
     :return: 成功返回 trace_id 字符串；未开启、不在 @traceable 范围内或发生异常时均返回 None。
@@ -83,7 +83,7 @@ def get_trace_id() -> str | None:
             return None
         return str(run.trace_id)
     except Exception:  # noqa: BLE001 —— 守住核心链路，不向外抛出任何监控异常
-        logger.warning("get_trace_id 异常，返回 None", exc_info=True)
+        logger.warning("get_current_trace_id 异常，返回 None", exc_info=True)
         return None
 
 
