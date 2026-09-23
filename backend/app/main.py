@@ -39,6 +39,9 @@ from app.core.config import settings
 # 导入日志系统：configure_logging 用于全系统日志格式化，get_logger 用于获取本模块打印器
 from app.core.logging import configure_logging, get_logger
 
+# 导入可观测性初始化：把 Settings 里的 LangSmith 配置同步写入 os.environ
+from app.core.observability import configure_observability
+
 
 def create_app() -> FastAPI:
     """应用工厂函数（Application Factory）。
@@ -52,6 +55,14 @@ def create_app() -> FastAPI:
     # 第一步：初始化日志系统
     # 必须最先执行！因为后续的组件在启动报错时，需要依赖已经配置好的标准日志格式输出到控制台或文件
     configure_logging()
+
+    # 第一步之二：初始化可观测性（第 9 期）
+    # 【为什么必须紧跟在 configure_logging 之后、且早于任何业务模块被调用】：
+    # LangSmith SDK 只读 os.environ（不读我们的 Settings 对象），而它内部对
+    # 环境变量做了 lru_cache；一旦有业务代码先触发了 trace，再写 env 就晚了。
+    # 放在这里，可保证进程内第一次 trace 之前环境变量已经就位。
+    configure_observability()
+
     logger = get_logger(__name__)
 
     # 第二步：实例化 FastAPI 核心框架

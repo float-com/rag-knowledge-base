@@ -213,6 +213,39 @@ class Settings(BaseSettings):
         """rerank_api_key 留空时回落到 chat_api_key。二者本来就是同一份 DashScope key。"""
         return self.rerank_api_key or self.chat_api_key
 
+    # ===== LangSmith 可观测性配置（第 9 期）=====
+
+    # 1. 核心追踪总开关
+    # 设为 False 时：所有追踪（@traceable / LangChain 内部 trace）自动静默失效（no-op），
+    # run_id / trace_id 统一返回 None，不影响任何正常业务请求（详见 app/core/observability.py）。
+    langsmith_tracing: bool = False
+
+    # 2. SDK 环境变量同步配置
+    # 【注意机制】：LangSmith SDK 底层只读取系统的 `os.environ`，不认 Pydantic Settings 对象。
+    # 因此这三项先在 Settings 类中声明以便从 .env 文件读取，
+    # 再由应用启动时的 `configure_observability()` 函数统一写回系统环境变量：
+    langsmith_api_key: str = ""  # API 密钥（对应系统环境变量 LANGCHAIN_API_KEY）
+    langsmith_project: str = "rag-knowledge-base"  # 监控项目名称（对应 LANGCHAIN_PROJECT，不存在时会自动创建）
+    langsmith_endpoint: str = "https://api.smith.langchain.com"  # 上报服务接口地址（默认官方 SaaS 地址）
+
+    # 3. 前端交互增强（选配）
+    # 目标格式形如：https://smith.langchain.com/o/{org_id}/projects/p/{project_name}
+    # 作用：由于包含租户/组织私有 ID，系统无法推导生成。
+    #   - 配置后：后端会基于该前缀和 trace_id 拼出完整 URL，下发给前端显示「在 LangSmith 中查看」直达按钮。
+    #   - 不配置（留空）：前端仅展示 trace_id 和「复制」按钮，不影响后端正常的追踪与数据上报。
+    langsmith_run_url_prefix: str = ""
+
+    @property
+    def observability_enabled(self) -> bool:
+        """可观测性实际可用状态（总开关打开 且 API Key 不为空）。
+
+        【设计意图 - 统一防错口径】：
+        下发前端 trace 链接或做埋点判断时，只需依赖这一个布尔状态。
+        避免在各个业务调用点散落书写 `if tracing and api_key`，防止漏判其中某一项
+        导致在未配置 Key（实际上未成功上报）的情况下向前端下发无效的“空链接”。
+        """
+        return bool(self.langsmith_tracing and self.langsmith_api_key)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
