@@ -232,6 +232,38 @@ class ChatService:
         await self.session.refresh(conversation)
         return conversation
 
+    async def list_conversations(
+        self,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[tuple[Conversation, int]], int]:
+        """分页拉取会话列表，每项带上消息条数。
+
+        【为什么返回值是元组列表而不是"会话列表 + 另一个计数表"】：
+        消息数是每个会话的附属属性，绑在同一个元组里能杜绝"两个列表顺序不一致"的隐患；
+        分页接口还需要总条数，因此再返回一个 total。
+
+        【事务边界】：纯读操作，不需要 commit。
+        """
+        repo = ConversationRepository(self.session)
+        return await repo.list_page(page=page, page_size=page_size)
+
+    async def delete_conversation(self, conversation_id: UUID) -> None:
+        """删除会话（及其消息与引用，由外键级联清理）。
+
+        【为什么不存在时要抛 404】：
+        删除是幂等语义上"删了就是删了"，但接口契约上必须区分
+        "删掉了一个真实存在的会话"与"你给了一个不存在的 id" ——
+        后者说明前端状态与后端不一致，显式报错比静默成功更利于排查。
+
+        【事务边界】：仓储层只 flush，由本层 commit 落地。
+        """
+        repo = ConversationRepository(self.session)
+        deleted = await repo.delete(conversation_id)
+        if not deleted:
+            raise NotFoundError("会话不存在")
+        await self.session.commit()
+
     async def get_conversation(self, conversation_id: UUID) -> Conversation:
         """按主键查询会话，不存在时抛出 404 业务异常。
 
@@ -476,7 +508,7 @@ class ChatService:
         state: RAGState,
         session: AsyncSession,
     ) -> None:
-        """流式开始前先把用户提问落库并提交。
+        """流式开始前先把用户提问落库并 commit；首次提问时顺手把会话标题改成问题前 30 字。
 
         【为什么必须单独 commit】：
         让用户提问先于大模型调用持久化。若后续检索或 LLM 调用失败，
@@ -484,12 +516,27 @@ class ChatService:
 
         【调用时机约束】：
         必须在 load_context 之后 调用——load_context 读到的「历史消息」不应包含本轮提问。
+
+        【为什么标题更新放在保存用户消息的同一事务里】：
+        合并提交可以避免"新建会话已经发了第一条，但标题还停在「新对话」"的中间态
+        —— 若分成两次 commit，在两次提交之间刷新侧栏，用户就会看到"新对话"。
         """
         repo = ConversationRepository(session)
+
+        # 判断是否首次提问：会话里一条消息都没有，说明这是第一轮。
+        # 【为什么用 count 而不是复用 list_messages】：只需要一个布尔信号，
+        # 不必把整批消息实体查出来（轻量查询）。
+        if await repo.count_messages(state["conversation_id"]) == 0:
+            # 用问题原文做标题（仓储内部已做了 strip / 空值防御 / 只改默认标题的判断）
+            await repo.update_title_if_default(
+                state["conversation_id"], state["question"]
+            )
+
         user_msg = ConversationRepository.make_user_message(
             state["conversation_id"], content=state["question"]
         )
         await repo.add_messages([user_msg])
+        # 一次 commit 同时落地"标题更新 + 用户消息"，保证两者原子
         await session.commit()
         # 回写主键：供上层组装 message_start 事件下发前端
         state["user_message_id"] = user_msg.id

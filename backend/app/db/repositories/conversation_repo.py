@@ -21,8 +21,8 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-# 引入 SQLAlchemy 核心查询组件
-from sqlalchemy import select
+# 引入 SQLAlchemy 核心查询组件与函数表达式（count 聚合需要 func）
+from sqlalchemy import func, select
 # 引入异步数据库会话类
 from sqlalchemy.ext.asyncio import AsyncSession
 # 引入关系预加载选项，避免懒加载 N+1 查询
@@ -31,31 +31,198 @@ from sqlalchemy.orm import selectinload
 # 引入数据库持久层实体与消息角色枚举
 from app.db.models import Conversation, Message, MessageRole
 
+# ==============================================================================
+# 模块级全局常量
+# ==============================================================================
+# 【为什么抽取为模块常量，而不是在方法内直接写字面量 "新对话"？】
+# 遵循单一真实数据源（Single Source of Truth, SSOT）原则。
+# 当前它有两个独立的消费者（消费方）：
+#   1. `create()` 的默认实参：用于初始落库。
+#   2. `update_title_if_default()`：用于判断“当前会话标题是否仍处于未被用户碰过的初始状态”。
+# 如果写死字面量，后续只要产品文案改动（例如改成“未命名会话”），开发者极易只修改其中一处，
+# 导致两边字符串不匹配，从而使“首问自动改标题”的核心业务逻辑产生静默失效（Silent Failure），
+# 且无任何报警日志。
+DEFAULT_CONVERSATION_TITLE = "新对话"
+
 
 class ConversationRepository:
     """
-    会话与消息仓储：负责会话元数据及其对话历史消息的数据库访问操作。
+    会话与消息仓储：负责封装对 Conversation 及关联 Message 实体的底层数据库读写操作。
     """
 
     def __init__(self, session: AsyncSession) -> None:
         """
-        初始化仓储实例，注入当前请求绑定的异步数据库会话。
+        初始化仓储实例，注入当前请求/任务上下文绑定的异步数据库会话（AsyncSession）。
         """
         self.session = session
 
-    async def create(self, title: str = "新对话") -> Conversation:
+    async def create(
+        self, title: str = DEFAULT_CONVERSATION_TITLE
+    ) -> Conversation:
         """
-        创建并持久化一个新的对话会话。
+        创建并持久化一个新会话实体。
 
-        :param title: 对话标题，默认为"新对话"
-        :return: 持久化并刷新后的 Conversation 实体
+        【仓储层的事务与提交约定】：
+        这里仅执行 await self.session.flush()，而不是 session.commit()。
+        - 为什么 flush？为了向数据库预发送 INSERT 语句，立刻回填由数据库生成的 UUID 主键
+          以及 server_default 生成的创建/更新时间戳，让返回值拥有完整属性供上层业务使用。
+        - 为什么不 commit？仓储层只做数据访问，事务的边界（Commit / Rollback）必须由外层
+          Service 层或 Unit of Work 严格控制，防止出现部分逻辑失败但底层仓储已提前提交的脏事务。
         """
         conversation = Conversation(title=title)
         self.session.add(conversation)
-        # 仅 flush，回填生成的主键与默认时间戳，不主动 commit
         await self.session.flush()
         return conversation
 
+    # ==========================================================================
+    # 新增方法 1：消息计数（首问检测）
+    # ==========================================================================
+    async def count_messages(self, conversation_id: UUID) -> int:
+        """统计指定会话下的消息总条数。
+
+        【设计目标与业务场景】：
+        专门用于判定“当前提问是否为该会话的首次提问”。当 count == 0 时，说明用户正在开启
+        第一轮对话，此时会触发后续的“提取首问文本并自动修改会话标题”逻辑。
+
+        【为什么不复用已有仓储方法（如 list_messages）？】
+        若使用 len(await self.list_messages(conversation_id))：
+        ORM 会将该会话下的所有 Message 记录完全反序列化为 Python 对象加载进内存，
+        当会话包含几十甚至上百条历史消息时，会产生严重的内存与反序列化开销。
+        这里直接发送轻量级的 `SELECT count(id)`，让数据库内部完成行统计，开销接近于 0。
+        """
+        stmt = select(func.count(Message.id)).where(
+            Message.conversation_id == conversation_id
+        )
+        # 【为什么用 scalar_one() 以及显式 int() 强转？】
+        # 1. 聚合函数 COUNT() 在 SQL 规范下恒定返回“一行一列”，scalar_one() 在无结果或
+        #    多于一行时会显式抛异常，是最符合聚合查询语义的取值方式。
+        # 2. 不同的异步数据库驱动（如 asyncpg、aiomysql）或不同配置下，COUNT 的返回值可能为
+        #    Decimal 类型甚至特殊包装类，外层显式包裹 int(...) 可确保对外输出强类型的标准 Python int。
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    # ==========================================================================
+    # 新增方法 2：分页列表（防 N+1 聚合查询）
+    # ==========================================================================
+    async def list_page(
+        self,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[tuple[Conversation, int]], int]:
+        """按 updated_at 倒序分页拉取会话列表，并原子性地附带每个会话当前包含的消息条数。
+
+        :return: ([(Conversation实体, 消息条数), ...], 数据库总会话数)
+        """
+        # ----------------------------------------------------------------------
+        # 1. 入参防御性约束（Defensive Clamping）
+        # ----------------------------------------------------------------------
+        # - 页码兜底：强制不能小于第 1 页，防止 offset 计算出负数导致 SQL 语法报错。
+        # - 分页大小兜底：上下限双重夹取（1 ~ 100）。上限截断至 100 是为了防止前端恶意传递
+        #   page_size=1000000 导致内存打爆或长事务拖垮数据库连接池。
+        page = max(page, 1)
+        page_size = max(min(page_size, 100), 1)
+        offset = (page - 1) * page_size
+
+        # ----------------------------------------------------------------------
+        # 2. 单次查询完成数据拉取与统计（核心：杜绝 N+1 查询）
+        # ----------------------------------------------------------------------
+        # 【为什么坚决不用“查出会话列表后，循环调用 count_messages”？】
+        # 传统做法如果每页 20 条，就会产生 1 次查会话 + 20 次查统计 = 21 次数据库 I/O（经典 N+1）。
+        # 这里通过 LEFT JOIN + GROUP BY，单次 SQL 交互直接让数据库引擎在底层一次性算好。
+        #
+        # 【为什么必须用 outerjoin (LEFT JOIN) 而不能用 join (INNER JOIN)？】
+        # 刚创建的全新会话还没有产生任何一条 Message。如果使用 INNER JOIN，所有消息数为 0 的
+        # 崭新会话都会在关联阶段被数据库自动过滤剔除，造成“刚建好的会话在列表页凭空消失”的严重 Bug。
+        #
+        # 【双字段排序的考量】：
+        # order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        # - 第一排序键 updated_at.desc()：保证最活跃（最新聊过）的会话始终置顶显示。
+        # - 第二排序键 id.desc()（主键兜底）：防止极端高并发场景下多个会话的更新时间戳完全相同，
+        #   导致数据库由于无序返回产生分页漂移（同一数据在翻页时重复出现或漏出）。
+        msg_count = func.count(Message.id).label("message_count")
+        stmt = (
+            select(Conversation, msg_count)
+            .outerjoin(Message, Message.conversation_id == Conversation.id)
+            .group_by(Conversation.id)
+            .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+            .limit(page_size)
+            .offset(offset)
+        )
+        rows = (await self.session.execute(stmt)).all()
+        # row[0] 为 Conversation ORM 实体，row[1] 为聚合算出的 count 值
+        items = [(row[0], int(row[1])) for row in rows]
+
+        # ----------------------------------------------------------------------
+        # 3. 统计全表总条数（Total Count）
+        # ----------------------------------------------------------------------
+        # 分页接口必须向前端返回 total 字段以供前端组件计算“总页数”。
+        # 在关系型数据库的标准分页规范中，列表数据和总记录数天然属于两次语义独立的查询。
+        total = int(
+            (
+                await self.session.execute(select(func.count(Conversation.id)))
+            ).scalar_one()
+        )
+        return items, total
+
+    # ==========================================================================
+    # 新增方法 3：会话硬删除（级联机制与 404 状态区分）
+    # ==========================================================================
+    async def delete(self, conversation_id: UUID) -> bool:
+        """硬删除指定会话实体。
+
+        :param conversation_id: 目标会话主键 UUID
+        :return: 删除成功返回 True；若记录本身不存在则返回 False（便于上层路由直接转译为 404）
+
+        【级联删除说明】：
+        会话下的历史消息（Message）及其引用的知识库片段（AnswerCitation）不需要在此处手写
+        多次循环删除，底层的数据库表外键约束已配置 ON DELETE CASCADE，由数据库引擎在底层原子清理。
+
+        【为什么选择“先 get 确认存在，再 delete”，而不是直接发送 DELETE 语句？】
+        1. 语义明确：直接执行 `delete(Conversation).where(...)` 只能通过返回游标的 cursor.rowcount
+           来判断是否命中，但在不同的异步数据库驱动和连接池封装中，rowcount 的兼容性和准确性存在差异。
+        2. ORM 生命周期与缓存状态同步：先 get 可以利用 Session 的 Identity Map，让 ORM 感知到
+           该实体的生命周期转变（从 persistent 变为 deleted），避免内存脏状态。
+        """
+        conversation = await self.get(conversation_id)
+        if conversation is None:
+            return False
+
+        await self.session.delete(conversation)
+        # 同样仅执行 flush，将 DELETE 操作发往数据库进行外键约束检查，严格不提交事务
+        await self.session.flush()
+        return True
+
+    # ==========================================================================
+    # 新增方法 4：标题条件更新（用户意图保护机制）
+    # ==========================================================================
+    async def update_title_if_default(
+        self,
+        conversation_id: UUID,
+        title: str,
+    ) -> None:
+        """在首次提问完成后，自动尝试将默认会话标题替换为首问摘要文本。
+
+        【核心业务约束（为什么是 if_default 而不是无条件覆盖？）】：
+        在实际业务中，用户在第一次提问前，完全有可能先在侧边栏手动点击了“重命名”。
+        如果此处直接执行无条件 UPDATE，系统就会以首次提问的内容暴力覆盖用户自己辛苦键入的自定义名称，
+        这属于典型的“系统侵占用户意志”。
+        因此必须严格做此守卫：只有当会话当前的标题依然等于 DEFAULT_CONVERSATION_TITLE 时，
+        才被视为“用户尚未对标题表态”，系统才可以安全地代为自动命名。
+        """
+        # 1. 文本清洗防御：过滤纯空格、制表符或换行。如果用户发的是空字符，拒绝修改标题
+        new_title = title.strip()
+        if not new_title:
+            return
+
+        conversation = await self.get(conversation_id)
+        # 2. 会话不存在，或者标题已经被用户主动修改过（不再等于初始默认常量）-> 直接安全退出
+        if conversation is None or conversation.title != DEFAULT_CONVERSATION_TITLE:
+            return
+
+        # 3. 边界截断：限制在前 30 字符。
+        # 一方面兼顾前端左侧历史列表的单行宽度排版美观，另一方面防止超长 Prompt 突破数据库 VARCHAR 列上限
+        conversation.title = new_title[:30]
+        # 仅 flush 暂存变更，统一等待外层 Service 决断最终 commit
+        await self.session.flush()
     async def get(self, conversation_id: UUID) -> Conversation | None:
         """
         根据主键 UUID 获取指定的会话实体。
