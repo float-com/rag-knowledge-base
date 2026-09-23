@@ -318,6 +318,7 @@ class ChatService:
         【执行的六个阶段，每一步对应下方相应位置的 SSE 事件】：
         1. 校验会话存在性（复用非流式的 self.session，本阶段仍是短请求）
         2. 开启独立数据库会话（与请求生命周期解耦，长连接专用）
+        2.1 【第 9 期】取本次回答的 trace_id —— 必须在函数体内取，见下方时序说明
         3. 装载上下文 → 图执行（标准化/路由/循环检索/精排/裁定）
         4. 落库并提交用户提问（必须在 load_context 之后，避免本轮提问混进历史）
         5. 下发路由 / 决策轨迹 → 回填引用 → 拒答分支或流式生成
@@ -330,6 +331,15 @@ class ChatService:
         - `verify_result.verified=False` 时携带 `replacement_answer`，前端按它**整段替换**
           流式出来的答案，与 PRD"校验失败 → 拒答替换"对齐；
         - 任何阶段出错则 `yield error` 并提前结束。
+        - 【第 9 期】`message_start` 追加 `trace_id` / `trace_url` 两个字段，
+          前端 `chatStream.ts` 的解析分支读的正是它们，因此**不新增事件类型**。
+
+        【第 9 期 · trace_id 的时序约束（本方法最容易被改坏的一处）】：
+        `get_current_trace_id()` 读的是"当前执行上下文"，**只在被 @traceable 装饰的函数体内有效**，
+        函数返回之后上下文即被清掉 —— 所以在外面（例如路由层、图节点里）取一律是 None。
+        与此同时，`message_start` 必须在**落库用户提问之后**才发（要带 user_message_id），
+        而落库又必须早于图执行（否则 load_context 会把本轮提问当成历史读回来）。
+        因此本方法的顺序被三重约束钉死，**不要把取号或 message_start 往上/往下挪**。
 
         【异常处理】：
         流式响应一旦开始返回，HTTP 状态码已固定为 200，后续异常无法再用 4xx/5xx 表达，
@@ -347,9 +357,19 @@ class ChatService:
         #    async with 保证无论是正常结束还是异常退出，连接都会被归还。
         async with AsyncSessionLocal() as session:
             try:
+                # 2.1 【第 9 期】取本次回答的 trace_id。
+                #     【为什么必须写在这里】观测 SDK 的取号函数是从"当前执行上下文"里读的，
+                #       而上下文只在本函数体内有效 —— 一旦函数返回就被清掉，外面再取必然是 None。
+                #       本函数带着 @traceable 装饰器，所以进入函数体时根 span 已经建好。
+                #     【未启用观测时】该函数直接返回 None，下面所有透出逻辑自然全部退化为"没有追踪信息"，
+                #       不需要在这里写任何特判。
+                trace_id = get_current_trace_id()
+
                 state: RAGState = {
                     "conversation_id": conversation_id,
                     "question": question,
+                    # 塞进状态后全链路可读（图内节点只透传、不产出）
+                    "trace_id": trace_id,
                 }
 
                 # 3. 装载上下文（取历史消息）、查询标准化与策略路由。
@@ -374,9 +394,18 @@ class ChatService:
 
                 # 5. 先把 message_start 发给前端，再进入 RAG 主链路。
                 #    这样做让前端尽早拿到 user_message_id 用于消息占位，参考资料的耗时不会阻塞首屏。
+                #    【第 9 期】顺带带上 trace_id / trace_url：
+                #      前端 TraceIdPanel 读的正是 message_start 的这两个字段（chatStream.ts）。
+                #      放在这里而不是新开一个事件，是为了不改动前端契约 —— 少一个事件就少一处不一致。
+                #      trace_url 走 build_trace_url()：用户没配 URL 前缀时它返回 None，
+                #      前端据此只显示"复制"按钮而不给跳转链接（None 是前端约定的"没有"）。
                 yield {
                     "event": "message_start",
-                    "data": {"user_message_id": str(state["user_message_id"])},
+                    "data": {
+                        "user_message_id": str(state["user_message_id"]),
+                        "trace_id": trace_id,
+                        "trace_url": build_trace_url(trace_id),
+                    },
                 }
 
                 # 6. 下发策略路由事件，把路由结果推给前端调试面板。
@@ -585,6 +614,13 @@ class ChatService:
             # Agentic 循环的决策轨迹：与 agent_steps SSE 事件共用同一份序列化函数，
             # 保证"实时展示"与"历史回看"看到的是同一条链（与 query_route 同一原则）。
             "agent_steps": _serialize_agent_steps(state),
+            # 【第 9 期】LangSmith trace 信息落库：刷新页面 / 翻历史时前端仍能展示与跳转。
+            #   【为什么 trace_url 也要存】前端 TraceIdPanel 只读它收到的那一个 URL 字段、
+            #   并不会自己拿 trace_id 去拼（拼接需要私有的 URL 前缀，前端无从得知），
+            #   所以只存 trace_id 会让历史回看退化成"只有 ID、没有跳转链接"。
+            #   两处都走同一对取号/拼链接函数，保证实时下发与历史回看看到的是同一份内容。
+            "trace_id": state.get("trace_id"),
+            "trace_url": build_trace_url(state.get("trace_id")),
         }
         if verify_result is not None:
             # verify_result 复用 SSE 的载荷格式，但 metadata【不需要】replacement_answer：
