@@ -6,26 +6,14 @@
  *   负责拉数据 + 渲染 + 触发回调；这样切换时取消正在进行的 SSE 等副作用全部留在 ChatPage
  * - 删除动作用 antd Popconfirm 二次确认，避免误删历史
  * - 新建对话按钮放在侧栏顶部，符合主流 ChatGPT 风格
- *
- * ⚠️ 当前降级说明（后续接入后端后请删除本段并恢复下方被注释的代码）：
- * 本组件原依赖两个后端接口，但目前后端尚未实现，直接调用会返回 405：
- *   - GET    /api/conversations            会话分页列表（listConversations）
- *   - DELETE /api/conversations/{id}       删除会话（deleteConversation）
- * 为让问答主链路先跑通，这里暂时摘除列表查询与删除能力：
- *   - 保留「新建对话」按钮与全部 props 接口（ChatPage 无需改动）；
- *   - 列表区域改为提示文案，不再发起请求，因此不会再出现 405；
- *   - 被注释的代码与依赖原样保留，后端补齐接口后取消注释即可恢复。
  */
 
-import { Button, Typography } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
-// ⚠️ 以下依赖供「会话列表 / 删除」使用，后端接口补齐后取消注释
-// import { List, Popconfirm, Spin, Tooltip, message } from 'antd'
-// import { DeleteOutlined, MessageOutlined, PlusOutlined } from '@ant-design/icons'
-// import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-// import { conversationsQueryKey } from '@/api/queryKeys'
-// import { deleteConversation, listConversations } from '@/client/sdk.gen'
-// import type { ConversationListItem } from '@/client/types.gen'
+import { Button, List, Popconfirm, Spin, Tooltip, Typography, message } from 'antd'
+import { DeleteOutlined, MessageOutlined, PlusOutlined } from '@ant-design/icons'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { conversationsQueryKey } from '@/api/queryKeys'
+import { deleteConversation, listConversations } from '@/client/sdk.gen'
+import type { ConversationListItem } from '@/client/types.gen'
 
 const { Text } = Typography
 
@@ -40,33 +28,39 @@ interface ConversationSidebarProps {
   isCreating?: boolean
 }
 
-export function ConversationSidebar({ onCreateNew, isCreating }: ConversationSidebarProps) {
-  // ⚠️ 会话列表查询已注释：GET /api/conversations 后端未实现（405）
-  // const queryClient = useQueryClient()
-  //
-  // const conversationsQuery = useQuery({
-  //   queryKey: conversationsQueryKey,
-  //   queryFn: async () => {
-  //     // 拉一页足够；侧栏不做无限滚动，超过 100 条的场景留到后续章节
-  //     const res = await listConversations({ query: { page: 1, page_size: 100 } })
-  //     return res.data!
-  //   },
-  // })
+export function ConversationSidebar({
+  currentId,
+  onSelect,
+  onDeleted,
+  onCreateNew,
+  isCreating,
+}: ConversationSidebarProps) {
+  const queryClient = useQueryClient()
 
-  // ⚠️ 删除会话已注释：DELETE /api/conversations/{id} 后端未实现（405）
-  // const deleteMutation = useMutation({
-  //   mutationFn: async (id: string) => {
-  //     await deleteConversation({ path: { conversation_id: id } })
-  //     return id
-  //   },
-  //   onSuccess: async (id) => {
-  //     message.success('已删除会话')
-  //     await queryClient.invalidateQueries({ queryKey: conversationsQueryKey })
-  //     if (id === currentId) onDeleted(id)
-  //   },
-  // })
-  //
-  // const items = conversationsQuery.data?.items ?? []
+  const conversationsQuery = useQuery({
+    queryKey: conversationsQueryKey,
+    queryFn: async () => {
+      // 拉一页足够；侧栏不做无限滚动，超过 100 条的场景留到后续章节
+      const res = await listConversations({ query: { page: 1, page_size: 100 } })
+      return res.data!
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await deleteConversation({ path: { conversation_id: id } })
+      return id
+    },
+    onSuccess: async (id) => {
+      message.success('已删除会话')
+      // 失效列表缓存，让侧栏重新拉一次（消息数、排序都可能变）
+      await queryClient.invalidateQueries({ queryKey: conversationsQueryKey })
+      // 删掉的正是当前会话 → 交给上层重置 currentId 并清空 pending
+      if (id === currentId) onDeleted(id)
+    },
+  })
+
+  const items = conversationsQuery.data?.items ?? []
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -82,16 +76,6 @@ export function ConversationSidebar({ onCreateNew, isCreating }: ConversationSid
         </Button>
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto' }}>
-        <Text
-          type="secondary"
-          style={{ display: 'block', textAlign: 'center', padding: 24, fontSize: 12 }}
-        >
-          会话列表暂未开放，历史记录可在下方直接提问
-        </Text>
-      </div>
-
-      {/* ⚠️ 以下为原列表渲染逻辑，后端接口补齐后取消注释并删除上方提示文案
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {conversationsQuery.isLoading ? (
           <div style={{ textAlign: 'center', padding: 24 }}>
@@ -122,12 +106,10 @@ export function ConversationSidebar({ onCreateNew, isCreating }: ConversationSid
           />
         )}
       </div>
-      */}
     </div>
   )
 }
 
-/* ⚠️ 以下子组件与工具函数供「会话列表」使用，后端补齐接口后一并取消注释
 interface ConversationItemProps {
   item: ConversationListItem
   isActive: boolean
@@ -162,6 +144,8 @@ function ConversationItem({
           okText="删除"
           okButtonProps={{ danger: true }}
           cancelText="取消"
+          // ⚠️ 每个 List.Item 都要 stopPropagation 处理删除按钮的点击事件，
+          //    否则点删除按钮会同时触发整行的 onClick（切会话 + 弹确认框一起发生）
           onConfirm={(e) => {
             e?.stopPropagation()
             onDelete()
@@ -204,11 +188,11 @@ function ConversationItem({
     </List.Item>
   )
 }
-*/
 
-/* ⚠️ 时间格式化工具供「会话列表」使用，当前列表已降级故未被调用；
-   若直接保留函数体会触发 noUnusedLocals(TS6133) 编译错误，因此一并注释。
-   后端补齐接口、恢复列表渲染后，请取消本段注释。
+/**
+ * 把 ISO 时间格式化成"X 分钟前 / X 小时前 / YYYY-MM-DD"。
+ * 侧栏空间窄，不展示完整 datetime；超过 7 天降级到日期。
+ */
 function formatRelativeTime(iso: string): string {
   const date = new Date(iso)
   const diffMs = Date.now() - date.getTime()
@@ -220,4 +204,3 @@ function formatRelativeTime(iso: string): string {
   if (diffMs < 7 * day) return `${Math.floor(diffMs / day)} 天前`
   return date.toLocaleDateString('zh-CN')
 }
-*/

@@ -25,7 +25,7 @@
 from collections.abc import AsyncIterable
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from app.api.deps import DbSession
@@ -33,6 +33,8 @@ from app.api.schemas.chat import (
     ChatRequest,
     ConversationCreate,
     ConversationDetail,
+    ConversationListItem,
+    ConversationPage,
     ConversationRead,
     MessageRead,
 )
@@ -160,3 +162,82 @@ async def stream_chat(
         # - event: 事件名，前端按它分派（message_start / citations / token / message_end / error）
         # - data : 原始字典，交给框架统一 JSON 编码
         yield ServerSentEvent(event=sse_event["event"], data=sse_event["data"])
+
+
+# =============================================================================
+# 4. 会话列表（分页）
+# =============================================================================
+# 语法（查询参数约束）：Query(1, ge=1)
+#   特性：声明查询参数并附带校验规则（ge = greater or equal）
+#   通俗来讲：把"页码至少为 1、每页最多 100 条"写进接口契约，
+#             前端传越界值时 FastAPI 直接返回 422，不必在函数体里手写 if 判断。
+@router.get(
+    "",
+    response_model=ConversationPage,
+    operation_id="listConversations",
+    summary="按更新时间倒序分页列出所有会话",
+)
+async def list_conversations(
+    session: DbSession,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+) -> ConversationPage:
+    """分页返回会话列表，每项带消息条数（供左侧侧栏渲染）。
+
+    【为什么把分页参数写在 Query 上而不是函数体里校验】：
+    ge / le 由 FastAPI 在进函数前校验，越界直接 422；
+    写在函数体里则要手动 raise，且 OpenAPI 文档不会体现约束。
+
+    【为什么这里手动做 ORM → 响应模型的转换，而不是 from_attributes】：
+    服务层返回的是 (Conversation, 消息条数) 元组列表，不是单一实体，
+    没有 from_attributes 可以直接映射的"源属性名"；
+    而且 message_count 不在 Conversation 实体上，必须显式赋值。
+    """
+    service = ChatService(session)
+    items, total = await service.list_conversations(page=page, page_size=page_size)
+    return ConversationPage(
+        items=[
+            ConversationListItem(
+                id=conv.id,
+                title=conv.title,
+                updated_at=conv.updated_at,
+                message_count=count,
+            )
+            for conv, count in items
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+# =============================================================================
+# 5. 删除会话
+# =============================================================================
+# 语法（204 与返回体）：status_code=204 表示"成功但无响应体"
+#   特性：删除成功的语义是"资源没了"，再回一段 JSON 反而与语义冲突
+#   通俗来讲：204 就是"收到了、做完了、没什么可给你看的"。
+#   ⚠️ 因此返回类型必须是 Response，不能声明 response_model。
+@router.delete(
+    "/{conversation_id}",
+    status_code=204,
+    operation_id="deleteConversation",
+)
+async def delete_conversation(
+    conversation_id: UUID,
+    session: DbSession,
+) -> Response:
+    """删除会话及其消息与引用（由数据库外键级联清理）。
+
+    【为什么返回 204 而不是 200 + 消息体】：
+    删除成功的标准语义是"资源已不存在"，此时没有任何需要回传给前端的数据；
+    返回 204 让契约更准确，前端也不必解析一个空对象。
+
+    【404 从哪来】：
+    服务层在"会话不存在"时会抛 NotFoundError，由全局异常处理器转成 404，
+    因此本函数不需要 if 判断 —— 异常契约统一在服务层收敛。
+    """
+    service = ChatService(session)
+    await service.delete_conversation(conversation_id)
+    # 204 要求空响应体，显式返回一个空 Response
+    return Response(status_code=204)

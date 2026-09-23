@@ -62,6 +62,30 @@ class ConversationRead(BaseModel):
     updated_at: datetime
 
 
+class ConversationListItem(BaseModel):
+    """会话列表元素：侧栏渲染用，比 ConversationRead 多带 message_count。
+
+    【为什么不复用 ConversationRead】：
+    侧栏比详情页多需要"这个会话聊了几轮"，但不需要 created_at（侧栏按最后活动时间排）。
+    另建一个模型比给 ConversationRead 加个可选字段更清晰 ——
+    后者会让"详情接口也可能返回 message_count"变成类型上的可能，语义反而模糊。
+    """
+
+    id: UUID
+    title: str
+    updated_at: datetime
+    message_count: int
+
+
+class ConversationPage(BaseModel):
+    """会话列表分页响应。统一 page/page_size 风格，与第 3 章文档列表一致。"""
+
+    items: list[ConversationListItem]
+    total: int
+    page: int
+    page_size: int
+
+
 # =============================================================================
 # 2. 引用快照模型
 # =============================================================================
