@@ -614,13 +614,14 @@ class ChatService:
             # Agentic 循环的决策轨迹：与 agent_steps SSE 事件共用同一份序列化函数，
             # 保证"实时展示"与"历史回看"看到的是同一条链（与 query_route 同一原则）。
             "agent_steps": _serialize_agent_steps(state),
-            # 【第 9 期】LangSmith trace 信息落库：刷新页面 / 翻历史时前端仍能展示与跳转。
-            #   【为什么 trace_url 也要存】前端 TraceIdPanel 只读它收到的那一个 URL 字段、
-            #   并不会自己拿 trace_id 去拼（拼接需要私有的 URL 前缀，前端无从得知），
-            #   所以只存 trace_id 会让历史回看退化成"只有 ID、没有跳转链接"。
-            #   两处都走同一对取号/拼链接函数，保证实时下发与历史回看看到的是同一份内容。
+            # 【第 9 期】LangSmith 追踪标识落库：刷新页面 / 翻历史时前端仍能展示与跳转。
+            #   【只存 trace_id，不存 trace_url】——
+            #   第 9 章的响应模型是"拿落库的 trace_id、按【当前】配置现拼跳转链接"。
+            #   若这里也存一份 URL，它就成了永不读取的死数据，而且换 LangSmith 工作区
+            #   或改 URL 格式后，历史里那份旧链接会与新规则不一致。
+            #   【为什么不在这里把 URL 一并算好】拼接规则属于表现层关切，
+            #   放在 API 模型层能在每次响应时反映最新配置。
             "trace_id": state.get("trace_id"),
-            "trace_url": build_trace_url(state.get("trace_id")),
         }
         if verify_result is not None:
             # verify_result 复用 SSE 的载荷格式，但 metadata【不需要】replacement_answer：

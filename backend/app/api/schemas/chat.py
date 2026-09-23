@@ -25,6 +25,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# 【第 9 期】只用它的"拼链接"能力：trace_url 不入库，每次响应按当前配置现拼（见 MessageRead）。
+from app.core.observability import build_trace_url
 from app.db.models import AnswerCitation, Message
 
 # 消息角色字面量联合类型：
@@ -355,6 +357,30 @@ def _parse_verify_result(metadata: dict | None) -> VerifyResultRead | None:
 
 
 # =============================================================================
+# 3.3 可观测性追踪标识（第 9 期）
+# =============================================================================
+def _parse_trace_id(metadata: dict | None) -> str | None:
+    """从 messages.extra_metadata 提取 trace_id：缺失 / 非法静默返回 None。
+
+    【与 _parse_query_route / _parse_verify_result 同一套防御思路】，但少了一层：
+    本字段是**纯字符串**而非嵌套结构，所以不需要交给 Pydantic 二次校验，
+    只需亲手确认"它确实是一个非空字符串"。
+
+    【为什么必须显式判类型而不是直接返回】：
+    元数据列是 JSONB，历史上或手工写入的值可能是数字、布尔、对象等任意 JSON 类型。
+    若直接把非字符串透出，Pydantic 会因类型不符抛 ValidationError ——
+    一段可选的可观测性数据，不该让整个历史接口 500。
+    """
+    if not metadata:
+        return None
+    raw = metadata.get("trace_id")
+    # `not isinstance(raw, str)` 挡住所有非字符串；`not raw.strip()` 挡住空串与纯空白
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw
+
+
+# =============================================================================
 # 4. 消息模型
 # =============================================================================
 class MessageRead(BaseModel):
@@ -378,6 +404,12 @@ class MessageRead(BaseModel):
     # 前端读的是 m.verify_result；只存在 metadata 里而不在此暴露，刷新历史后校验结果就消失了
     # （注意：content 已是替换后的最终文本，所以历史回看看到的是"已改过的答案"）。
     verify_result: VerifyResultRead | None = None
+    # 【第 9 期】LangSmith 追踪标识与跳转链接。
+    #   实时对话时由 SSE 的 message_start 事件下发；历史回看时从这里取。
+    #   【为什么 trace_url 也要声明成字段】前端 TraceIdPanel 只读这一个 URL 字段、
+    #   不会自己拿 trace_id 去拼（拼接需要私有的 URL 前缀，前端无从得知）。
+    trace_id: str | None = None
+    trace_url: str | None = None
 
     @classmethod
     def from_orm(cls, message: Message) -> "MessageRead":
@@ -403,6 +435,10 @@ class MessageRead(BaseModel):
         # 角色只判断一次并缓存：引用过滤与查询快照都依赖它，
         # 重复写 message.role == "assistant" 容易在改动时漏改其中一处
         is_assistant = message.role == "assistant"
+        # 【第 9 期】追踪标识只从 assistant 消息的元数据里取（user 消息从不写该键）；
+        #   trace_url 则**不入库**、按当前配置现拼 —— 这样换 LangSmith 工作区或改 URL 格式后，
+        #   历史消息跟着新规则跳转，不必回填历史数据。
+        trace_id = _parse_trace_id(message.extra_metadata) if is_assistant else None
         return cls(
             id=message.id,
             role=message.role,
@@ -426,6 +462,9 @@ class MessageRead(BaseModel):
             verify_result=(
                 _parse_verify_result(message.extra_metadata) if is_assistant else None
             ),
+            # 【第 9 期】追踪标识来自落库的元数据；跳转链接按当前配置现拼
+            trace_id=trace_id,
+            trace_url=build_trace_url(trace_id),
         )
 
 
