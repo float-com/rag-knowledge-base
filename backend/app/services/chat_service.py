@@ -31,7 +31,9 @@
    因此流式接口内部必须显式捕获异常并转为 error 事件下发，不能把异常直接抛给上层中间件。
 """
 
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from uuid import UUID
 
 # 第 9 期：观测 SDK 的装饰器。本服务是"编排者"，内部是普通 Python 方法，
@@ -59,6 +61,79 @@ from app.workflows.rag_state import RAGState
 
 # 初始化模块级业务日志记录器
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class EvaluationAnswer:
+    """评测专用领域模型：跑一遍完整 RAG 后拿到的一次性非流式结果快照。
+
+    与 stream_answer 的三点差异：
+    1. 沙箱隔离：不落 conversations / messages，跑几百条也不污染线上历史；
+    2. 指标底座：除 answer 外完整暴露 chunks，供外层映射成
+       RagasSample.retrieved_contexts，用于算召回率与忠实度；
+    3. 归因画像：聚合路由 / Agent 轨迹 / 校验结果 / 耗时，
+       让 Bad Case 能定位到"切片没召回、模型慢、还是触发拒答"。
+    frozen=True 保证进入并发评测与统计环节后不会被无意篡改。
+    """
+
+    # --- 核心结果区 ---------------------------------------------------------
+    # 最终答案文本（可能已被 verify 整段替换成拒答文案）。
+    # 映射：RagasSample.answer → answer_relevancy / faithfulness 的入参。
+    answer: str
+
+    # 是否以"拒答"收场。来源三条：① plan_retrieval 判定 refuse（只置位）；
+    # ② refuse 节点写文案；③ verify 校验失败（替换答案 + 强制置位）。
+    # ①② 是"没找到依据"、③ 是"答了但不可信"，归因时修复动作完全不同。
+    refused: bool
+
+    # 实际召回并喂给模型的切片列表。
+    # 映射：`[c.content for c in chunks]` → RagasSample.retrieved_contexts（是 content 不是 text）。
+    # 拒答时照样有值（只清空 citations），RAGAS 仍能算上下文类指标。
+    chunks: list[RetrievedChunk]
+
+    # --- 决策链路与白盒轨迹区 -----------------------------------------------
+    # 路由结果，固定 5 键（见 _build_query_route_payload）：route(original|rewrite|hyde|
+    # multi_query) / query / rewritten_query / hyde_answer / multi_queries。
+    # 单知识库，无 intent / target_kb；且路由由 LLM 决策，同一题两次跑可能不同。
+    query_route: dict
+
+    # 检索循环的逐轮「决策 + 观察」轨迹，每项固定形如（见 rag_state.py）：
+    # {round, action, reason, route, query, retrieved_count, top_score}
+    # （plan_retrieval 追加决策、observe_context 回填观察，同一轮只占一条记录）。
+    # 排查用：retrieved_count 恒为 0 = 空转；round 逼近视 agent_max_rounds = 不收敛。
+    agent_steps: list[dict]
+
+    # 答案真实性校验结果（VerifyResult = verified + reason），即"回答能否由上下文支撑"。
+    # 与敏感词 / 内容安全无关；拒答路径不校验，恒为 None。
+    verify_result: VerifyResult | None
+
+    # --- 可观测性与性能诊断区 -----------------------------------------------
+    # 链路追踪 ID（本项目接 LangSmith）。未启用观测时为 None，
+    # 且只在 @traceable 装饰的函数体内有效、函数返回即失效。
+    trace_id: str | None
+
+    # 端到端耗时（ms）。起算点是进入 answer_for_evaluation 那一刻，不含执行器调度开销。
+    latency_ms: int
+
+    # 首字耗时（TTFT，ms）。起算点与 latency_ms 是同一个 started_at，检索 / 规划 /
+    # 重排都算在内 —— 测的是"用户体感首字时间"，不是"模型首 token 时间"
+    # （实测 5172 ms，同期 latency_ms 7378 ms）。拒答或异常未调 LLM 时为 None。
+    first_token_latency_ms: int | None
+
+    # --- 异常与证据溯源区 ---------------------------------------------------
+    # 【为什么这两个必须压在最后】dataclass 语法强制：带默认值的字段不能排在无默认值
+    # 字段之前，否则抛 TypeError —— 所以 citations 别顺手往上挪。
+    #
+    # 未捕获异常的摘要（str(exc)，空则退化为类名；完整堆栈在 logger.exception）。
+    # 不为 None 即基础设施故障：第 6 节标 failed，第 3 节按 is_error=True 归到 other。
+    error_message: str | None = None
+
+    # 引用角标列表（拒答时为空）。元素固定 9 键（见 _serialize_citation）：
+    # ordinal / chunk_id / document_id / document_name / page_no / section_path /
+    # score / quote / retrieval_meta。是 ordinal 不是 index，与 prompt 的
+    # 「片段 N」一致、从 1 开始。这个形状就是第 3 节 compute_citation_hit 的入参。
+    # 用 default_factory=list，避免所有实例共享同一个列表。
+    citations: list[dict] = field(default_factory=list)
 
 
 def _serialize_agent_steps(state: RAGState) -> list[dict]:
@@ -537,6 +612,245 @@ class ChatService:
                         "message": str(exc) or "问答处理失败",
                     },
                 }
+
+    # =========================================================================
+    # 评测专用入口（第 10 期）：非流式跑一遍完整 RAG，只为离线评测取数
+    # =========================================================================
+
+    # 【可观测性设计 - 链路追踪根节点】：
+    # 使用 LangSmith / LangChain 提供的 @traceable 装饰器将本函数注册为 Chain 根节点。
+    # 为什么必须加？
+    # 若不声明根节点，离线评测期间 RAG 内部并发调用的检索切片、Prompt 组装、LLM 生成等子调用
+    # 会变成没有父节点的“孤儿 Span（Orphan Spans）”，散落在追踪看板各处；
+    # 加上该装饰器后，每次评测都会生成一个树状 Trace，方便在 LangSmith 看板上一键排查 Bad Case 的完整执行轨迹。
+    @traceable(name="ChatService.answer_for_evaluation", run_type="chain")
+    async def answer_for_evaluation(self, question: str) -> EvaluationAnswer:
+        """跑一遍完整 RAG 拿非流式结果，用于离线评测。
+
+        【与生产线上接口 stream_answer 的核心差异】：
+        1. 【评测沙箱隔离】：不创建 conversation 实体，不向数据库写入 user/assistant 消息，
+           保证几百上千次离线自动化跑批绝不污染线上生产的对话历史表。
+        2. 【题目完全正交】：强制注入 `chat_history: []`。生产环境有多轮对话改写（Contextualize），
+           离线评测集每道题均独立计算指标，清空历史能杜绝上一题的对话记忆污染下一题。
+        3. 【校验口径对齐】：等待生成流全部聚合为完整文本后，统一执行 verify_answer 事实校验，
+           校验失败同样重放拒答逻辑，确保评测统计的指标口径与线上完全一致。
+        4. 【无中断容错】：单个测试 Case 崩溃不向上 raise 异常打断整个评测批次，
+           而是将异常原因收敛至 error_message，交由外部调度引擎统计失败率。
+
+        :param question: 评测集中该用例的原始用户提问
+        :return: 非流式评测快照实体（EvaluationAnswer），供下游计算 RAGAS 指标及归因画像
+        """
+        # -------------------------------------------------------------------------
+        # 步骤 1：启动基准计时与链路追踪上下文初始化
+        # -------------------------------------------------------------------------
+        # 【为什么用 time.perf_counter() 而不用 time.time()？】
+        # 1. 避免时钟回拨与负数隐患（Monotonic Clock 单调递增性）：
+        #    - time.time() 读取的是操作系统的“挂钟时间”（Wall Clock Time）。生产服务器后台常驻 NTP 自动校时
+        #      进程或夏令时/闰秒调整，一旦系统时间在此期间被往回校准了 1~2 秒，耗时算式 (time.time() - started_at)
+        #      就会诡异地算出【负数】（如 -1800ms）或几十秒的虚假暴增，导致评测报表数据污染。
+        #    - time.perf_counter() 读取的是 CPU 硬件级的单调时钟，物理上严格单调递增、永不倒流，计算耗时差值绝对安全。
+        # 2. 高分辨率（适配微秒/毫秒级性能测量）：
+        #    - 大模型评测对首字延迟（TTFT，往往在几十到几百毫秒）以及网络 I/O 耗时非常敏感，
+        #      perf_counter 以【纳秒为单位】返回，实际分辨率取决于平台（通常亚微秒级），远优于普通时间戳函数。
+        started_at = time.perf_counter()
+        trace_id = get_current_trace_id()
+
+        # 构造 LangGraph 状态图的初始上下文（RAGState）：
+        state: RAGState = {
+            # 【为什么用 UUID(int=0) 占位？】：
+            # 1. 类型约束：RAGState 状态模式强类型要求 conversation_id 必须是 UUID 类型，不能直接传 None；
+            # 2. 数据库安全：评测分支不执行落盘写库操作，使用 00000000-0000-0000-0000-000000000000 占位；
+            # 3. 流量染色：日志检索或链路系统看到全 0 UUID，能立刻断定为离线评测或自动化巡检流量。
+            "conversation_id": UUID(int=0),
+            "question": question,
+            # 显式置空多轮历史，禁用多轮指代消解与改写，保证评测用例的单轮独立性
+            "chat_history": [],
+            "trace_id": trace_id,
+        }
+
+        try:
+            # ---------------------------------------------------------------------
+            # 步骤 2：执行 LangGraph 核心图拓扑（意图识别 -> 检索 -> 重排 -> 路由）
+            # ---------------------------------------------------------------------
+            # 1. 驱动状态图异步执行：
+            #    通过 get_rag_graph().ainvoke(state) 触发编译好的 LangGraph 图流转。
+            #    该图内部黑盒完成了：意图分类 -> 关键词/向量混合检索 -> RRF融合 -> 重排打分 -> 拒答裁定。
+            #    此处图执行停止在流式生成之前，返回生成所需的上下文终态（final_state）。
+            final_state = await get_rag_graph().ainvoke(state)
+
+            # 2. 状态增量合并与静态类型检查抑制：
+            #    - 将图流转产出的新字段（如 retrieved_chunks、agent_steps、refused）回填至原 state。
+            #    - # type: ignore[arg-type] 的原因：LangGraph 的 ainvoke() 返回的是 dict[str, Any]，
+            #      而 TypedDict.update() 期望同类型映射，MyPy 据此报 arg-type。
+            state.update(final_state)  # type: ignore[arg-type]
+
+            # 3. 后置校验对象提前占位初始化：
+            #    - 只有当流程未被前置拒答、且开启了 verify_answer_enabled 开关时，才会真正调用校验器生成该对象；
+            #    - 前置拒答路径或未开启校验时，该变量保持为 None，下游 EvaluationAnswer 据此如实记录“未执行校验”。
+            verify_result: VerifyResult | None = None
+
+            # 4. 首字延迟（TTFT）指标占位初始化：
+            #    - 该字段用于记录从发起调用到大模型吐出首个 token 的端到端毫秒数；
+            #    - 若流程在前置路由阶段直接被拒答（无需调 LLM 生成），或调用发生异常中断，
+            #      则此值保持为 None，避免向离线评测报表中注入虚假的首字耗时。
+            first_token_latency_ms: int | None = None
+
+            # ---------------------------------------------------------------------
+            # 步骤 3：答案生成与流式首字耗时（TTFT）捕获
+            # ---------------------------------------------------------------------
+            # 检查前置 LangGraph 执行阶段是否已经判定为拒答（如检索无相关切片、上下文判据不足）
+            if state.get("refused"):
+                # 【拒答快速通道】：
+                # 前置规划节点已将标准拒答文案写入 state["answer"]，直接复用该文案；
+                # 跳过大模型调用，节省昂贵的 Token 消耗与推理时间；
+                # 此时 first_token_latency_ms 保持为 None，如实反映“未发起 LLM 生成”。
+                answer = state["answer"]
+            else:
+                # 【正常生成通道：流式聚合缓冲区】
+                # 针对生产接口采用 SSE 逐字下发，而离线评测需拿到完整文本输入给下游指标评测器（RAGAS）；
+                # 初始化内存列表作为收集器，避免字符串频繁 += 拼接引发的大量内存重分配。
+                parts: list[str] = []
+
+                # 异步遍历大模型推理生成的流式事件生成器（AsyncIterator[str]）：
+                async for delta in stream_generate(state):
+                    # 捕获 Time To First Token（TTFT，首字生成耗时）：
+                    # 利用 if None 守卫逻辑，仅在接收到首个文本切片（Token）的瞬间触发一次计算；
+                    # 记录从进入 answer_for_evaluation 开始，到看到第一个字跳出的端到端真实体感时延（毫秒）。
+                    if first_token_latency_ms is None:
+                        first_token_latency_ms = int(
+                            (time.perf_counter() - started_at) * 1000
+                            # 算式原理解析：
+                            # 1. time.perf_counter() 读取当前纳秒级单调时钟，减去起点 started_at 得到流逝的「秒数（float）」；
+                            # 2. 乘以 1000 将「秒（s）」换算为「毫秒（ms）」；
+                            # 3. 外层 int(...) 截断取整，得到标准的整数毫秒值，记录从进入评测到吐出首个 Token 的真实端到端体感耗时。
+                        )
+                    # 将当前流式增量追加至缓冲区
+                    parts.append(delta)
+
+                # 将分散的 token 切片高效拼接为完整回答字符串
+                answer = "".join(parts)
+                # 将最终拼接好的生成结果同步回写至图状态上下文，供后续校验与落库逻辑使用
+                state["answer"] = answer
+
+                # -----------------------------------------------------------------
+                # 步骤 4：后置事实校验与线上护栏行为对齐
+                # -----------------------------------------------------------------
+                # 读取全局配置开关：判断当前环境是否启用了生成后的事实一致性（反幻觉）校验
+                if settings.verify_answer_enabled:
+                    # 执行事实核验流水线（异步调用专用校验器）：
+                    # 1. 传入原始提问与完整聚合后的生成回答；
+                    # 2. list(state.get("retrieved_chunks", []))：防御性读取切片，
+                    #    并包一层 list 复制【列表容器】，防止校验器对列表增删而影响 state；
+                    #    注意元素仍是同一批 RetrievedChunk 引用（它本身是 frozen dataclass，天然不可变）。
+                    # 3. 校验器内部比对 answer 中的事实断言是否均能由 chunks 充分推导支撑。
+                    verify_result = await get_answer_verifier().verify(
+                        question,
+                        answer,
+                        chunks=list(state.get("retrieved_chunks", [])),
+                    )
+
+                    # 检查核验结果：若 verified 为 False，说明模型产生了无法由知识库佐证的严重事实幻觉
+                    if not verify_result.verified:
+                        # 【与线上 verify 失败后的处理完全对齐】：
+                        # 1. 废弃并覆盖原有不可信回答，强行替换为统一标准拒答文案 REFUSAL_ANSWER；
+                        answer = REFUSAL_ANSWER
+
+                        # 2. 同步回写状态字典，确保后续所有模块读到的都是最终安全文案；
+                        state["answer"] = answer
+
+                        # 3. 将状态显式标记为拒答（refused=True）：
+                        #    - 触发后续步骤清空引用角标（citations 置空），避免出现“拒绝回答却给出了参考资料”的矛盾展示；
+                        #    - 固化进 EvaluationAnswer 产物，供下游评测报表将其归因为“幻觉拦截”典型用例。
+                        state["refused"] = True
+
+            # ---------------------------------------------------------------------
+            # 步骤 5：切片序列化、角标引用提取与快照装配
+            # ---------------------------------------------------------------------
+            # 1. 安全提取召回切片：
+            #    - 使用 .get(..., []) 规避键缺失风险；
+            #    - 外层包 list(...) 复制一份【列表容器】，防止上游对列表增删而影响 state；
+            #      元素仍是同一批 RetrievedChunk 引用（它本身是 frozen dataclass，天然不可变）。
+            chunks = list(state.get("retrieved_chunks", []))
+
+            # 2. 状态值布尔强转与归一化：
+            #    - 将可能为 None 的 state.get("refused") 强制规整为标量布尔值（True/False），
+            #      严格契合 EvaluationAnswer 强类型契约。
+            refused = bool(state.get("refused"))
+
+            # 3. 引用溯源角标条件装配（拒答业务对齐）：
+            #    - 若 refused=True（前置拒答或事实校验未通过）：强制清空引用（置为 []），
+            #      杜绝“回答内容拒绝回答，但下方却展示参考切片”的业务逻辑自相矛盾；
+            #    - 若正常回答：使用 enumerate(chunks, 1) 从 1 起始编号，确保生成的角标 [1],[2]
+            #      与大模型 Prompt 提示词中看到的【片段 N】完全一致，逐个调用 _serialize_citation 序列化。
+            citations = (
+                []
+                if refused
+                else [
+                    _serialize_citation(c, ordinal=i)
+                    for i, c in enumerate(chunks, 1)
+                ]
+            )
+
+            # 4. 固化并交付不可变评测领域模型实体：
+            #    将问答结果、决策轨迹、耗时画像与追踪信息打包，作为供下游 RAGAS 打分和 Bad Case 归因的不可变快照。
+            return EvaluationAnswer(
+                # 核心业务文本（用于 RAGAS 计算 answer_relevancy 与 faithfulness）
+                answer=answer,
+                # 拒答状态标记（前置拒答、或事实校验未通过，均为 True）
+                refused=refused,
+                # 原始切片实体列表（供外层提取 c.content 映射为 RagasSample.retrieved_contexts）
+                chunks=chunks,
+                # 意图路由快照（包含改写、HyDE 等分支细节，用于排查路由错位）
+                query_route=_build_query_route_payload(state),
+                # Agent 多轮检索轨迹（包含各轮 action / reason / retrieved_count，用于排查多跳空转）
+                agent_steps=_serialize_agent_steps(state),
+                # 后置反幻觉校验实体（包含是否通过 verified 及判定理由 reason）
+                verify_result=verify_result,
+                # LangSmith 链路追踪根节点 ID（未启用时为 None，用于一键跳转查看分布式调用树）
+                trace_id=trace_id,
+                # 端到端全链路总耗时（毫秒整数）：从函数入口计算至装配交付的完整时长
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                # 首字生成时延（TTFT，毫秒整数）：若前置拒答或异常未触发 LLM，则自然保持为 None
+                first_token_latency_ms=first_token_latency_ms,
+                # 结构化引用角标列表
+                citations=citations,
+            )
+
+        except Exception as exc:
+            # ---------------------------------------------------------------------
+            # 步骤 6：异常隔离护栏（Fail-Safe 故障隔离设计）
+            # ---------------------------------------------------------------------
+            # 1. 打印带堆栈的现场日志：
+            #    - 使用 logger.exception 自动挂载完整 Traceback 堆栈信息；
+            #    - question=%r：利用 repr 格式化输出带转义的原题，防止题干自带换行污染日志排版。
+            logger.exception("Evaluation answer failed: question=%r", question)
+
+            # 2. 构造并交付降级快照（禁止向上抛出异常，防止评测批处理任务链直接熔断）：
+            return EvaluationAnswer(
+                # 异常未产出有效回复，置空字符，避免下游误当正常回答处理
+                answer="",
+                # 异常中断不属于合规业务拒答，标记为 False
+                refused=False,
+                # 未完成检索或检索产物失效，置空列表，防止产生脏切片
+                chunks=[],
+                # 【保全现场】：即使崩溃，也保留崩溃前 state 已生成的路由决策，便于定位哪条链路翻车
+                query_route=_build_query_route_payload(state),
+                # 【保全现场】：保留崩溃前已走过的 Agent 思考轨迹，查明停在第几轮
+                agent_steps=_serialize_agent_steps(state),
+                # 链路未正常走完，无反幻觉核验结果，置为 None
+                verify_result=None,
+                # 保留链路追踪根节点 ID，支持在 LangSmith 上溯源崩溃点
+                trace_id=trace_id,
+                # 记录从进入到崩溃的总时长（毫秒）：辅助判断是瞬间闪退还是超时挂起
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                # 流程中断未成功调用 LLM 吐字，首字延迟恒为 None
+                first_token_latency_ms=None,
+                # 【双重防御提取异常原因】：
+                # - 优先取 str(exc).strip() 异常描述（如 "Connection timed out"）；
+                # - 若某些异常未附带描述文本导致空串，自动短路回退为异常类名（如 "TimeoutError"），
+                #   确保下游执行器能拿到非空的故障定位信息，将本 case 标为 Failed。
+                error_message=str(exc).strip() or exc.__class__.__name__,
+            )
 
     # =========================================================================
     # 内部方法：流式链路的两段落库逻辑
