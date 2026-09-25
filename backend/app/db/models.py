@@ -4,7 +4,7 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 【模块核心职责】
 本模块基于 SQLAlchemy 2.0 现代声明式映射（Mapped/mapped_column）规范与 PostgreSQL 原生扩展，
 集中定义系统全部持久化实体与生命周期状态机，是数据库结构的【唯一真实来源】。
-按业务域分为四组，共 8 张表：
+按业务域分为五组，共 11 张表：
 
 一、文档接入域（第 1-3 期）
 1. UploadSessionStatus: 预签名直传会话状态枚举。
@@ -31,6 +31,12 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 12. EvaluationItem: 评测明细表（evaluation_items），每条 case 的输入快照、实际输出、
     各项指标与 Bad Case 归因。
 
+五、认证与权限域（第 11 期）
+13. UserStatus: 用户启用状态枚举（active / disabled）。
+14. User: 用户主表（users），存登录名、bcrypt 密码哈希与展示名。
+15. Role: RBAC 角色表（roles），持有权限标签数组（permission_tags TEXT[]）。
+16. user_roles: 用户-角色多对多关系表（user_roles），复合主键、无业务字段。
+
 【架构设计特性】
 - 向量对齐：通过 pgvector.sqlalchemy.Vector 严格对齐 settings.embedding_dim 配置维度。
 - 级联清理：采用数据库层外键 ON DELETE CASCADE 与 ORM passive_deletes=True 配合，保障父子表清理的高吞吐。
@@ -42,6 +48,11 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 - 索引显式声明：DocumentChunk 的 GIN 与 HNSW 索引写在 __table_args__ 里（含 postgresql_using / ops）。
   【必须如此】：模型侧不声明时，Alembic 自动比对看不见这两类索引，
   每次 autogenerate 都会生成 drop_index 把它们误删。
+- 权限标签重叠匹配（第 11 期）：documents.permission_tags 与用户的权限标签并集做 PostgreSQL 数组
+  `&&` 重叠运算，配合 GIN 索引实现毫秒级过滤。空数组 = 公开（兼容存量文档）；
+  admin 角色带特殊标签 "*" 表示通配。
+- 删除用户后的数据保全（第 11 期）：documents.created_by 与 conversations.user_id 均为
+  ON DELETE SET NULL —— 用户被硬删后文档与会话仍保留，供管理员审计，不会连带丢失业务数据。
 """
 
 from datetime import datetime
@@ -55,6 +66,9 @@ from sqlalchemy import (
     BigInteger,
     # 布尔列类型：第 10 期评测模型用来存"是否拒答 / 是否 Bad Case"等开关位
     Boolean,
+    # 传统列构造器：第 11 期的 user_roles 关系表用 Table() 而非 ORM 类声明，
+    # 需要 Column 显式构造列对象（关系表没有业务字段，纯关系，不必套一层 ORM 类）。
+    Column,
     # 生成列（GENERATED ALWAYS AS ... STORED）构造器：
     # 声明后 SQLAlchemy 会把它从 INSERT / UPDATE 语句中自动剔除，交给数据库维护
     Computed,
@@ -67,12 +81,15 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    # Table 构造器：第 11 期声明 user_roles 多对多关系表（不经过 ORM 类）
+    Table,
     Text,
     func,
 )
 # PostgreSQL 方言类型：支持 JSONB 高效二进制存储及原生 UUID 映射
+# ARRAY：原生数组列类型（第 11 期 roles / documents 的 permission_tags 用它）
 # TSVECTOR：全文检索向量列类型，对应 PostgreSQL 原生 tsvector
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID as PGUUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID as PGUUID
 # SQLAlchemy 2.0 现代声明式语法核心：
 # Mapped 用于 Python 侧类型注解（提供 IDE 智能提示与静态类型检查）
 # mapped_column 用于底层数据库字段定义（生成 DDL 约束与列类型）
@@ -357,6 +374,39 @@ class Document(Base):
         comment="解析/索引失败时的错误信息堆栈"
     )
 
+    # --------------------------------------------------------------------------
+    # 权限标签与归属（第 11 期新增）
+    # --------------------------------------------------------------------------
+    # 数据权限标签数组（原生 TEXT[]）：
+    # - 空数组 {} 视为「公开」，任何登录用户都能看见并检索到 ——
+    #   【为什么以空为公开】：前 10 期上传的存量文档没有标签，若把空数组当"谁都不能看"，
+    #   这次升级会让所有历史文档瞬间失联。用 server_default="{}" 把旧行一次性填成空数组，
+    #   正好对应默认公开的语义。
+    # - 非空数组与用户的有效权限标签做 PostgreSQL 数组重叠运算（&&），
+    #   任意一个元素相等即命中；admin 角色持特殊标签 "*" 通配。
+    # - default=list 是 Python 侧默认值（传函数引用而非 list()）；server_default 是 DDL 默认值，
+    #   两者都要，前者管 ORM 新建对象，后者管已有行的回填与外部 SQL 直插。
+    permission_tags: Mapped[list[str]] = mapped_column(
+        ARRAY(String()),
+        nullable=False,
+        default=list,
+        server_default="{}",
+        comment="数据权限标签数组；空数组视为公开可检索"
+    )
+
+    # 上传者（第 11 期新增）：
+    # - ondelete="SET NULL"：用户被硬删后，该字段置 NULL，但【文档本身保留】，
+    #   供管理员继续审计文档历史 —— 而不是把整份文档连同切片一起级联删掉。
+    # - nullable=True：存量文档没有上传者，且删除用户后也允许为空。
+    # - 与 permission_tags 的职责区分：本字段管「谁传的」（审计），
+    #   permission_tags 管「谁能看」（可见性），两者互不影响。
+    created_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="上传者用户 ID；用户被删后置 NULL，文档历史保留"
+    )
+
     # 记录创建时间：
     # - DateTime(timezone=True): 带有时区偏移的时间戳（PostgreSQL 的 TIMESTAMPTZ 类型），消除服务器跨时区时间错乱。
     # - func.now(): SQLAlchemy 的 SQL 函数生成器，对应数据库内置的 NOW() 或 CURRENT_TIMESTAMP。
@@ -383,6 +433,24 @@ class Document(Base):
     )
 
     # --------------------------------------------------------------------------
+    # 表级约束与索引（第 11 期新增）
+    # --------------------------------------------------------------------------
+    # permission_tags 上的 GIN 索引：为 `&&`（数组重叠）过滤提供毫秒级响应。
+    # 【为什么必须显式声明在模型里 —— 而不是只写在迁移脚本中】：
+    #   第 10 期给 DocumentChunk 补 GIN / HNSW 索引时已经踩过同一个坑：
+    #   模型侧不声明时，Alembic 的自动比对看不见这个索引，
+    #   于是【下一次】autogenerate 会把它当成"数据库里多出来的东西"生成 drop_index 误删掉。
+    #   本项目 10 个文档就有 259 个 chunk，将来过滤发生在 documents 表上，
+    #   这个索引一旦被误删，权限过滤会从毫秒退化成顺序扫描。
+    __table_args__ = (
+        Index(
+            "ix_documents_permission_tags",
+            "permission_tags",
+            postgresql_using="gin",
+        ),
+    )
+
+    # --------------------------------------------------------------------------
     # 关系映射（导航指针）
     # --------------------------------------------------------------------------
     # 一对多关系：一个 Document 实体关联其拆分出的所有 DocumentChunk 切片
@@ -402,6 +470,13 @@ class Document(Base):
         cascade="all, delete-orphan",
         passive_deletes=True
     )
+
+    # 多对一关系：文档的上传者（第 11 期新增）
+    # - 单向关系：User 侧不声明 documents 反向属性 ——
+    #   本字段只用于审计展示（谁传的），不需要从用户反查他传过的所有文档。
+    # - ⚠️【未声明 lazy，走默认惰性加载】：async 场景下直接访问 doc.creator 会抛 MissingGreenlet。
+    #   凡是要读它的地方（文档列表/详情）都必须显式 .options(selectinload(Document.creator)) 预加载。
+    creator: Mapped["User | None"] = relationship()
 
 
 # ==============================================================================
@@ -647,12 +722,27 @@ class Conversation(Base):
 
     # 会话标题：
     # - 默认缺省值为 "新对话"，后续可通过提问内容自动生成并更新总结标题。
-    # - 注：预留 user_id 字段，后续引入多租户与用户体系时可平滑扩展。
     title: Mapped[str] = mapped_column(
         String(256),
         nullable=False,
         default="新对话",
         comment="会话展示标题"
+    )
+
+    # 会话归属用户（第 11 期新增）：
+    # - 前 10 期此处只留了一行注释「预留 user_id 字段，后续引入用户体系时可平滑扩展」，
+    #   本期正式落地。会话列表与详情都要按本字段过滤，用户只能看到自己的会话。
+    # - ondelete="SET NULL"：用户被硬删后会话仍保留（供管理员审计），只是失去归属人。
+    # - index=True：【必须建索引】。会话列表是最高频的查询之一，
+    #   而查询条件恒定带 user_id = ?，没有索引就会全表扫描。
+    # - nullable=True：与 SET NULL 配套（被删用户的会话会变成无主）；
+    #   存量会话在加列时也是 NULL，它们不会出现在任何普通用户的列表里。
+    user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="会话归属用户 ID；用户被删后置 NULL，会话保留"
     )
 
     # --------------------------------------------------------------------------
@@ -686,6 +776,13 @@ class Conversation(Base):
         passive_deletes=True,
         order_by="Message.created_at",
     )
+
+    # 多对一关系：会话归属人（第 11 期新增）
+    # - 单向关系：User 侧不声明 conversations 反向属性，避免删用户时 ORM 想在内存里
+    #   维护庞大集合；会话的清理交给数据库的 ON DELETE SET NULL。
+    # - ⚠️【未声明 lazy，走默认惰性加载】：async 场景下直接访问 conv.user 会抛 MissingGreenlet。
+    #   凡是要读它的地方都必须显式 .options(selectinload(Conversation.user)) 预加载。
+    user: Mapped["User | None"] = relationship()
 
 
 class Message(Base):
@@ -1277,3 +1374,184 @@ class EvaluationItem(Base):
     # 语法（SQLAlchemy 2.0 关系映射）：relationship(...)
     #   业务说明：反向关联父级 EvaluationRun 实体，便于从单条 Case 快速反查其执行批次的整体上下文
     run: Mapped[EvaluationRun] = relationship(back_populates="items")
+
+
+# ==============================================================================
+# 5. 认证与权限域 ORM 模型定义（第 11 期）
+# ==============================================================================
+class UserStatus(str, Enum):
+    """用户启用状态枚举（第 11 期）。
+
+    【为什么用 (str, Enum) 而不是数据库原生 ENUM】：
+    与 DocumentStatus / EvaluationRunStatus 保持同一套约定 ——
+    物理列仍是 String(16)，扩状态时只改代码、不需要 ALTER TYPE 迁移。
+    """
+
+    # 正常启用：可登录、可按其权限标签检索
+    ACTIVE = "active"
+
+    # 已停用：保留账号与历史归属（其上传的文档 created_by 仍指向他），但禁止登录
+    DISABLED = "disabled"
+
+
+# 用户 - 角色 多对多关系表：
+# 【为什么用 Table 而不是再写一个 ORM 类】：
+# 本表没有任何业务字段（只有两个外键组成的复合主键），纯关系；
+# 用 Core 的 Table 让 SQLAlchemy 自动处理中间表，省掉一个空壳模型类。
+# 【为什么两边外键都是 ondelete="CASCADE"】：
+# 用户或角色被硬删时，其在关系表中的关联行【应当】一并消失 ——
+# 这与 documents.created_by 的 SET NULL 不同：关联行本身没有保留价值。
+user_roles_table = Table(
+    "user_roles",
+    Base.metadata,
+    Column(
+        "user_id",
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "role_id",
+        PGUUID(as_uuid=True),
+        ForeignKey("roles.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+class Role(Base):
+    """RBAC 角色表（roles）ORM 实体映射（第 11 期）。
+
+    【模型定位】
+    权限的载体。用户不直接持有权限，而是通过角色间接获得 ——
+    这样增删权限只需改角色配置，不必逐个修改用户。
+
+    权限模型只有一层「权限标签数组」，刻意不展开「资源-操作」矩阵（本期最小化实现）。
+    """
+
+    __tablename__ = "roles"
+
+    # 角色唯一标识：
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        comment="角色全局唯一UUID主键"
+    )
+
+    # 角色名：admin / user / hr / sales ...
+    # - unique=True: 角色名是业务标识，重名会让"按名字找角色"产生歧义。
+    # - String(64): 够放业务角色名，同时防超长输入。
+    name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        comment="角色唯一名称，如 admin / user / hr"
+    )
+
+    # 角色描述：给管理员看的说明，不影响任何逻辑判断。
+    description: Mapped[str] = mapped_column(
+        String(256),
+        nullable=False,
+        default="",
+        comment="角色用途说明"
+    )
+
+    # 权限标签数组（原生 TEXT[]）：
+    # - 用户的【有效权限】= 其所有角色的 permission_tags 求并集。
+    # - 特殊值 "*" 表示通配（admin 角色持有）：检索时识别到它就直接跳过权限 WHERE，
+    #   等价于"不加任何权限条件"，既跑得最快，也符合 admin 看全量的预期。
+    # - default=list: Python 侧默认值；server_default="{}": DDL 默认值（外部直插也不会为 NULL）。
+    permission_tags: Mapped[list[str]] = mapped_column(
+        ARRAY(String()),
+        nullable=False,
+        default=list,
+        server_default="{}",
+        comment="角色持有的权限标签数组；* 表示通配"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="角色创建时间"
+    )
+
+    # 多对多关系：一个角色可被多个用户持有。
+    # - secondary: 指定中间关系表。
+    # - back_populates="roles": 与 User.roles 双向绑定。
+    users: Mapped[list["User"]] = relationship(
+        secondary=user_roles_table,
+        back_populates="roles",
+    )
+
+
+class User(Base):
+    """用户主表（users）ORM 实体映射（第 11 期）。
+
+    【模型定位】
+    系统身份的唯一来源。承载登录凭证（username + password_hash）与展示信息，
+    并通过 roles 间接获得权限标签。
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        comment="用户全局唯一UUID主键"
+    )
+
+    # 登录名：
+    # - unique=True: 登录凭据必须唯一，否则"用这个用户名登录"会有歧义。
+    # - String(64): 限制长度，防超长输入。
+    username: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        comment="登录用户名，全局唯一"
+    )
+
+    # 密码哈希：
+    # - 【绝不能存明文】。使用 bcrypt 生成，其输出固定为 60 字符（形如 $2b$12$...）。
+    # - String(255): 预留充足余量，避免将来更换算法（如 argon2）时字符变长导致截断。
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="bcrypt 密码哈希，禁止存明文"
+    )
+
+    # 展示名：界面上显示的名字，不参与登录与鉴权。
+    display_name: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment="界面展示名称"
+    )
+
+    # 账号状态：
+    # - 物理列仍是 String(16)，默认 active（与 DocumentStatus 同一套约定）。
+    # - 停用（disabled）的用户：保留其历史归属数据，但禁止登录与访问。
+    status: Mapped[UserStatus] = mapped_column(
+        String(16),
+        nullable=False,
+        default=UserStatus.ACTIVE,
+        comment="账号状态：active 可登录 / disabled 已停用"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="用户创建时间"
+    )
+
+    # 多对多关系：一个用户可持有多个角色。
+    # ⚠️【注意：没有声明 lazy，走 SQLAlchemy 默认的惰性加载（lazy="select"）】
+    #   在 async 场景下，直接访问 user.roles 会抛 MissingGreenlet。
+    #   因此凡是要读 roles 的地方（登录、/auth/me、权限汇总），
+    #   查询时必须显式带上 .options(selectinload(User.roles)) 预加载。
+    roles: Mapped[list["Role"]] = relationship(
+        secondary=user_roles_table,
+        back_populates="users",
+    )

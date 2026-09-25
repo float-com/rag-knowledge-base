@@ -16,10 +16,15 @@
    借助 lru_cache 装饰器构建进程级配置单例（Settings），避免重复扫描磁盘 I/O，全局直接导出 settings 实例。
 """
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 模块级打印器：用于在配置加载阶段输出告警（此时全局日志系统可能尚未初始化，
+# 因此不依赖 app.core.logging.get_logger，避免形成循环导入）
+logger = logging.getLogger(__name__)
 
 # 计算并获取项目根目录绝对路径
 # __file__ 为当前文件 (backend/app/core/config.py)
@@ -245,6 +250,53 @@ class Settings(BaseSettings):
         导致在未配置 Key（实际上未成功上报）的情况下向前端下发无效的“空链接”。
         """
         return bool(self.langsmith_tracing and self.langsmith_api_key)
+
+
+    # ===== 认证与权限配置（第 11 期）=====
+    # 【为什么密钥默认留空而不是给一个默认串】：
+    #   给默认值最危险 —— 生产环境忘了改，等于用一个人人皆知的值签发令牌，
+    #   任何人都能自己伪造 admin 的 JWT。留空 + 启动告警，能把问题暴露在启动阶段。
+    #
+    # JWT 签名密钥（HMAC 的共享密钥）。生成示例：openssl rand -hex 32
+    #   ⚠️ 生产部署前务必改成足够长的随机串。为空时启动期打 ERROR 告警但不阻断
+    #   （教学场景下允许先跑起来，避免学员因忘记配这一项而完全跑不动）。
+    jwt_secret: str = ""
+    # JWT 签名算法。HS256 = HMAC-SHA256（对称密钥），单服务自签自验场景足够。
+    jwt_algorithm: str = "HS256"
+    # token 默认过期时间（分钟）。1440 分钟 = 24 小时。
+    #   【为什么不做成"永不过期"】：token 一旦泄露就是长期通行证，
+    #   JWT 无状态又无法主动吊销，只能靠 exp 到期兜底。
+    jwt_expire_minutes: int = 1440
+
+    # 首次启动的种子管理员账号：库里已有用户时【跳过】，因此可以安全地长期留在配置里。
+    #   用途：让新库第一次启动就有一个可登录的 admin，
+    #   否则会陷入"没有 admin 就无法创建用户、没有用户就无法创建 admin"的死锁。
+    default_admin_username: str = "admin"
+    default_admin_password: str = "admin"
+    default_admin_display_name: str = "管理员"
+
+    @property
+    def jwt_configured(self) -> bool:
+        """动态检测 JWT 是否已完成必要配置。
+
+        与 cos_configured / observability_enabled 同一思路：
+        把"是否真的可用"收敛成一个布尔状态，避免散落书写 `if settings.jwt_secret`。
+        """
+        return bool(self.jwt_secret)
+
+    def warn_if_jwt_unconfigured(self) -> None:
+        """启动自检：JWT 密钥缺失时打 ERROR 告警，但【不抛异常、不阻断启动】。
+
+        【设计取舍 - 为什么是告警而不是 raise ConfigurationError】：
+        本项目其它模块（COS / LangSmith）缺配置是"降级"，但 JWT 缺配置无法降级 ——
+        它会让所有登录失败。若在这里 raise，学员在还没学到"配密钥"这一步时就完全起不来。
+        因此选择"响亮地告警 + 允许带病启动"，让问题在第一次登录失败前就被看见。
+        """
+        if not self.jwt_configured:
+            logger.error(
+                "JWT_SECRET 未配置：登录签发的令牌可被任意伪造。"
+                "请在 .env 中设置 JWT_SECRET（生成示例：openssl rand -hex 32）"
+            )
 
 
 @lru_cache(maxsize=1)
