@@ -31,7 +31,8 @@ from app.api.error_handlers import register_error_handlers
 # 语法（路由模块汇聚导入）：from app.api.routes import chat, documents, health
 #   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 与 chat 模块
 #   通俗来讲：把刚写好的文档业务接待员（documents）与问答业务接待员（chat）请到总服务台前报到。
-from app.api.routes import chat, document_uploads, documents, health
+#   第 10 期增量：把评测业务接待员（evaluations）也请过来。
+from app.api.routes import chat, document_uploads, documents, evaluations, health
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -117,6 +118,16 @@ def create_app() -> FastAPI:
     #     - 自动向 Swagger UI (/docs) 注入「创建会话 / 会话详情 / SSE 流式问答」三个端点。
     #   通俗来讲：把问答接待窗口挂到总大厅的“/api”综合服务牌下，客人访问 /api/conversations 就能办业务了。
     app.include_router(chat.router, prefix="/api")
+
+    # 新增（评测路由级联挂载，第 10 期）：app.include_router(evaluations.router, prefix="/api")
+    #   特性：将 evaluations.router 动态接入主应用。
+    #   路径拼接公式：全局前缀 [/api] + 模块前缀 [/evaluations] + 接口子路径 [/datasets /runs ...]
+    #   核心收益：
+    #     - 评测批次与用例明细统一挂在 /api/evaluations 之下，便于 Nginx 反向代理统一转发；
+    #     - 自动向 Swagger UI (/docs) 注入「评测集列表 / 创建 run / run 列表·详情·删除 /
+    #       case 列表·详情 / 人工覆盖归因」8 个端点，并单独成组显示为 evaluations。
+    #   通俗来讲：把评测接待窗口挂到总大厅的“/api”综合服务牌下，前端访问 /api/evaluations 就能办业务了。
+    app.include_router(evaluations.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)
