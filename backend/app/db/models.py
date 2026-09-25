@@ -972,15 +972,22 @@ class EvaluationRun(Base):
     )
 
     # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
-    #   业务说明：后台任务已顺利执行完毕（包含判定为 Bad Case 但 RAG 流程正常走完）的 Case 累计计数器
-    #   业务联动：由 Worker 每跑完一条原子累加，前端轮询通过 (progress_completed + progress_failed) / progress_total 驱动进度条
+    #   业务说明：后台任务【已跑完】的 Case 累计计数器（进度条的分子）
+    #   计数口径：包含两类 —— ① RAG 流程正常走完的（哪怕该条被判定为 Bad Case）；
+    #            ② 执行中降级失败的。凡走完 _run_single_case 的都会 +1，
+    #            因此 progress_failed 是它的【子集】，二者不是互斥计数。
+    #   业务联动：由 Worker 每跑完一条原子累加；前端轮询直接用
+    #            progress_completed / progress_total 驱动进度条
+    #            （见 frontend 的 EvaluationListPage / EvaluationDetailPage）。
     progress_completed: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
 
     # 语法（SQLAlchemy 2.0 声明式列映射）：mapped_column(Integer, nullable=False, default=0)
     #   业务说明：单条 Case 执行期间抛出未捕获异常、调用下游大模型接口硬性超时崩溃的失败用例累计计数器
-    #   约束属性：nullable=False，default=0，用于监控任务异常率，若失败占比过高可供运维策略触发告警
+    #   计数口径：它是 progress_completed 的【子集】—— 降级失败的那条会先计入 completed，再【额外】计入本列
+    #   约束属性：nullable=False，default=0；可用于监控任务异常率（progress_failed / progress_completed），
+    #            若失败占比过高可供运维策略触发告警
     progress_failed: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
