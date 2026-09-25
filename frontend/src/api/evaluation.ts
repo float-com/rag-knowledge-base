@@ -5,6 +5,7 @@
  * - running 状态的 run 自动 5 秒轮询，对齐第 3 章文档非终态轮询风格
  */
 
+import { useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   createEvaluationRun as sdkCreateEvaluationRun,
@@ -47,6 +48,30 @@ export function useEvaluationRuns(page = 1, pageSize = 20) {
       return items.some((r) => r.status === 'running') ? 5000 : false
     },
   })
+}
+
+/**
+ * 兜底补刷：浏览器会限制【后台标签页】的定时器（Chrome 对不可见页面
+ * 把 setInterval 压到 ~1 分钟甚至冻结），长跑评测期间一旦切走标签页，
+ * refetchInterval 就等于停了，切回来看到的是停之前那一帧（仍是「执行中」）。
+ *
+ * 为什么不靠 TanStack Query 自带的 refetchOnWindowFocus：
+ * 本项目的 QueryClient 默认把 refetchOnWindowFocus 关成了 false（见 src/main.tsx），
+ * 所以这里用显式的 focus 监听补一轮，只影响评测列表页，不改变全局行为。
+ *
+ * invalidateQueries 用 ['evaluation-runs'] 前缀匹配，
+ * 因此不管当前在第几页（key 尾部带 page/pageSize）都会被一起失效。
+ */
+export function useEvaluationRunsFocusRefresh() {
+  const queryClient = useQueryClient()
+  useEffect(() => {
+    const onFocus = () => {
+      queryClient.invalidateQueries({ queryKey: evaluationRunsKey })
+    }
+    window.addEventListener('focus', onFocus)
+    // 卸载时摘掉监听，避免离开列表页后还在触发无谓请求
+    return () => window.removeEventListener('focus', onFocus)
+  }, [queryClient])
 }
 
 export function useEvaluationRun(runId: string | undefined) {

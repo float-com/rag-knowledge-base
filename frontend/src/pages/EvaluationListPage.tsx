@@ -14,6 +14,7 @@ import {
   useDeleteEvaluationRun,
   useEvaluationDatasets,
   useEvaluationRuns,
+  useEvaluationRunsFocusRefresh,
 } from '@/api/evaluation'
 import type { EvaluationRunListItem } from '@/client/types.gen'
 
@@ -32,6 +33,8 @@ export function EvaluationListPage() {
   const [page, setPage] = useState(1)
   const pageSize = 20
   const { data, isLoading } = useEvaluationRuns(page, pageSize)
+  // 浏览器会节流后台标签页的定时器，切走再切回来时补一轮，避免一直显示旧的「执行中」
+  useEvaluationRunsFocusRefresh()
   const [modalOpen, setModalOpen] = useState(false)
 
   const columns: ColumnsType<EvaluationRunListItem> = [
