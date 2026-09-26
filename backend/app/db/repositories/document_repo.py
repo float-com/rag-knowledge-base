@@ -15,10 +15,76 @@
 
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.permissions import WILDCARD_PERMISSION_TAG
 from app.db.models import Document, DocumentStatus
+
+
+def build_permission_filter(
+    permission_tags: list[str] | None,
+) -> ColumnElement[bool] | None:
+    """构造 `documents` 的权限过滤条件。
+
+    :param permission_tags: 调用方的有效权限标签。**传 None 表示"不做权限过滤"**
+                            （供内部调用、admin 视角使用）
+    :return: 可直接 `.where(...)` 的条件表达式；None 表示无需过滤
+
+    【⚠️ 本函数是全项目最容易写错的一处 —— 空数组的语义】
+    直觉写法是只写"数组重叠"：
+
+        Document.permission_tags.op("&&")(permission_tags)
+
+    但 PostgreSQL 的 `&&` 语义是"两边都必须有元素可重叠"，
+    **空数组与任何东西都不重叠，包括另一个空数组**。实测确认：
+
+        SELECT ... WHERE permission_tags && '{}'::varchar[]   -- 返回 0 行！
+
+    而本项目的约定是「**空数组 = 公开，任何登录用户都能看**」（兼容前 8 期上传的存量文档）。
+    所以必须显式补一个 OR 分支：
+
+        权限标签重叠  OR  文档标签为空（公开）
+
+    【少了那个 OR 分支会怎样】
+    - 有 hr 标签的用户：只看到 HR 文档，公开文档看不到；
+    - **无任何角色的用户：一篇都看不到** —— 存量 10 篇文档全体失联。
+    这比"少看见"严重得多，它是**静默的全面失联**。
+
+    【加了 OR 分支会不会让 GIN 索引失效？不会】
+    已实测 EXPLAIN：PostgreSQL 会把它规划成 `BitmapOr`，
+    两个分支各自走 `ix_documents_permission_tags`：
+
+        BitmapOr
+          -> Bitmap Index Scan on ix_documents_permission_tags  (permission_tags && '{hr}')
+          -> Bitmap Index Scan on ix_documents_permission_tags  (permission_tags = '{}')
+
+    【为什么 admin 要短路】
+    持通配标签 `"*"` 时直接 return None（不加任何条件）：
+    既省掉一次条件计算，也符合"admin 看全量、且跑得最快"的预期。
+    """
+    if permission_tags is None:
+        # 内部调用：不做权限过滤（例如评测跑批、后台任务）
+        return None
+    if WILDCARD_PERMISSION_TAG in permission_tags:
+        # admin 视角：等价于"不加权限条件"，直接返回 None 而不是空条件
+        return None
+    return or_(
+        Document.permission_tags.op("&&")(permission_tags),
+        # 【⚠️ 这里必须传【空列表】而不是字符串 "{}"】
+        # 直觉写法是 `Document.permission_tags == "{}"`（照抄 SQL 里的数组字面量），
+        # 但那样 SQLAlchemy 会按【字符串】绑定参数，生成：
+        #     documents.permission_tags = $1::VARCHAR
+        # 而左边是 `varchar[]`，PostgreSQL 直接报：
+        #     operator does not exist: character varying[] = character varying
+        # （本项目实测踩过这个 500。）
+        #
+        # 传 [] 时 SQLAlchemy 会沿用左侧的数组类型来绑定参数，生成的 SQL 是：
+        #     documents.permission_tags = $1::VARCHAR[]
+        # 类型对得上，PostgreSQL 正确识别为"空数组比较"。
+        Document.permission_tags == [],
+    )
 
 
 class DocumentRepository:
@@ -29,20 +95,32 @@ class DocumentRepository:
         #   属性说明 (self.session: AsyncSession)：持有当前请求生命周期内的异步数据库会话引用（由依赖注入容器提供）
         self.session = session
 
-    async def get_by_id(self, document_id: UUID) -> Document | None:
+    async def get_by_id(
+        self, document_id: UUID, *, permission_tags: list[str] | None = None
+    ) -> Document | None:
         """根据文档全局唯一主键 ID 检索单条文档。
 
         【参数说明】：
         - document_id (UUID): 文档的 UUID 主键标识
+        - permission_tags: 【第 11 期新增】调用方有效权限标签。传 None 表示不做权限过滤；
+                            传值则要求该文档对调用方可见（公开或标签重叠）
 
         【返回值】：
-        - Document | None: 命中的文档实体模型；若不存在则返回 None
+        - Document | None: 命中的文档实体模型；若不存在 **或调用方无权查看** 则返回 None
+
+        【为什么"无权"也返回 None 而不是抛 403】
+        与 conversation_repo 同一考量：若"存在但无权"报 403、"不存在"返回 None，
+        调用方就能靠状态码差异探测出某个 document_id 是否真实存在。统一 None 更安全。
         """
-        # 语法（SQLAlchemy 异步会话主键查询）：await AsyncSession.get(entity, ident)
-        #   参数1 (entity: Type[T])：待查询的目标 ORM 映射模型类（Document）
-        #   参数2 (ident: Any)：待检索的主键值（document_id: UUID）
-        #   方法特性：优先命中 Session 一级缓存（Identity Map），缓存未命中时生成精准主键 SQL 查询
-        return await self.session.get(Document, document_id)
+        if permission_tags is None:
+            # 内部调用 / admin：直接用主键查询（能命中 Identity Map，最省）
+            return await self.session.get(Document, document_id)
+
+        where = build_permission_filter(permission_tags)
+        stmt = select(Document).where(Document.id == document_id)
+        if where is not None:
+            stmt = stmt.where(where)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_by_hash(self, file_hash: str) -> Document | None:
         """根据文件内容 SHA256/MD5 指纹哈希检索文档（用于上传重复秒传校验）。
@@ -120,6 +198,7 @@ class DocumentRepository:
         page_size: int,
         *,
         status: DocumentStatus | None = None,
+        permission_tags: list[str] | None = None,
     ) -> tuple[list[Document], int]:
         """分页获取文档列表及满足条件的总记录数。
 
@@ -127,9 +206,14 @@ class DocumentRepository:
         - page (int): 当前请求的目标页码（从 1 开始计）
         - page_size (int): 每页拉取的文档条数限制
         - status (DocumentStatus | None): 可选的状态枚举过滤标签
+        - permission_tags: 【第 11 期新增】调用方有效权限标签。传 None 表示不做权限过滤
 
         【返回值】：
         - tuple[list[Document], int]: (当前页文档实体列表, 符合条件的总数据条数)
+
+        【⚠️ 权限条件必须同时作用于 items_stmt 与 count_stmt】
+        与 conversation_repo.list_page 同一个道理：只过滤数据不过滤总数，
+        会让前端算出的总页数比实际可翻的页数多，翻到后面就是空列表。
         """
         # 语法（Python 原生算术运算）：根据页码与每页大小推算数据库游标偏移量（对标 MySQL/PG OFFSET 语法）
         offset = (page - 1) * page_size
@@ -155,6 +239,12 @@ class DocumentRepository:
         if status is not None:
             items_stmt = items_stmt.where(Document.status == status)
             count_stmt = count_stmt.where(Document.status == status)
+
+        # 【第 11 期】权限过滤：同样两个语句都要加（见 docstring 的提醒）
+        permission_where = build_permission_filter(permission_tags)
+        if permission_where is not None:
+            items_stmt = items_stmt.where(permission_where)
+            count_stmt = count_stmt.where(permission_where)
 
         # 语法（SQLAlchemy 标量多行异步提取）：
         #   .scalars()：将执行结果扁平化提取为 ORM 映射实体流（剥离 Tuple 包装）

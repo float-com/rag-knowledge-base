@@ -15,22 +15,25 @@
 避免各处各算一遍导致口径不一致（例如某处算成了"角色并集"、另一处只取了第一个角色）。
 """
 
+from app.core.permissions import ADMIN_ROLE_NAME, WILDCARD_PERMISSION_TAG
 from app.db.models import User
 
 # =============================================================================
 # 常量定义
 # =============================================================================
-
-# 通配权限标签：含义是"无视权限过滤"，admin 角色默认持有。
-# 【为什么要引入它】admin 视角等价于"不加任何权限条件"——
-# 与其给 admin 逐个列出所有标签（还得随新标签同步维护），
-# 不如用一个特殊值表示"全部"，检索时识别到它就【直接跳过权限 WHERE 拼接】。
-WILDCARD_PERMISSION_TAG = "*"
-
-# 内置管理员角色名。
-# 【为什么用名字而不是 id 判断】：id 是运行时生成的 uuid，代码里写不死；
-# 而 admin 是内置角色的业务标识，数据库上有 UNIQUE 约束保证唯一。
-ADMIN_ROLE_NAME = "admin"
+# 【第 11 期 · 常量已上移到 app/core/permissions.py，这里只做转发导入】
+# 原因：`document_repo` / `chunk_repo`（db 层）拼检索 SQL 时也要判断"是否持通配标签"，
+# 若常量定义在本模块，db 层就得 import services 层 —— **依赖方向反了**。
+# 因此把常量放到最底层的 core，各层都能 import 且不产生反向依赖。
+#
+# 为了不破坏既有调用方的 import 路径，这里仍然把两个常量转发出来
+# （`from app.services.permission_service import WILDCARD_PERMISSION_TAG` 依然可用）。
+__all__ = [
+    "ADMIN_ROLE_NAME",
+    "WILDCARD_PERMISSION_TAG",
+    "compute_user_permission_tags",
+    "is_admin",
+]
 
 
 def compute_user_permission_tags(user: User) -> list[str]:

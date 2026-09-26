@@ -27,6 +27,7 @@
 """
 
 import hashlib
+from collections.abc import Sequence
 from pathlib import PurePath
 from uuid import UUID
 
@@ -162,6 +163,38 @@ _DELETABLE_STATUSES: frozenset[DocumentStatus] = frozenset(
 logger = get_logger(__name__)
 
 
+def _normalize_tags(tags: Sequence[str]) -> list[str]:
+    """标准化权限标签：去空白、丢弃空串、去重，并保持稳定顺序（第 11 期新增）。
+
+    【与 RoleService / UserService 里的同名函数是什么关系】
+    三处逻辑**完全相同**（去空白 / 去空串 / 去重 / 保序），但刻意各留一份副本。
+    原因是它们分属三个互不依赖的模块，抽公共函数反而要新建一个工具模块、
+    并让三个 service 都依赖它 —— 对一个 8 行的纯函数来说不划算。
+    真正需要统一的是**行为**（而不是代码位置），因此在三处都写了同样的说明。
+
+    【为什么必须做这一步】
+    权限标签最终用于 PostgreSQL 的数组重叠运算（`&&`）。
+    若用户输入的是 `"hr, "`（带尾随空格）或 `" hr"`（带前导空格），
+    存进库里就是一个"看起来像 hr 但实际不相等"的字符串，检索时 `&&` 永远不命中 ——
+    表现为"权限明明配了却不生效"，极难排查。
+
+    【为什么用 seen 集合 + 结果列表，而不是 sorted(set(...))】
+    要同时满足"去重"与"保持用户输入顺序"：
+    - 纯 set 会丢顺序；
+    - sorted 会改变顺序（用户按 [sales, hr] 输入，回显却变成 [hr, sales]，容易以为没保存成功）。
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in tags:
+        t = tag.strip()
+        # 跳过空串（前端"回车新增标签"的操作很容易留下空项）
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        result.append(t)
+    return result
+
+
 # =============================================================================
 # 文档领域服务主类
 # =============================================================================
@@ -210,6 +243,9 @@ class DocumentService:
         self,
         file: UploadFile,
         background_tasks: BackgroundTasks,
+        *,
+        created_by: UUID | None = None,
+        permission_tags: Sequence[str] | None = None,
     ) -> Document:
         """处理文档上传核心用例。
 
@@ -220,6 +256,13 @@ class DocumentService:
         4. 对象上云：写入腾讯云 COS 存储桶并获取 Object Key；
         5. 元数据持久化：生成主表 Document 记录并提交事务；
         6. 异步任务编排：将 document_id 投递至后台任务队列，解耦繁重的 AI 解析切分流水线。
+
+        【第 11 期新增的两个参数】：
+        - `created_by`：上传者 user_id。只做**审计**用途（"这份文档是谁传的"），
+          与"谁能看"无关；用户被硬删后该字段会置 NULL（外键 ON DELETE SET NULL）。
+        - `permission_tags`：文档的可见性标签。**空 = 公开**（任何登录用户都能看），
+          这是为了兼容前 8 期上传的存量文档 —— 它们没有标签，
+          若把空当作"谁都看不到"，这些文档会集体失联。
         """
         # ---------------------------------------------------------------------
         # 阶段 1：格式安检（MIME 与后缀校验）
@@ -305,6 +348,11 @@ class DocumentService:
             cos_object_key=object_key,
             cos_region=self.file_service.region,
             status=DocumentStatus.UPLOADING,
+            # 【第 11 期】权限标签：经 _normalize_tags 清洗（去空白 / 去空串 / 去重 / 保序）。
+            #   不传时给 [] —— 即"公开"，与数据库列的 server_default='{}' 语义一致。
+            permission_tags=_normalize_tags(permission_tags or []),
+            # 【第 11 期】上传者（审计用）：用户被硬删后由数据库置 NULL，文档本身保留
+            created_by=created_by,
         )
 
         # 语法（仓储层入库挂载）：await self.repo.add(document)
@@ -341,7 +389,9 @@ class DocumentService:
     # =========================================================================
     # 单文档详情检索接口
     # =========================================================================
-    async def get(self, document_id: UUID) -> Document:
+    async def get(
+        self, document_id: UUID, *, permission_tags: list[str] | None = None
+    ) -> Document:
         """根据文档全局唯一标识符（UUID）查询单条文档详情。
 
         【业务判定规则】：
@@ -351,18 +401,21 @@ class DocumentService:
 
         【参数说明】：
         - document_id (UUID): 目标文档的主键 UUID 标识符
+        - permission_tags: 【第 11 期新增】调用方有效权限标签（None = 不做权限过滤）。
+          传值则只有"公开文档或标签重叠"才取得到 —— 无权时同样抛 404，
+          **不让调用方从状态码差异中探测出文档是否存在**。
 
         【异常说明】：
-        - NotFoundError: 当数据库未查到匹配文档时触发
+        - NotFoundError: 当数据库未查到匹配文档（或调用方无权查看）时触发
         """
-        # 语法（异步主键精确查找）：await self.repo.get_by_id(document_id)
+        # 语法（异步主键精确查找）：await self.repo.get_by_id(document_id, permission_tags=...)
         #   特性：调用仓储层的非阻塞主键检索，底层执行对应的 SQL WHERE id = :document_id 语句
-        #   通俗来讲：拿着文档的身份证号（UUID）去数据库里查这一行记录。
-        doc = await self.repo.get_by_id(document_id)
+        #   通俗来讲：拿着文档的身份证号（UUID）去数据库里查这一行记录，顺便核对"你有没有权限看"。
+        doc = await self.repo.get_by_id(document_id, permission_tags=permission_tags)
 
         # 语法（空值存在性拦截）：if doc is None
         #   特性：针对空结果主动触发领域异常，配合全局异常处理器返回标准 404 响应
-        #   通俗来讲：如果数据库翻了个遍都没找到，直接掀桌子报错“文档不存在”，告诉前端这是 404 错误。
+        #   通俗来讲：如果数据库翻了个遍都没找到（或者无权看），直接掀桌子报错“文档不存在”。
         if doc is None:
             raise NotFoundError("文档不存在")
 
@@ -380,27 +433,33 @@ class DocumentService:
         page_size: int,
         *,
         status: DocumentStatus | None = None,
+        permission_tags: list[str] | None = None,
     ) -> tuple[list[Document], int]:
         """按分页参数和状态过滤条件批量查询文档列表。
 
         【核心机制】：
         - 支持基于页码（page）与每页容量（page_size）的标准物理分页（OFFSET / LIMIT）；
         - 支持按文档生命周期状态（status，如 READY/FAILED/UPLOADING）进行可选过滤；
+        - 支持按调用方权限过滤（第 11 期新增）；
         - 返回标准二元组结构，分别提供“当前页记录切片”与“符合条件的记录总数”，便于前端分页控件渲染。
 
         【参数说明】：
         - page (int): 当前请求的页码序号（通常从 1 开始计）
         - page_size (int): 每页展示的最大条目数量限制
-        - * (语法强制分隔符): 强制要求其后的 status 必须作为关键字参数传递，避免位置传参混淆
+        - * (语法强制分隔符): 强制要求其后的 status / permission_tags 必须作为关键字参数传递，避免位置传参混淆
         - status (DocumentStatus | None): 可选的状态过滤枚举，为 None 时表示不限制状态全量查询
+        - permission_tags: 【第 11 期新增】调用方有效权限标签（None = 不做权限过滤）
 
         【返回值说明】：
         - tuple[list[Document], int]: 包含 (文档实体列表, 匹配记录总行数) 的二元组
         """
         # 语法（仓储层分页代理）：await self.repo.list_paginated(...)
         #   特性：将物理分页偏移量与过滤条件统一下推至仓储层与底层 SQL 引擎执行
-        #   通俗来讲：指挥仓储层账房先生去翻账本，把第几页、每页几条、想要什么状态的文档捞出来，连同总条数一起打包带回。
-        return await self.repo.list_paginated(page, page_size, status=status)
+        #   通俗来讲：指挥仓储层账房先生去翻账本，把第几页、每页几条、想要什么状态、
+        #             以及"你有权看哪些"一起交给 SQL 引擎，连同总条数打包带回。
+        return await self.repo.list_paginated(
+            page, page_size, status=status, permission_tags=permission_tags
+        )
 
     # =========================================================================
     # 文档删除操作接口（DB 优先 + COS 容错策略）
@@ -516,18 +575,32 @@ class DocumentService:
         document_id: UUID,
         page: int,
         page_size: int,
+        *,
+        permission_tags: list[str] | None = None,
     ) -> tuple[list[DocumentChunk], int, ChunkStats | None]:
         """分页获取指定文档的所有文本切块明细及切块统计信息。
 
         【核心机制】：
-        - 先调用 self.get 验证父文档是否存在，防御空文档与“文档不存在”两类边界混淆；
-        - 并行下推两个仓储操作：物理分页查询指定切片列表、聚合统计总切块数与平均字符数；
+        - 先调用 self.get 验证父文档是否存在 **且调用方是否有权查看**；
+        - 顺序下推两个仓储操作：物理分页查询指定切片列表、聚合统计总切块数与平均字符数；
         - 返回 (切片列表, 总数, 汇总统计指标)，供前端全景展示切片质量。
+
+        【参数说明】：
+        - permission_tags: 【第 11 期新增】调用方有效权限标签（None = 不做权限过滤）。
+
+        【⚠️ 为什么权限校验放在"父文档"上，而不是给每个 chunk 也存标签】
+        chunk 量级是 document 的几十倍（实测 10 篇文档 = 259 个 chunk）。
+        若让 chunk 自己存权限标签：① 数据冗余、② 改一次文档权限要批量 UPDATE 上千行、
+        ③ 极易出现"文档权限改了但 chunk 没跟着改"的不一致。
+        因此本项目让 chunk **继承父文档的权限** —— 先校验父文档能否看，
+        再看得到的前提下才去列它的切片。
         """
-        # 语法（先行存在性守卫）：await self.get(document_id)
-        #   特性：借助 get 方法自带的 NotFoundError 校验机制，防止用户拿不存在的 ID 查询产生误导性的空列表
-        #   通俗来讲：先查这个主文档到底存不存在，避免把“文档根本没有”和“文档有但还没切块”这两种情况搞混了。
-        await self.get(document_id)
+        # 语法（先行存在性守卫）：await self.get(document_id, permission_tags=...)
+        #   特性：借助 get 方法自带的 NotFoundError 校验机制（同时含权限校验），
+        #         防止用户拿不存在的 ID 或无权查看的 ID 查询产生误导性的空列表
+        #   通俗来讲：先查这个主文档到底存不存在、你有没有权看，
+        #             避免把"文档根本没有 / 无权看"和"文档有但还没切块"这两种情况搞混。
+        await self.get(document_id, permission_tags=permission_tags)
 
         # 语法（仓储层分页查询）：await self.chunk_repo.list_paginated_by_document(...)
         #   特性：按所属文档的外键 ID 进行针对性分页抽取
@@ -546,13 +619,27 @@ class DocumentService:
         self,
         document_id: UUID,
         chunk_id: UUID,
+        *,
+        permission_tags: list[str] | None = None,
     ) -> DocumentChunk:
         """根据文档 ID 与切片 ID 获取唯一的切块详情。
 
-        【双主键防御机制】：
-        - 查询时同时要求匹配 document_id 与 chunk_id，防范跨文档越权越界读取；
-        - 未命中时抛出 NotFoundError。
+        【参数说明】：
+        - permission_tags: 【第 11 期新增】调用方有效权限标签（None = 不做权限过滤）。
+
+        【双重防御机制（第 11 期升级为"三重"）】：
+        1. **父文档权限校验**：先确认调用方有权查看该文档（无权则抛 404）；
+        2. **父文档归属校验**：以下组合约束确保所查切片确实属于传入的目标文档；
+        3. **切片存在性**：未命中时抛出 NotFoundError。
+
+        【为什么先校验父文档、再查切片】
+        若直接按 (document_id, chunk_id) 查切片，那么"文档无权看但切片恰好存在"时
+        仍会把切片内容返回出去 —— 越权就在这里发生。
+        先过父文档这一关，等于给所有 chunk 读取加了一道统一的闸门。
         """
+        # 语法（父文档权限 + 存在性守卫）：只在通过后才继续往下查
+        await self.get(document_id, permission_tags=permission_tags)
+
         # 语法（组合唯一校验查询）：await self.chunk_repo.get_for_document(document_id, chunk_id)
         #   特性：双重约束下推，确保所查切片确实属于传入的目标文档
         #   通俗来讲：拿着文档 ID 和切片 ID 两把钥匙去开锁，必须两个都对上才把切片内容拿出来。
@@ -564,3 +651,43 @@ class DocumentService:
         if chunk is None:
             raise NotFoundError("Chunk 不存在")
         return chunk
+
+    # =========================================================================
+    # 修改文档可见性标签（第 11 期新增，仅 admin 调用）
+    # =========================================================================
+    async def update_permission_tags(
+        self,
+        document_id: UUID,
+        tags: Sequence[str],
+    ) -> Document:
+        """修改文档的可见性标签。
+
+        :param document_id: 目标文档主键
+        :param tags: 新的标签列表（会经 _normalize_tags 清洗）
+        :return: 更新后的 Document 实体
+
+        【为什么这个方法【不带】permission_tags 过滤参数】
+        它是写操作，且调用方（路由层）已要求 `CurrentAdmin`。
+        管理员改标签时本来就看得到全部文档，再加一层"能不能看"的过滤没有意义 ——
+        反而会让"管理员的标签与文档不符时会改不动"这种怪事发生。
+
+        传空列表 = 把文档改回**公开**（任何人可见）。这是合法且有意义的操作，
+        例如"这份制度公开了，撤掉 hr 限制"。
+
+        【为什么 commit 之后必须 refresh —— 第 7 章那个 500 的同款注意点】
+        `updated_at` 列带 `onupdate=func.now()`，UPDATE 时它被写进 SET 子句，
+        于是 `commit()` 会把它标记为**过期**。若直接返回实体让路由层做
+        `DocumentRead.model_validate(doc)`，读 `updated_at` 会触发异步重载并抛
+        `MissingGreenlet`（在第 7 章的 update_user 上真实踩过一次）。
+        因此这里显式 refresh 一次，代价是一条主键查询。
+        """
+        doc = await self.repo.get_by_id(document_id)
+        if doc is None:
+            raise NotFoundError("文档不存在")
+
+        doc.permission_tags = _normalize_tags(tags)
+        # 事务边界由 Service 掌握：仓储只 flush，这里统一提交
+        await self.session.commit()
+        # 提交后重新加载，保证返回对象所有字段都处于"已加载"状态、可直接序列化
+        await self.session.refresh(doc)
+        return doc

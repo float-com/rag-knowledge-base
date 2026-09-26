@@ -104,6 +104,17 @@ class DocumentRead(BaseModel):
     #   通俗来讲：只有在文档处理失败时才记录报错原因，平时正常就留空。
     error_message: str | None = None
 
+    # 【第 11 期新增】数据权限标签：
+    # - 空数组视为"公开"（任何登录用户都可见）；
+    # - 非空数组与用户的有效权限标签做数组重叠匹配（admin 持 "*" 通配）。
+    # 通俗来讲：这份文档贴了哪些"门禁标签"，没标签就是谁都能看。
+    permission_tags: list[str] = Field(default_factory=list)
+
+    # 【第 11 期新增】上传者 user_id：
+    # - 用户被硬删后置 None（外键 ON DELETE SET NULL），文档本身保留供审计；
+    # - 它管的是"谁传的"（审计），与 permission_tags 管的"谁能看"（可见性）是两件事。
+    created_by: UUID | None = None
+
     # 语法（时间戳感知类型）：created_at / updated_at: datetime
     #   特性：ISO 8601 标准时间戳，分别记录创建时刻与最后修改状态时刻
     #   通俗来讲：文档被创建和被更新的精确时间戳。
@@ -369,3 +380,18 @@ class DocumentChunkDetail(BaseModel):
             chunk_hash=chunk.chunk_hash,
             created_at=chunk.created_at,
         )
+
+
+# =============================================================================
+# 6. 修改文档可见性标签请求模型（第 11 期新增）
+# =============================================================================
+class DocumentPermissionTagsUpdate(BaseModel):
+    """admin 修改文档可见性标签的请求体（仅管理员可调用）。"""
+
+    # 语法（可变默认值）：Field(default_factory=list)
+    #   特性：直接写 `= []` 会让所有实例共享同一个列表对象（Pydantic 经典陷阱），
+    #         default_factory 保证每个实例拿到独立的新列表。
+    # 【为什么默认是空列表而不是必填】：
+    #   传空列表 = 把文档改回"公开"（撤掉所有门禁标签），这是合法且有意义的操作，
+    #   例如"这份制度可以公开了"。因此空列表不能被当成"没传"而拒绝。
+    permission_tags: list[str] = Field(default_factory=list)

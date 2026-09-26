@@ -26,7 +26,7 @@ from app.db.models import Role, User, UserStatus
 from app.db.repositories.role_repo import RoleRepository
 from app.db.repositories.user_repo import UserRepository
 from app.db.session import AsyncSessionLocal
-from app.services.permission_service import WILDCARD_PERMISSION_TAG
+from app.core.permissions import WILDCARD_PERMISSION_TAG
 
 logger = get_logger(__name__)
 

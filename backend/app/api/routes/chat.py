@@ -28,7 +28,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
-from app.api.deps import DbSession
+from app.api.deps import CurrentUser, DbSession
 from app.api.schemas.chat import (
     ChatRequest,
     ConversationCreate,
@@ -61,6 +61,7 @@ router = APIRouter(prefix="/conversations", tags=["chat"])
     operation_id="createConversation",
 )
 async def create_conversation(
+    user: CurrentUser,
     payload: ConversationCreate,
     session: DbSession,
 ) -> ConversationRead:
@@ -70,11 +71,15 @@ async def create_conversation(
     用户点击「新建对话」时，前端先建会话拿到 conversation_id，
     后续该会话下的所有消息与流式问答都挂在这个 id 上。
 
+    【第 11 期 · 为什么必须传 user_id】：
+    会话是有归属的。若建会话时不记录归属人，这条会话就成了"无主会话"——
+    它在任何用户的列表里都看不到（列表按 user_id 过滤），等于凭空产生垃圾数据。
+
     【协议转换】：
     服务层返回 ORM 实体，这里通过属性映射（from_attributes）转换为脱敏的响应模型。
     """
     service = ChatService(session)
-    conversation = await service.create_conversation(title=payload.title)
+    conversation = await service.create_conversation(user.id, title=payload.title)
     return ConversationRead.model_validate(conversation)
 
 
@@ -88,6 +93,7 @@ async def create_conversation(
 )
 async def get_conversation(
     conversation_id: UUID,
+    user: CurrentUser,
     session: DbSession,
 ) -> ConversationDetail:
     """返回会话主体与全部历史消息（含引用）。
@@ -108,7 +114,7 @@ async def get_conversation(
     否则异步环境下会触发懒加载并抛出 MissingGreenlet。
     """
     service = ChatService(session)
-    conversation = await service.get_conversation(conversation_id)
+    conversation = await service.get_conversation(conversation_id, user_id=user.id)
 
     repo = ConversationRepository(session)
     messages = await repo.list_messages(conversation_id)
@@ -132,6 +138,7 @@ async def get_conversation(
 )
 async def stream_chat(
     conversation_id: UUID,
+    user: CurrentUser,
     payload: ChatRequest,
     session: DbSession,
 ) -> AsyncIterable[ServerSentEvent]:
@@ -157,7 +164,9 @@ async def stream_chat(
     避免 SSE 长连接长期占用请求级连接（详见该方法的双会话策略说明）。
     """
     service = ChatService(session)
-    async for sse_event in service.stream_answer(conversation_id, payload.question):
+    async for sse_event in service.stream_answer(
+        conversation_id, payload.question, current_user=user
+    ):
         # 服务层产出 {event, data} 字典：
         # - event: 事件名，前端按它分派（message_start / citations / token / message_end / error）
         # - data : 原始字典，交给框架统一 JSON 编码
@@ -178,6 +187,7 @@ async def stream_chat(
     summary="按更新时间倒序分页列出所有会话",
 )
 async def list_conversations(
+    user: CurrentUser,
     session: DbSession,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -194,7 +204,9 @@ async def list_conversations(
     而且 message_count 不在 Conversation 实体上，必须显式赋值。
     """
     service = ChatService(session)
-    items, total = await service.list_conversations(page=page, page_size=page_size)
+    items, total = await service.list_conversations(
+        page=page, page_size=page_size, user_id=user.id
+    )
     return ConversationPage(
         items=[
             ConversationListItem(
@@ -225,6 +237,7 @@ async def list_conversations(
 )
 async def delete_conversation(
     conversation_id: UUID,
+    user: CurrentUser,
     session: DbSession,
 ) -> Response:
     """删除会话及其消息与引用（由数据库外键级联清理）。
@@ -238,6 +251,6 @@ async def delete_conversation(
     因此本函数不需要 if 判断 —— 异常契约统一在服务层收敛。
     """
     service = ChatService(session)
-    await service.delete_conversation(conversation_id)
+    await service.delete_conversation(conversation_id, user_id=user.id)
     # 204 要求空响应体，显式返回一个空 Response
     return Response(status_code=204)

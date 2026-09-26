@@ -48,13 +48,15 @@ from app.core.logging import get_logger
 # 【第 9 期】可观测性工具：本章只落地 import 与类上的装饰器，
 # 真正"取号 + 拼链接 + 下发落库"在第 8 章接入 —— 放在这里是为了让 import 与用法同处一处。
 from app.core.observability import build_trace_url, get_current_trace_id
-from app.db.models import AnswerCitation, Conversation, Message
+from app.db.models import AnswerCitation, Conversation, Message, User
 from app.db.repositories.citation_repo import AnswerCitationRepository
 from app.db.repositories.conversation_repo import ConversationRepository
 from app.db.session import AsyncSessionLocal
 from app.llm.answer_verifier import VerifyResult, get_answer_verifier
 from app.llm.prompts import REFUSAL_ANSWER
 from app.retrieval.vector_retriever import RetrievedChunk
+from app.core.permissions import WILDCARD_PERMISSION_TAG
+from app.services.permission_service import compute_user_permission_tags
 from app.workflows.graph import get_rag_graph
 from app.workflows.nodes import load_context, stream_generate
 from app.workflows.rag_state import RAGState
@@ -297,8 +299,12 @@ class ChatService:
     # 非流式接口：会话基础 CRUD
     # =========================================================================
 
-    async def create_conversation(self, title: str = "新对话") -> Conversation:
-        """创建一个新会话。
+    async def create_conversation(
+        self, user_id: UUID, title: str = "新对话"
+    ) -> Conversation:
+        """创建一个新会话，并把它归属于指定用户。
+
+        :param user_id: 会话归属人（第 11 期新增）。**必传**，没有归属的会话谁都不该看到。
 
         【事务边界】：
         仓储层只负责 add + flush，提交与刷新由本层控制。
@@ -307,7 +313,7 @@ class ChatService:
         否则序列化响应时这两个字段为 None。
         """
         repo = ConversationRepository(self.session)
-        conversation = await repo.create(title)
+        conversation = await repo.create(title, user_id=user_id)
         # 提交事务：仓储层不主动 commit，由服务层统一控制事务边界
         await self.session.commit()
         # 刷新实体：回填数据库生成的时间戳等字段，避免响应里出现 None
@@ -318,8 +324,12 @@ class ChatService:
         self,
         page: int,
         page_size: int,
+        *,
+        user_id: UUID | None = None,
     ) -> tuple[list[tuple[Conversation, int]], int]:
         """分页拉取会话列表，每项带上消息条数。
+
+        :param user_id: 归属过滤（第 11 期新增）。传 None 表示不限制（admin 视角）
 
         【为什么返回值是元组列表而不是"会话列表 + 另一个计数表"】：
         消息数是每个会话的附属属性，绑在同一个元组里能杜绝"两个列表顺序不一致"的隐患；
@@ -328,47 +338,65 @@ class ChatService:
         【事务边界】：纯读操作，不需要 commit。
         """
         repo = ConversationRepository(self.session)
-        return await repo.list_page(page=page, page_size=page_size)
+        return await repo.list_page(page=page, page_size=page_size, user_id=user_id)
 
-    async def delete_conversation(self, conversation_id: UUID) -> None:
+    async def delete_conversation(
+        self, conversation_id: UUID, *, user_id: UUID | None = None
+    ) -> None:
         """删除会话（及其消息与引用，由外键级联清理）。
+
+        :param user_id: 归属过滤（第 11 期新增）。传值则只能删自己的会话
 
         【为什么不存在时要抛 404】：
         删除是幂等语义上"删了就是删了"，但接口契约上必须区分
         "删掉了一个真实存在的会话"与"你给了一个不存在的 id" ——
         后者说明前端状态与后端不一致，显式报错比静默成功更利于排查。
 
+        【⚠️ 注意"别人的会话"与"不存在的会话"返回同一个 404】
+        仓储层把"不属于该用户"也当作查不到（返回 False），
+        因此本方法对这两种情况给出的是同一条错误 —— 这是刻意的：
+        若"别人的会话"报 403、不存在的报 404，攻击者就能靠状态码差异
+        探测出某个 conversation_id 是否真实存在。
+
         【事务边界】：仓储层只 flush，由本层 commit 落地。
         """
         repo = ConversationRepository(self.session)
-        deleted = await repo.delete(conversation_id)
+        deleted = await repo.delete(conversation_id, user_id=user_id)
         if not deleted:
             raise NotFoundError("会话不存在")
         await self.session.commit()
 
-    async def get_conversation(self, conversation_id: UUID) -> Conversation:
-        """按主键查询会话，不存在时抛出 404 业务异常。
+    async def get_conversation(
+        self, conversation_id: UUID, *, user_id: UUID | None = None
+    ) -> Conversation:
+        """按主键查询会话，不存在（或不属于该用户）时抛出 404 业务异常。
+
+        :param user_id: 归属过滤（第 11 期新增）。传值则只能取自己的会话
 
         【异常契约】：
         统一把「查不到」翻译成 NotFoundError，由全局异常处理器转换为标准 404 响应，
         避免各调用方各自写 if None 判断与状态码映射。
         """
         repo = ConversationRepository(self.session)
-        conversation = await repo.get(conversation_id)
+        conversation = await repo.get(conversation_id, user_id=user_id)
         if conversation is None:
             raise NotFoundError("会话不存在")
         return conversation
 
-    async def list_messages(self, conversation_id: UUID) -> list[Message]:
+    async def list_messages(
+        self, conversation_id: UUID, *, user_id: UUID | None = None
+    ) -> list[Message]:
         """拉取指定会话的全部历史消息（按时间正序）。
+
+        :param user_id: 归属过滤（第 11 期新增），透传给会话存在性校验
 
         【为什么先校验会话再查消息】：
         先执行一次会话存在性校验，是为了让「会话不存在（404）」与
         「会话存在但还没有任何消息（200 + 空列表）」两种情况能在 API 层被明确区分。
         若直接查消息表，两种情况的返回都是空列表，调用方无法判断到底是哪一种。
         """
-        # 1. 会话存在性校验：不存在会在此处直接抛 404，不会继续向下查消息
-        await self.get_conversation(conversation_id)
+        # 1. 会话存在性校验：不存在或不属于该用户会在此处直接抛 404，不会继续向下查消息
+        await self.get_conversation(conversation_id, user_id=user_id)
 
         # 2. 复用 self.session 再实例化一次仓储（仓储是无状态的，仅持有会话引用）
         repo = ConversationRepository(self.session)
@@ -386,7 +414,11 @@ class ChatService:
     #   不装饰的话下面所有子 span 会变成互不相连的孤儿，看不到"一次问答"这个整体。
     @traceable(name="ChatService.stream_answer", run_type="chain")
     async def stream_answer(
-        self, conversation_id: UUID, question: str
+        self,
+        conversation_id: UUID,
+        question: str,
+        *,
+        current_user: User,
     ) -> AsyncIterator[dict]:
         """**这是本模块最核心的一段**：流式问答主链路。
 
@@ -422,11 +454,22 @@ class ChatService:
 
         :param conversation_id: 目标会话 ID（必须已存在）
         :param question: 用户本轮提问原文
+        :param current_user: 【第 11 期新增】当前登录用户。用它做两件事：
+                             ① 会话归属校验（只能问自己的会话）；
+                             ② 算出有效权限标签注入 RAGState，供检索 SQL 做权限过滤。
         :return: 逐条 SSE 事件字典（含 event 与 data 两个键）的异步生成器
         """
-        # 1. 会话存在性校验：复用请求级 session。
-        #    此步骤在流式响应开始之前完成，若会话不存在会直接抛 404，由路由层正常返回 HTTP 错误。
-        await self.get_conversation(conversation_id)
+        # 1. 会话存在性 + 归属校验：复用请求级 session。
+        #    此步骤在流式响应开始之前完成，若会话不存在或不属于当前用户会直接抛 404，
+        #    由路由层正常返回 HTTP 错误。
+        await self.get_conversation(conversation_id, user_id=current_user.id)
+
+        # 1.1 【第 11 期】算好本用户的权限标签，稍后注入 RAGState。
+        #     【为什么在 session 之外算】它是纯函数（只读 current_user.roles），不碰数据库，
+        #       放在这里比放进长连接会话里更清晰。
+        #     【为什么必须在进图之前算】检索发生在图内部的 retrieve 节点，
+        #       而图只会读 state —— 身份信息不提前塞进去，图内就拿不到。
+        permissions = compute_user_permission_tags(current_user)
 
         # 2. 开启独立 session：SSE 长连接期间不能占用请求级连接，否则并发时极易耗尽连接池。
         #    async with 保证无论是正常结束还是异常退出，连接都会被归还。
@@ -443,6 +486,9 @@ class ChatService:
                 state: RAGState = {
                     "conversation_id": conversation_id,
                     "question": question,
+                    # 【第 11 期】有效权限标签：图内 retrieve 节点据此拼检索 SQL 的权限 WHERE。
+                    #   持 "*" 时等价于 admin 视角（不附加权限过滤）。
+                    "permissions": permissions,
                     # 塞进状态后全链路可读（图内节点只透传、不产出）
                     "trace_id": trace_id,
                 }
@@ -665,6 +711,13 @@ class ChatService:
             "question": question,
             # 显式置空多轮历史，禁用多轮指代消解与改写，保证评测用例的单轮独立性
             "chat_history": [],
+            # 【第 11 期 · ⚠️ 本行是"权限过滤不反噬评测"的关键】
+            #    评测跑批没有"当前登录用户"，若不加这一行，permissions 会缺省为空列表，
+            #    检索 SQL 就会退化成"只能看到公开文档"——非公开文档全部检索不到，
+            #    Day10 的全部指标（context_recall / citation_hit_rate 等）会突然崩盘。
+            #    因此这里显式注入通配标签，等价于 admin 视角：
+            #    "评测是系统内部行为，不代表任何真实用户，理应看到全量语料"。
+            "permissions": [WILDCARD_PERMISSION_TAG],
             "trace_id": trace_id,
         }
 

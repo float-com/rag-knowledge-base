@@ -39,6 +39,12 @@ class RAGState(TypedDict, total=False):
     # --- 1. 工作流初始输入阶段 (Input) ---
     conversation_id: UUID       # 当前会话的唯一标识 UUID
     question: str              # 用户在输入框键入的原始提问内容
+    # 【第 11 期新增】用户有效权限标签，由 ChatService 在【进图前】注入。
+    #   - 含 "*" 时检索 SQL 不附加权限过滤（admin 视角）；
+    #   - 评测路径固定注入 ["*"]，防止离线评测被权限拦住；
+    #   - 【为什么必须在这里显式声明】RAGState 是 TypedDict(total=False)，
+    #     未声明的键会被 LangGraph 【静默丢弃】—— 不声明就等于没传。
+    permissions: list[str]
 
     # --- 2. 上下文加载节点 (load_context 节点产出) ---
     chat_history: list[Message] # 数据库中预加载的正序最近多轮对话历史列表

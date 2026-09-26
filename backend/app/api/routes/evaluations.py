@@ -28,9 +28,9 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Query, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response
 
-from app.api.deps import DbSession
+from app.api.deps import DbSession, get_current_admin
 from app.api.schemas.evaluations import (
     BadCaseCategoryValue,
     DatasetInfo,
@@ -51,7 +51,19 @@ from app.services.evaluation_service import EvaluationService, execute_evaluatio
 #     - 路径拼接公式 = 全局前缀 [/api] + 模块前缀 [/evaluations] + 端点子路径；
 #     - Swagger UI (/docs) 会把这一组单独折叠成 "evaluations" 分组，便于查阅。
 #   通俗来讲：给评测相关接口挂上统一门牌号 `/evaluations`，和 documents / conversations 并列。
-router = APIRouter(prefix="/evaluations", tags=["evaluations"])
+#
+# 【第 11 期 · 为什么用 dependencies=[Depends(get_current_admin)] 而不是给每个路由加参数】
+# 评测是纯管理面能力（会真金白银调 LLM 跑分），8 个端点应当统一要求管理员。
+# 两种写法都能实现，差别在于：
+#   ① 逐路由加 `_: CurrentAdmin` 参数 —— 要在 8 个函数签名里重复 8 次；
+#   ② 挂在 router 上（本处） —— 声明一次，整组生效，新增端点自动继承保护。
+# 缺点 ② 是"路由函数内拿不到 User 对象"，但评测模块本来也不需要知道是谁在调用
+# （评测跑批固定用通配权限，不代表任何真实用户），所以这个缺点在这里不构成问题。
+router = APIRouter(
+    prefix="/evaluations",
+    tags=["evaluations"],
+    dependencies=[Depends(get_current_admin)],
+)
 
 
 # =============================================================================

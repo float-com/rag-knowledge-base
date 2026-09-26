@@ -57,10 +57,17 @@ class ConversationRepository:
         self.session = session
 
     async def create(
-        self, title: str = DEFAULT_CONVERSATION_TITLE
+        self,
+        title: str = DEFAULT_CONVERSATION_TITLE,
+        *,
+        user_id: UUID | None = None,
     ) -> Conversation:
         """
         创建并持久化一个新会话实体。
+
+        :param user_id: 会话归属人（第 11 期新增）。默认 None 是为了兼容
+                        内部调用（如评测、脚本）；HTTP 路径必须显式传入，
+                        否则会造出"无主会话"——它在任何用户的列表里都看不到。
 
         【仓储层的事务与提交约定】：
         这里仅执行 await self.session.flush()，而不是 session.commit()。
@@ -69,7 +76,7 @@ class ConversationRepository:
         - 为什么不 commit？仓储层只做数据访问，事务的边界（Commit / Rollback）必须由外层
           Service 层或 Unit of Work 严格控制，防止出现部分逻辑失败但底层仓储已提前提交的脏事务。
         """
-        conversation = Conversation(title=title)
+        conversation = Conversation(title=title, user_id=user_id)
         self.session.add(conversation)
         await self.session.flush()
         return conversation
@@ -107,10 +114,20 @@ class ConversationRepository:
         self,
         page: int,
         page_size: int,
+        *,
+        user_id: UUID | None = None,
     ) -> tuple[list[tuple[Conversation, int]], int]:
         """按 updated_at 倒序分页拉取会话列表，并原子性地附带每个会话当前包含的消息条数。
 
-        :return: ([(Conversation实体, 消息条数), ...], 数据库总会话数)
+        :param user_id: 归属过滤（第 11 期新增）。传值则只返回该用户的会话；
+                        传 None 表示"不限制"（admin 视角 / 内部调用）
+        :return: ([(Conversation实体, 消息条数), ...], 满足条件的总会话数)
+
+        【⚠️ 分页的"数据"与"总数"必须用同一套过滤条件】
+        下面 `stmt` 与 `count_stmt` 各自带一份 `if user_id is not None` 的判断 ——
+        看起来重复，但**绝不能只改一处**：若只过滤数据而不过滤总数，
+        前端算出来的总页数会比实际能翻的页数多，翻到后面就是空列表。
+        这是分页接口最经典的一类 bug，两处的条件必须严格同源。
         """
         # ----------------------------------------------------------------------
         # 1. 入参防御性约束（Defensive Clamping）
@@ -147,6 +164,10 @@ class ConversationRepository:
             .limit(page_size)
             .offset(offset)
         )
+        # 归属过滤：与下面的 count_stmt 必须用同一个条件（见 docstring 的提醒）
+        if user_id is not None:
+            stmt = stmt.where(Conversation.user_id == user_id)
+
         rows = (await self.session.execute(stmt)).all()
         # row[0] 为 Conversation ORM 实体，row[1] 为聚合算出的 count 值
         items = [(row[0], int(row[1])) for row in rows]
@@ -156,21 +177,30 @@ class ConversationRepository:
         # ----------------------------------------------------------------------
         # 分页接口必须向前端返回 total 字段以供前端组件计算“总页数”。
         # 在关系型数据库的标准分页规范中，列表数据和总记录数天然属于两次语义独立的查询。
-        total = int(
-            (
-                await self.session.execute(select(func.count(Conversation.id)))
-            ).scalar_one()
-        )
+        count_stmt = select(func.count(Conversation.id))
+        if user_id is not None:
+            count_stmt = count_stmt.where(Conversation.user_id == user_id)
+
+        total = int((await self.session.execute(count_stmt)).scalar_one())
         return items, total
 
     # ==========================================================================
     # 新增方法 3：会话硬删除（级联机制与 404 状态区分）
     # ==========================================================================
-    async def delete(self, conversation_id: UUID) -> bool:
+    async def delete(
+        self, conversation_id: UUID, *, user_id: UUID | None = None
+    ) -> bool:
         """硬删除指定会话实体。
 
         :param conversation_id: 目标会话主键 UUID
-        :return: 删除成功返回 True；若记录本身不存在则返回 False（便于上层路由直接转译为 404）
+        :param user_id: 归属过滤（第 11 期新增）。传值则只删除属于该用户的会话；
+                        传 None 表示"不限制"（内部调用）
+        :return: 删除成功返回 True；若记录不存在 **或不属于该用户** 则返回 False
+
+        【⚠️ 这里复用 self.get(..., user_id=user_id)，而不是自己另拼一套 where】
+        删除前的存在性检查必须与"归属校验"共用同一段逻辑 ——
+        若检查用一套条件、删除用另一套，就会出现"检查通过但删错了行"这类危险偏差。
+        复用 get 也顺带保证了"无权访问 == 不存在 == 返回 False"三者在语义上完全一致。
 
         【级联删除说明】：
         会话下的历史消息（Message）及其引用的知识库片段（AnswerCitation）不需要在此处手写
@@ -182,7 +212,7 @@ class ConversationRepository:
         2. ORM 生命周期与缓存状态同步：先 get 可以利用 Session 的 Identity Map，让 ORM 感知到
            该实体的生命周期转变（从 persistent 变为 deleted），避免内存脏状态。
         """
-        conversation = await self.get(conversation_id)
+        conversation = await self.get(conversation_id, user_id=user_id)
         if conversation is None:
             return False
 
@@ -223,14 +253,39 @@ class ConversationRepository:
         conversation.title = new_title[:30]
         # 仅 flush 暂存变更，统一等待外层 Service 决断最终 commit
         await self.session.flush()
-    async def get(self, conversation_id: UUID) -> Conversation | None:
-        """
-        根据主键 UUID 获取指定的会话实体。
+    async def get(
+        self, conversation_id: UUID, *, user_id: UUID | None = None
+    ) -> Conversation | None:
+        """按主键获取会话实体（返回 None 表示不存在 **或无权访问**）。
 
         :param conversation_id: 会话唯一标识
-        :return: 对应的 Conversation 实体；若不存在则返回 None
+        :param user_id: 归属过滤（第 11 期新增）。传值则强制要求该会话属于此用户；
+                        传 None 表示"不限制"（供后台任务、评测等内部路径使用）
+        :return: 对应的 Conversation 实体；不存在或不属于该用户时返回 None
+
+        【为什么把"无权访问"也返回 None，而不是抛 403】
+        若"存在但无权"抛 403、"不存在"返回 None，调用方就能通过状态码差异
+        **探测出某个 conversation_id 是否真实存在**（越权信息的侧信道）。
+        统一返回 None、由上层一律翻译成 404，可以彻底抹掉这个差异。
+
+        【为什么要有 user_id=None 这条不限制的路径】
+        会话仓储不只服务于 HTTP 请求 —— 评测跑批、后台任务等内部路径没有"当前登录用户"，
+        它们需要能取到任意会话。用 None 显式表达"这是内部调用"，
+        比让内部调用伪造一个 user_id 更诚实。
+
+        【为什么传了 user_id 就不能走 session.get()】
+        `session.get()` 只接受主键，无法附带 `WHERE user_id = ...` 这样的过滤条件。
+        所以一旦要做归属校验，就必须改用 `select()` 显式构造查询。
         """
-        return await self.session.get(Conversation, conversation_id)
+        if user_id is None:
+            # 内部路径：只按主键取，不做归属限制
+            return await self.session.get(Conversation, conversation_id)
+
+        stmt = select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def list_messages(self, conversation_id: UUID) -> list[Message]:
         """
