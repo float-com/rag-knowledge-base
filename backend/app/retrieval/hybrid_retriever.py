@@ -66,6 +66,7 @@ class HybridRetriever:
         *,
         recall_top_k: int,
         final_top_k: int,
+        permission_tags: list[str] | None = None,
     ) -> list[RetrievedChunk]:
         """两路并发召回 + RRF 融合 + 取 final Top-K。
 
@@ -81,6 +82,12 @@ class HybridRetriever:
         :param query: 用户原始提问（两路使用同一个查询串，各自内部按自身语义处理）
         :param recall_top_k: 单路召回宽度（应大于 final_top_k，为融合留足候选）
         :param final_top_k: 融合后交给 LLM 的最终切片数
+        :param permission_tags: 【第 9 章新增】调用方有效权限标签，**同时**下发给两路。
+                                **None = 不做权限过滤**（admin / 离线评测 / 启动期种子）。
+                                【为什么在这里就分发给两路、而不是融合后再过滤】：
+                                过滤必须发生在 SQL（召回阶段），而不是融合之后 ——
+                                否则无权分块会先占掉 top_k 名额，把有权分块挤出候选窗口，
+                                结果是"权限过滤生效了，但用户能拿到的资料也变少了"。
         :return: 按 RRF 融合分降序排列的 RetrievedChunk 列表
         """
         # 元组解包：gather 的返回顺序【严格等于】传入参数的顺序，
@@ -89,10 +96,14 @@ class HybridRetriever:
         vector_hits, keyword_hits = await asyncio.gather(
             # 第 1 路：向量检索。传入【类对象】而非实例——实例化由 _safe_search 在
             # 它自己新建的会话里完成，这样两路才能各持一个独立会话。
-            self._safe_search(VectorRetriever, query, recall_top_k, "vector"),
+            self._safe_search(
+                VectorRetriever, query, recall_top_k, "vector", permission_tags
+            ),
             # 第 2 路：关键词检索。与第 1 路走【完全相同的代码路径】，
             # 只是换了类对象与日志标签——这正是统一 RetrievedChunk 契约换来的对称性。
-            self._safe_search(KeywordRetriever, query, recall_top_k, "keyword"),
+            self._safe_search(
+                KeywordRetriever, query, recall_top_k, "keyword", permission_tags
+            ),
         )
         # 两路结果到手后交给融合函数；这里 return 直接透传，无需再加工：
         # 融合函数已经负责了去重、累加、排序、截断、以及最终契约的构造。
@@ -108,7 +119,7 @@ class HybridRetriever:
         )
 
     # @staticmethod：本方法不需要 self，也不读写任何实例状态。
-    # 好处是两路调用形式完全一致（都是 _safe_search(类, 查询, 条数, 标签)），
+    # 好处是两路调用形式完全一致（都是 _safe_search(类, 查询, 条数, 标签, 权限标签)），
     # 且可以直接被单元测试单独调用，无需先构造 HybridRetriever 实例。
     @staticmethod
     async def _safe_search(
@@ -116,6 +127,7 @@ class HybridRetriever:
         query: str,
         top_k: int,
         label: str,
+        permission_tags: list[str] | None,
     ) -> list[RetrievedChunk]:
         """单路检索的异常兜底：任何异常都降级为"空结果 + 记日志"，绝不向上抛。
 
@@ -130,10 +142,17 @@ class HybridRetriever:
         这里是有意为之。检索是"尽力而为"的旁路能力，任何一路失败都不应让用户看不到回答；
         且失败已被完整记入日志（含堆栈），可排查、可告警，不存在"异常被吞掉无从查起"的问题。
 
+        【第 9 章 · permission_tags 为什么是【必传】的普通参数，而不是带默认值的可选参数】
+        这个方法是本模块内部的私有函数，唯一调用方就是上面的 search()。
+        写成必传位置参数，等于让编译器帮忙保证"两路都别漏传"——
+        如果给它 `= None` 默认值，将来新加一路检索时忘了传，就会静默变成"不过滤"，
+        那正是最危险的失效方式（越权召回且无任何报错）。宁可传参麻烦一点。
+
         :param retriever_cls: 检索器类（向量或关键词），由调用方传入以保证两路对称
         :param query: 查询文本
         :param top_k: 本路召回条数
         :param label: 日志标签，纯为排查时看清是哪一路挂了
+        :param permission_tags: 调用方有效权限标签；None = 不做权限过滤
         :return: 本路召回结果；异常时返回空列表
         """
         # try 包住整个"开会话 + 检索"过程，而不仅仅是 search() 那一行：
@@ -148,7 +167,10 @@ class HybridRetriever:
                 retriever = retriever_cls(session)
                 # await 本路检索：向量路内部会调 embedding 模型，关键词路内部是纯 SQL；
                 # 两者耗时不同，但都通过 async I/O 让出事件循环，因此能被 gather 真正并发。
-                return await retriever.search(query, top_k)
+                # 【第 9 章】把权限标签继续往下传，最终会变成 SQL 里的可见性 WHERE。
+                return await retriever.search(
+                    query, top_k, permission_tags=permission_tags
+                )
         # 兜住一切异常（含超时、网络、SQL、模型返回异常结构等）。
         # 注意顺序：except 必须在 async with 之外，否则会话退出时的清理异常会被漏掉。
         except Exception:

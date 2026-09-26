@@ -25,10 +25,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+# sqlalchemy.sql.elements.ColumnElement：条件表达式的静态类型，
+#   用于给"条件列表"做类型标注（list[ColumnElement[bool]]），让 IDE 与 mypy 都能看懂
+from sqlalchemy.sql.elements import ColumnElement
 # 引入文档与文档分块持久层 ORM 模型
 from app.db.models import Document, DocumentChunk
+# 【第 9 章】复用文档仓储里的权限过滤条件生成函数 —— 全项目只有这一处定义
+#   为什么不自己再写一份"空数组 OR 标签重叠"：
+#     权限条件一旦有第二个副本，就会出现"文档列表一套口径、检索另一套口径"的分叉，
+#     而分叉的方向几乎总是"检索那条忘了同步"→ 静默的越权召回。
+#   （教程把该函数放在本文件、再由 document_repo 反向 import；
+#     本项目按已有的落点反过来 import —— 函数归属哪一侧不影响正确性，
+#     关键是【全项目只留一份实现】。）
+from app.db.repositories.document_repo import build_permission_filter
 # 引入关系急加载加载策略，用于在异步环境下高效加载关联父表
 from sqlalchemy.orm import selectinload
 
@@ -209,6 +220,8 @@ class DocumentChunkRepository:
             self,
             query_embedding: list[float],
             top_k: int,
+            *,
+            permission_tags: list[str] | None = None,
     ) -> list[tuple[DocumentChunk, float]]:
         """
         按 cosine 距离做 Top-K 向量检索。
@@ -219,18 +232,40 @@ class DocumentChunkRepository:
 
         :param query_embedding: 待检索的浮点型向量列表
         :param top_k: 期望返回的最相关候选分块数量
+        :param permission_tags: 【第 9 章新增】调用方有效权限标签。
+                                **None = 不做权限过滤**（admin 视角 / 离线评测 / 启动期种子）；
+                                传值则只召回"对调用方可见"的文档下的分块。
         :return: (分块实体, 余弦距离) 的元组列表
+
+        【为什么本次改动必须做，以及为什么它比文档列表的过滤更要紧】
+        第 8 章只把权限加到了"文档列表 / 详情 / 切片浏览"这些**读接口**上。
+        但真正决定"用户能不能知道这份文档的内容"的，是**检索**：
+        只要向量召回把无权分块捞回来，它就会被塞进 prompt、被 LLM 转述、
+        并作为引用卡片显示给用户 —— 那么"列表里看不到"就形同虚设。
+        所以这一步才是把权限做成"真闭环"的关键一笔。
         """
         # 1. 构建 pgvector 原生余弦距离计算表达式（<=> 运算符对应 cosine_distance）
         distance = DocumentChunk.embedding.cosine_distance(query_embedding)
 
-        # 2. 编排向量检索 SQL 语句
+        # 2. 【第 9 章】把全部 WHERE 条件先收进列表，再用 and_ 一次性拼上。
+        #    【为什么不写成 .where(cond1, cond2, perm)】
+        #    权限条件可能是 None（admin / 评测不限制），而 `.where(None)` 会直接报错；
+        #    先收集再合并，就能天然表达"这个条件可能压根不存在"。
+        conditions: list[ColumnElement[bool]] = [
+            # 状态守卫：仅检索已完成解析、索引并就绪的文档分块
+            Document.status == "ready",
+        ]
+        perm_where = build_permission_filter(permission_tags)
+        if perm_where is not None:
+            conditions.append(perm_where)
+
+        # 3. 编排向量检索 SQL 语句
         stmt = (
             select(DocumentChunk, distance.label("distance"))
-            # 内连接父级 Document 表以校验入库状态
+            # 内连接父级 Document 表以校验入库状态与可见性
             .join(Document, Document.id == DocumentChunk.document_id)
-            # 状态守卫：仅检索已完成解析、索引并就绪的文档分块
-            .where(Document.status == "ready")
+            # 状态 + 权限条件一起 AND（少写 permissions 就是越权召回，没有报错提示）
+            .where(and_(*conditions))
             # 按余弦距离升序排列（距离越小，语义相关度越高）
             .order_by(distance.asc())
             # 限制召回最大条数
@@ -239,16 +274,18 @@ class DocumentChunkRepository:
             .options(selectinload(DocumentChunk.document))
         )
 
-        # 3. 异步执行查询并提取所有匹配行
+        # 4. 异步执行查询并提取所有匹配行
         rows = (await self.session.execute(stmt)).all()
 
-        # 4. 组装为强类型元组返回，将 distance 标量安全转为 Python float
+        # 5. 组装为强类型元组返回，将 distance 标量安全转为 Python float
         return [(chunk, float(dist)) for chunk, dist in rows]
 
     async def keyword_search(
             self,
             query: str,
             top_k: int,
+            *,
+            permission_tags: list[str] | None = None,
     ) -> list[tuple[DocumentChunk, float]]:
         """
         基于 PostgreSQL 全文检索召回与用户输入最相关的 Top-K 文档切片。
@@ -269,7 +306,13 @@ class DocumentChunkRepository:
 
         :param query: 用户原始输入的搜索文本（支持任意特殊字符与空格）
         :param top_k: 期望返回的最相关切片最大条数
+        :param permission_tags: 【第 9 章新增】调用方有效权限标签；None = 不做权限过滤
         :return: (DocumentChunk 实体, ts_rank 相关度得分) 的元组列表，按分值降序排列
+
+        【⚠️ 关键词路与向量路必须【同时】加权限过滤】
+        两路是并发的、且最终交由 RRF 融合。只给向量路加、漏了关键词路，
+        结果是"关键词命中的越权分块照样进最终候选"—— 权限过滤会被这条腿绕过去。
+        所以本方法的结构与 vector_search 保持严格对称。
         """
         # 1. 查询词解析：切词并生成数据库匹配表达式（tsquery）
         #    【说明】func 是 SQLAlchemy 的动态工厂（通过 __getattr__ 映射底层 SQL 函数），
@@ -281,17 +324,24 @@ class DocumentChunkRepository:
         #    否则显式 import 会抛出 ImportError。
         rank_expr = func.ts_rank(DocumentChunk.content_tsv, tsquery)
 
-        # 3. 编排检索 SQL 语句
+        # 3. 【第 9 章】与向量路同构：条件先收集，再 and_ 合并
+        conditions: list[ColumnElement[bool]] = [
+            # 状态守卫：仅检索就绪状态的文档，过滤脏数据
+            Document.status == "ready",
+            # 全文命中：@@ 操作符判断切片分词向量（content_tsv）是否满足 tsquery
+            DocumentChunk.content_tsv.op("@@")(tsquery),
+        ]
+        perm_where = build_permission_filter(permission_tags)
+        if perm_where is not None:
+            conditions.append(perm_where)
+
+        # 4. 编排检索 SQL 语句
         stmt = (
             select(DocumentChunk, rank_expr.label("rank"))
-            # 关联父级 Document 表，用于校验整篇文档的状态
+            # 关联父级 Document 表，用于校验整篇文档的状态与可见性
             .join(Document, Document.id == DocumentChunk.document_id)
-            .where(
-                # 状态守卫：仅检索就绪状态的文档，过滤脏数据
-                Document.status == "ready",
-                # 全文命中：@@ 操作符判断切片分词向量（content_tsv）是否满足 tsquery
-                DocumentChunk.content_tsv.op("@@")(tsquery),
-            )
+            # 状态 + 全文命中 + 权限，三条一起 AND
+            .where(and_(*conditions))
             # 按全文匹配分降序排列（最相关的排在最前）
             .order_by(rank_expr.desc())
             # 限制召回最大条数
@@ -300,8 +350,8 @@ class DocumentChunkRepository:
             .options(selectinload(DocumentChunk.document))
         )
 
-        # 4. 异步执行查询并取出所有命中行
+        # 5. 异步执行查询并取出所有命中行
         rows = (await self.session.execute(stmt)).all()
 
-        # 5. 组装返回：将数据库数值安全转为 Python 原生 float
+        # 6. 组装返回：将数据库数值安全转为 Python 原生 float
         return [(chunk, float(rank)) for chunk, rank in rows]

@@ -52,17 +52,51 @@ def build_permission_filter(
     - **无任何角色的用户：一篇都看不到** —— 存量 10 篇文档全体失联。
     这比"少看见"严重得多，它是**静默的全面失联**。
 
-    【加了 OR 分支会不会让 GIN 索引失效？不会】
-    已实测 EXPLAIN：PostgreSQL 会把它规划成 `BitmapOr`，
-    两个分支各自走 `ix_documents_permission_tags`：
+    【加了 OR 分支会不会让 GIN 索引失效？不会 —— 但写法有讲究，已实测】
+    在 6 万行、带 GIN 索引的同构临时表上实测（本机 PostgreSQL 16 + pgvector 镜像）：
 
-        BitmapOr
-          -> Bitmap Index Scan on ix_documents_permission_tags  (permission_tags && '{hr}')
-          -> Bitmap Index Scan on ix_documents_permission_tags  (permission_tags = '{}')
+        permission_tags && ARRAY['hr']  OR  permission_tags = ARRAY[]::varchar[]
+        ────────────────────────────────────────────────────────────────────
+        Bitmap Heap Scan on t_docs_perf
+          Recheck Cond: ((permission_tags && '{hr}') OR (permission_tags = '{}'))
+          ->  BitmapOr
+                ->  Bitmap Index Scan on ix_t_docs_permission_tags
+                      Index Cond: (permission_tags && '{hr}')
+                ->  Bitmap Index Scan on ix_t_docs_permission_tags
+                      Index Cond: (permission_tags = '{}')
+
+    即：PostgreSQL 把 OR 规划成 `BitmapOr`，两个分支【各自走同一个 GIN 索引】。
+    "补上那个 OR 分支"既拿到正确性，又没有性能代价。
+
+    【⚠️ 但换一种"等价"写法就会退化成顺序扫描 —— 实测对比】
+    教程给的是 `func.cardinality(Document.permission_tags) == 0`。它语义上等价
+    （两者结果集在 6 万行上实测完全一致，均为 38000 行），但：
+
+        ... OR cardinality(permission_tags) = 0
+        ────────────────────────────────────────────────────────────────────
+        Seq Scan on t_docs_perf            ← ❌ 索引完全没用上
+          Filter: ((status = 'ready') AND
+                   ((permission_tags && '{hr}') OR (cardinality(permission_tags) = 0)))
+
+    原因：`ix_documents_permission_tags` 是 `gin(permission_tags)`（默认 array_ops），
+    它只认得**数组运算符**（`&&`、`=`、`@>` …）。`cardinality()` 是函数调用，
+    不在 GIN 的操作符族里，规划器只能退化成全表过滤。
+    **后果**：权限过滤从"毫秒级索引命中"退化成"每查一次就线性扫一遍 documents 表"，
+    文档一多就会成为问答链路上最慢的一环。
+
+    所以本项目【采用 `== []` 的写法】。若哪天确实需要 NULL 安全语义，
+    正确做法是把列改成 NOT NULL（本列本来就是 `nullable=False`），
+    而不是换成函数调用把索引废掉。
 
     【为什么 admin 要短路】
     持通配标签 `"*"` 时直接 return None（不加任何条件）：
     既省掉一次条件计算，也符合"admin 看全量、且跑得最快"的预期。
+
+    【第 9 章起，本函数有两个调用方 —— 这是它必须放在【模块级】的原因】
+        db/repositories/document_repo.py  文档列表 / 详情（第 8 章就在用）
+        db/repositories/chunk_repo.py     向量检索 / 关键词检索（第 9 章新增）
+    检索侧若不拼这个条件，就会出现"文档列表看不到、但 AI 照样把原文念给你听"的漏洞 ——
+    权限列表做得再严，也等于白做。
     """
     if permission_tags is None:
         # 内部调用：不做权限过滤（例如评测跑批、后台任务）
@@ -71,15 +105,17 @@ def build_permission_filter(
         # admin 视角：等价于"不加权限条件"，直接返回 None 而不是空条件
         return None
     return or_(
+        # 分支一：与调用方标签有交集（数组重叠运算 `&&`，走 GIN 索引）
         Document.permission_tags.op("&&")(permission_tags),
-        # 【⚠️ 这里必须传【空列表】而不是字符串 "{}"】
-        # 直觉写法是 `Document.permission_tags == "{}"`（照抄 SQL 里的数组字面量），
+        # 分支二：文档标签为空 —— 即【公开】
+        #
+        # 【⚠️ 为什么右边必须写空列表 []，不能写字符串 "{}"】
+        # 直觉写法是照抄 SQL 里的数组字面量 `Document.permission_tags == "{}"`，
         # 但那样 SQLAlchemy 会按【字符串】绑定参数，生成：
         #     documents.permission_tags = $1::VARCHAR
         # 而左边是 `varchar[]`，PostgreSQL 直接报：
         #     operator does not exist: character varying[] = character varying
         # （本项目实测踩过这个 500。）
-        #
         # 传 [] 时 SQLAlchemy 会沿用左侧的数组类型来绑定参数，生成的 SQL 是：
         #     documents.permission_tags = $1::VARCHAR[]
         # 类型对得上，PostgreSQL 正确识别为"空数组比较"。

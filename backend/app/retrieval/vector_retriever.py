@@ -87,12 +87,22 @@ class VectorRetriever:
     # 【第 9 期】手动打点：与混合检索同理，本方法走裸 SQLAlchemy。
     #   它是 trace 树里 HybridRetriever 的子节点，两路并发召回因此可以分别看耗时。
     @traceable(name="VectorRetriever.search", run_type="retriever")
-    async def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
+    async def search(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        permission_tags: list[str] | None = None,
+    ) -> list[RetrievedChunk]:
         """
         根据文本 query 进行向量近似检索，返回最相似的 Top-K 个分块。
 
         :param query: 用户输入的查询文本
         :param top_k: 返回最相关的文档块数量
+        :param permission_tags: 【第 9 章新增】调用方有效权限标签，原样透传给仓储层。
+                                **None = 不做权限过滤**（admin / 离线评测 / 启动期种子）。
+                                本层【不做任何判断】，只负责把它传到底 ——
+                                判断的职责全在仓储层的 build_permission_filter。
         :return: 包含相似度评分的 RetrievedChunk 列表
         """
         # 1. 将单条 query 文本向量化
@@ -101,7 +111,11 @@ class VectorRetriever:
 
         # 2. 调用数据访问层执行 pgvector 的 Top-K 向量相似度查询
         #    返回结果通常包含 chunk 实体以及 pgvector 计算出的余弦距离 (cosine distance)
-        rows = await self.chunk_repo.vector_search(embedding, top_k)
+        #    【第 9 章】permission_tags 必须一起传下去：SQL 里多一条可见性 WHERE，
+        #    无权文档的分块就【根本不会进入候选】，而不是"进来了再被上层丢掉"。
+        rows = await self.chunk_repo.vector_search(
+            embedding, top_k, permission_tags=permission_tags
+        )
 
         # 3. 解析与组装结果列表
         return [

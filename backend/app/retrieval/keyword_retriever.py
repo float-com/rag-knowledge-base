@@ -46,18 +46,34 @@ class KeywordRetriever:
     # 【第 9 期】手动打点：与向量路对称，本方法走裸 SQLAlchemy 全文检索。
     #   两路都打点后，才能对比"向量路慢还是关键词路慢"。
     @traceable(name="KeywordRetriever.search", run_type="retriever")
-    async def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
+    async def search(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        permission_tags: list[str] | None = None,
+    ) -> list[RetrievedChunk]:
         """
         根据文本 query 进行中文全文检索，返回最相关的 Top-K 个分块。
 
         :param query: 用户输入的查询文本（原始自然语言，无需预处理）
         :param top_k: 返回最相关的文档块数量
+        :param permission_tags: 【第 9 章新增】调用方有效权限标签，原样透传给仓储层。
+                                **None = 不做权限过滤**（admin / 离线评测 / 启动期种子）。
         :return: 包含 ts_rank 评分的 RetrievedChunk 列表
+
+        【为什么关键词路也必须加这道过滤，而不能只加在向量路】
+        两路是并发执行的，最终结果由 RRF 融合。若只有向量路过滤，
+        一条"关键词命中但无权"的分块仍会进入最终候选并交给 LLM ——
+        等于给越权内容留了一条旁路。两路必须严格对称。
         """
         # 1. 调用数据访问层执行 PostgreSQL 全文检索
         #    底层已完成 chinese_zh 分词、tsvector @@ tsquery 匹配与 ts_rank 打分，
-        #    并按 rank 降序返回 (chunk, rank) 列表
-        rows = await self.chunk_repo.keyword_search(query, top_k)
+        #    并按 rank 降序返回 (chunk, rank) 列表；
+        #    【第 9 章】同时加入文档可见性过滤，无权文档的分块不进入候选。
+        rows = await self.chunk_repo.keyword_search(
+            query, top_k, permission_tags=permission_tags
+        )
 
         # 2. 解析与组装结果列表（与 VectorRetriever.search 保持严格对称）
         return [
