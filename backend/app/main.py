@@ -32,7 +32,8 @@ from app.api.error_handlers import register_error_handlers
 #   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 与 chat 模块
 #   通俗来讲：把刚写好的文档业务接待员（documents）与问答业务接待员（chat）请到总服务台前报到。
 #   第 10 期增量：把评测业务接待员（evaluations）也请过来。
-from app.api.routes import chat, document_uploads, documents, evaluations, health
+#   第 11 期增量：把认证业务接待员（auth）也请过来。
+from app.api.routes import auth, chat, document_uploads, documents, evaluations, health
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -42,6 +43,48 @@ from app.core.logging import configure_logging, get_logger
 
 # 导入可观测性初始化：把 Settings 里的 LangSmith 配置同步写入 os.environ
 from app.core.observability import configure_observability
+
+# 导入种子数据初始化（第 11 期）：库内无用户时建好内置角色与默认管理员
+from app.db.seed import seed_default_admin
+
+# 应用生命周期钩子所需的类型与装饰器
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """应用生命周期钩子：启动时做种子初始化。
+
+    【为什么种子初始化要放在 lifespan，而不是放在 create_app() 里】
+    它是**异步**的（要查库、要写入），而 `create_app()` 是同步函数 ——
+    放进去只能靠 asyncio.run 硬跑，会在"恰好在事件循环里调用 create_app"时直接报错。
+    lifespan 天生运行在事件循环里，`await` 是自然的。
+
+    【顺带解决了第 1 步留下的一个悬案】
+    第 1 步加的 `settings.warn_if_jwt_unconfigured()` 一直**没有任何调用点**（死代码）。
+    当时的问题是"该在哪调用它"：写在 `create_app()` 里不合适，因为那时全局日志
+    还没配置完（configure_logging 在 create_app 内部才执行），告警会以默认格式输出。
+    放在 lifespan 里就对了 —— 此时日志系统早已就绪，且服务还没开始接请求。
+
+    【为什么初始化失败只记日志、不阻断启动】
+    种子初始化失败只意味着"可能登不进去"，而不该让整个服务起不来 ——
+    那样连 /docs 都看不了，反而更难排查。记下异常堆栈，修好后重启即可重试
+    （本函数幂等，重启是安全的重试方式）。
+    """
+    logger = get_logger(__name__)
+
+    # 密钥自检：缺失时给出响亮告警，但同样不阻断启动（详见 config.py 的取舍说明）
+    settings.warn_if_jwt_unconfigured()
+
+    try:
+        await seed_default_admin()
+    except Exception:
+        logger.exception("种子初始化失败；后续可重新启动重试")
+
+    # yield 之前是"启动完成前"的逻辑，之后是"关闭时"的逻辑。
+    # 本项目没有需要优雅关闭的资源（连接池由 SQLAlchemy 自行管理），因此 yield 后为空。
+    yield
 
 
 def create_app() -> FastAPI:
@@ -68,7 +111,9 @@ def create_app() -> FastAPI:
 
     # 第二步：实例化 FastAPI 核心框架
     # title 会直接显示在自动生成的 Swagger API 文档（/docs）的页面正上方
-    app = FastAPI(title=settings.app_name)
+    # lifespan：注册应用生命周期钩子（第 11 期新增），启动时执行种子数据初始化
+    #   —— 库内无用户时自动建好内置角色与默认管理员，避免"没人能登录"的死锁。
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
     # 第三步：装配跨域资源共享（CORS）中间件
     # 浏览器出于同源策略安全限制，会阻止前端（如 localhost:5173）向不同端口的后端发起 API 请求。
@@ -128,6 +173,15 @@ def create_app() -> FastAPI:
     #       case 列表·详情 / 人工覆盖归因」8 个端点，并单独成组显示为 evaluations。
     #   通俗来讲：把评测接待窗口挂到总大厅的“/api”综合服务牌下，前端访问 /api/evaluations 就能办业务了。
     app.include_router(evaluations.router, prefix="/api")
+
+    # 新增（认证路由级联挂载，第 11 期）：app.include_router(auth.router, prefix="/api")
+    #   特性：将 auth.router 动态接入主应用。
+    #   路径拼接公式：全局前缀 [/api] + 模块前缀 [/auth] + 接口子路径 [/login /me]
+    #   核心收益：
+    #     - 登录与「当前用户」统一挂在 /api/auth 之下；
+    #     - 自动向 Swagger UI (/docs) 注入这两个端点，并单独成组显示为 auth。
+    #   通俗来讲：把认证接待窗口挂到总大厅的“/api”综合服务牌下，前端访问 /api/auth/login 就能换令牌了。
+    app.include_router(auth.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)

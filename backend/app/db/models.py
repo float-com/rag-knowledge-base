@@ -33,7 +33,7 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 
 五、认证与权限域（第 11 期）
 13. UserStatus: 用户启用状态枚举（active / disabled）。
-14. User: 用户主表（users），存登录名、bcrypt 密码哈希与展示名。
+14. User: 用户主表（users），存登录名、bcrypt 密码哈希与展示名，以及创建/更新两个审计时间戳。
 15. Role: RBAC 角色表（roles），持有权限标签数组（permission_tags TEXT[]）。
 16. user_roles: 用户-角色多对多关系表（user_roles），复合主键、无业务字段。
 
@@ -1548,6 +1548,24 @@ class User(Base):
         server_default=func.now(),
         nullable=False,
         comment="用户创建时间"
+    )
+
+    # 记录更新时间（第 11 期补回）：
+    # - onupdate=func.now():【ORM 层面更新钩子】当对已存在的 User 字段做修改并 commit 时，
+    #   SQLAlchemy 会在 UPDATE 语句里自动追加 `SET updated_at = NOW()`，应用层不用手写。
+    #   与 Document / Conversation 的写法完全一致。
+    # - 【它有什么用 —— 别当成"抄教程的样板字段"】：
+    #   它是 users 表【唯一】能回答"这个账号什么时候被改过"的字段。具体场景：
+    #     · 出现安全事件后要回答"攻击者拿到 admin 后有没有改过密码 / 加过账号"；
+    #     · 排查"某员工说我账号被停用了，什么时候停的"。
+    #   文档与会话的审计靠 created_by / user_id 能追到人，但"用户本身被谁改动过"
+    #   只有这一列记得到。
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        comment="用户信息最近更新时间"
     )
 
     # 多对多关系：一个用户可持有多个角色。
