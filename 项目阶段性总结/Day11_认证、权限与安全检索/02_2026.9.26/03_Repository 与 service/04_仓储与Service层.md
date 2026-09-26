@@ -505,9 +505,9 @@ u2.roles.append(role)          # ← 抛 MissingGreenlet
 | # | 事项 | 说明 |
 | --- | --- | --- |
 | 1 | **种子管理员还没接** | 教程本步用的两个件都到位了：`UserRepository.count_all()`（"库内无用户"判据）+ `settings.default_admin_*`。**但播种动作属启动流程**，第 5～6 步接 |
-| 2 | **`hash_password` 的 72 字节上限** | `create_user` / `update_user` 目前只校验"至少 4 位"。超 72 字节的密码会让 `hash_password` 抛**未捕获**的 `ValueError` → 500。**建议第 6 步在 Pydantic schema 上加 `max_length`**，让它在参数校验层返回 422 |
-| 3 | **这两个模块目前是"零消费者"** | `auth_service` / `permission_service` 当前没有任何模块 import 它们（`role_service` 只在注释里提到 `is_admin` 的逻辑）。**这是正常的** —— 它们等第 5 步（依赖注入）、第 6 步（路由）、第 7 步（检索过滤）来消费 |
-| 4 | **`UserService` 缺少"不能删自己"** | `delete_user` 没有这个拦截。属业务策略，第 6 步按需补充 |
+| 2 | **`hash_password` 的 72 字节上限** | `create_user` / `update_user` 目前只校验"至少 4 位"。超 72 字节的密码会让 `hash_password` 抛**未捕获**的 `ValueError` → 500。<br>**⚠️ 第 7 章部分解决了、但没完全解决**：教程在 `UserCreate` / `UserUpdate` 上加了 `max_length=128` —— 但它限制的是**字符数**，而 bcrypt 拒绝的是超过 72 **字节**。纯 ASCII 下 72 字符恰好 = 72 字节，看着"128 很宽松"；**中文只要 25 个字（UTF-8 每字 3 字节）就会超过 72 字节** → 仍然 500。详见第 7 章归档 |
+| 3 | **这两个模块目前是"零消费者"** | `auth_service` / `permission_service` 当前没有任何模块 import 它们（`role_service` 只在注释里提到 `is_admin` 的逻辑）。**这是正常的** —— 它们等第 5 步（依赖注入）、第 6 章（路由）、第 7 步（权限过滤接入检索）来消费。<br>✅ **第 5～7 章已消费**：`auth_service` 被 `/api/auth/*` 使用；`permission_service` 被 `deps.py`（判管理员）与 `/api/auth/*`（算权限标签）使用 |
+| 4 | ~~**`UserService` 缺少"不能删自己"**~~ → **已在第 7 章补上** | 本节当时记为"属业务策略，后续按需补充"。**第 7 章写 `DELETE /api/users/{user_id}` 时教程正好加了这个防呆**，实现位置是**路由层**（`routes/users.py` 里比对 `admin.id == user_id`），而不是 Service 层 —— 因为它需要"当前登录者"这个只有 HTTP 上下文才有的信息。详见第 7 章归档 |
 | 5 | **`UserRepository.get_by_username` / `list_paginated` 里的 `.options(selectinload(...))` 是冗余的** | 有了模型级 `lazy="selectin"` 之后，这两处不会多产生任何查询。保留是为了表达"登录紧接着要读 roles"的意图，并在将来模型配置变动时仍然安全 |
 
 ---

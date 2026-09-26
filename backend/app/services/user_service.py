@@ -119,10 +119,11 @@ class UserService:
         await self.user_repo.add(user)
         await self.session.commit()
 
-        # 提交后把 roles 重新拉一次：
-        #   commit 会结束事务，之前 set 进去的关系在"已提交"状态下重新加载更稳妥，
-        #   也让返回对象与数据库的最终状态一致（例如将来在角色上加了过滤条件）。
-        await self.session.refresh(user, attribute_names=["roles"])
+        # 提交后重新加载，保证返回对象可直接序列化（详见 _reload_for_read 的说明）。
+        # 注：INSERT 路径其实不会产生"过期列"（created_at/updated_at 由 server_default 生成后
+        # 被当作普通值回填），这里依然调用同一个方法，是为了让三条写路径保持一致 ——
+        # 将来若给 users 加了带 onupdate 的列，create 路径也不会漏掉。
+        await self._reload_for_read(user)
         return user
 
     async def update_user(
@@ -165,8 +166,7 @@ class UserService:
             user.password_hash = hash_password(password)
 
         await self.session.commit()
-        # 返回前确保 roles 是"已加载"状态，避免路由层序列化时触发隐式 IO
-        await self.session.refresh(user, attribute_names=["roles"])
+        await self._reload_for_read(user)
         return user
 
     async def set_user_roles(
@@ -189,7 +189,7 @@ class UserService:
 
         await self.user_repo.set_roles(user, roles)
         await self.session.commit()
-        await self.session.refresh(user, attribute_names=["roles"])
+        await self._reload_for_read(user)
         return user
 
     async def delete_user(self, user_id: UUID) -> None:
@@ -212,3 +212,36 @@ class UserService:
         user = await self.get_user(user_id)
         await self.user_repo.delete(user)
         await self.session.commit()
+
+    async def _reload_for_read(self, user: User) -> None:
+        """提交之后重新加载实体，让所有字段都处于"已加载"状态，可直接交给 Pydantic 序列化。
+
+        【为什么必须有这一步 —— 一个很隐蔽的坑，且只对 UPDATE 路径发作】
+        `session.commit()` 会把本次 flush 中**写过的列标记为过期（expired）**：
+        它们的值被丢弃，下次访问时会触发一次 SQL 重新取值。
+
+        于是出现这条因果链：
+
+            updated_at 列带 onupdate=func.now()
+                    ↓
+            每次 UPDATE 时 SQLAlchemy 都会把它写进 SET 子句
+                    ↓
+            commit 之后它被标记为过期
+                    ↓
+            路由层同步地执行 UserRead.model_validate(user)
+                    ↓
+            读 updated_at → 触发异步重载 → 抛 MissingGreenlet → 500
+
+        **为什么 create 路径没事**：INSERT 不涉及 onupdate，`created_at` / `updated_at`
+        由 server_default 生成后被当作普通值回填，提交后不会过期。
+        所以这个坑**只在更新接口上发作**，非常容易被漏掉。
+
+        【为什么用 refresh() 全量刷新，而不是只刷 roles】
+        只写 `attribute_names=["roles"]` 的话，`updated_at` 依然是过期状态，
+        序列化时照样炸。写死"哪些列可能过期"也很脆弱 —— 将来给表加一个带
+        `onupdate` 的列，就会重演同一个 500。
+        用**不带 attribute_names 的 refresh()**，让 SQLAlchemy 一次性恢复该实体的全部状态，
+        代价是多一条主键查询，换来"写到哪都不会因为过期属性而炸"。
+        （roles 关系因为模型上配了 lazy="selectin"，也会在这次 refresh 中一并加载。）
+        """
+        await self.session.refresh(user)

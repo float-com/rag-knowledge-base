@@ -32,8 +32,17 @@ from app.api.error_handlers import register_error_handlers
 #   特性：从 API 路由层导入各业务子路由模块；原有 health 健康检查路由保留，增量引入 documents 与 chat 模块
 #   通俗来讲：把刚写好的文档业务接待员（documents）与问答业务接待员（chat）请到总服务台前报到。
 #   第 10 期增量：把评测业务接待员（evaluations）也请过来。
-#   第 11 期增量：把认证业务接待员（auth）也请过来。
-from app.api.routes import auth, chat, document_uploads, documents, evaluations, health
+#   第 11 期增量：把认证业务接待员（auth）与用户 / 角色管理接待员（users / roles）也请过来。
+from app.api.routes import (
+    auth,
+    chat,
+    document_uploads,
+    documents,
+    evaluations,
+    health,
+    roles,
+    users,
+)
 
 # 导入应用配置单例（包含从 .env 读取的应用名、CORS 允许源等）
 from app.core.config import settings
@@ -182,6 +191,16 @@ def create_app() -> FastAPI:
     #     - 自动向 Swagger UI (/docs) 注入这两个端点，并单独成组显示为 auth。
     #   通俗来讲：把认证接待窗口挂到总大厅的“/api”综合服务牌下，前端访问 /api/auth/login 就能换令牌了。
     app.include_router(auth.router, prefix="/api")
+
+    # 新增（用户与角色管理路由级联挂载，第 11 期第 7 章）：
+    #   路径拼接公式：全局前缀 [/api] + 模块前缀 [/users 或 /roles] + 接口子路径
+    #   核心收益：
+    #     - 自动向 Swagger UI (/docs) 注入用户管理 5 个端点 + 角色管理 4 个端点，
+    #       并分别单独成组显示为 users / roles；
+    #     - 至此前端 sdk.gen.ts 里已写死的 12 个 operationId 全部兑现。
+    #   注意：这两组路由**全部要求 CurrentAdmin**（管理面），普通用户访问会得到 403。
+    app.include_router(users.router, prefix="/api")
+    app.include_router(roles.router, prefix="/api")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)
