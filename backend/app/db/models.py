@@ -474,9 +474,14 @@ class Document(Base):
     # 多对一关系：文档的上传者（第 11 期新增）
     # - 单向关系：User 侧不声明 documents 反向属性 ——
     #   本字段只用于审计展示（谁传的），不需要从用户反查他传过的所有文档。
-    # - ⚠️【未声明 lazy，走默认惰性加载】：async 场景下直接访问 doc.creator 会抛 MissingGreenlet。
-    #   凡是要读它的地方（文档列表/详情）都必须显式 .options(selectinload(Document.creator)) 预加载。
-    creator: Mapped["User | None"] = relationship()
+    # - lazy="selectin"：【必须显式指定，不能用默认惰性加载】
+    #   异步 SQLAlchemy 下，默认的 lazy="select" 会在属性被访问时临时发一条 SQL，
+    #   而属性访问不在可 await 的上下文里，会直接抛：
+    #       MissingGreenlet: greenlet_spawn has not been called ...
+    #   （第 2 步与第 4 步都实测撞到过这个异常。）
+    #   selectin 的语义是"主查询结束后，用一条 IN 查询把关联对象一次性取回"，
+    #   因此查询 Document 时不会在序列化 / 日志阶段意外触发惰性加载。
+    creator: Mapped["User | None"] = relationship(lazy="selectin")
 
 
 # ==============================================================================
@@ -780,9 +785,8 @@ class Conversation(Base):
     # 多对一关系：会话归属人（第 11 期新增）
     # - 单向关系：User 侧不声明 conversations 反向属性，避免删用户时 ORM 想在内存里
     #   维护庞大集合；会话的清理交给数据库的 ON DELETE SET NULL。
-    # - ⚠️【未声明 lazy，走默认惰性加载】：async 场景下直接访问 conv.user 会抛 MissingGreenlet。
-    #   凡是要读它的地方都必须显式 .options(selectinload(Conversation.user)) 预加载。
-    user: Mapped["User | None"] = relationship()
+    # - lazy="selectin"：同 Document.creator，理由完全一致（见该处注释）。
+    user: Mapped["User | None"] = relationship(lazy="selectin")
 
 
 class Message(Base):
@@ -1547,11 +1551,21 @@ class User(Base):
     )
 
     # 多对多关系：一个用户可持有多个角色。
-    # ⚠️【注意：没有声明 lazy，走 SQLAlchemy 默认的惰性加载（lazy="select"）】
-    #   在 async 场景下，直接访问 user.roles 会抛 MissingGreenlet。
-    #   因此凡是要读 roles 的地方（登录、/auth/me、权限汇总），
-    #   查询时必须显式带上 .options(selectinload(User.roles)) 预加载。
+    # - lazy="selectin"：【本字段最关键的一处配置，绝不要改成默认惰性加载】
+    #   登录后每次鉴权都要读 user.roles 来汇总 permission_tags；
+    #   它发生在依赖注入与 Service 内部，未必处在可 await 的显式上下文里。
+    #   默认的 lazy="select" 会在访问属性时临时发 SQL，直接抛 MissingGreenlet；
+    #   selectin 表示"加载 User 时用一条 IN 查询顺带把角色取回"，
+    #   既避免异步报错，也避免每个请求多打一轮数据库（N+1）。
+    #   （第 2 步与第 4 步均实测撞到过这个异常，第 4 步的 set_roles 还因此需要兜底。）
+    # - ⚠️ 本配置的覆盖范围（已逐条实测，别凭直觉猜）：
+    #   selectin 对【所有】取数路径都生效，不只是 select() ——
+    #   实测 `session.get(User, id)`（如 UserRepository.get_by_id）同样会预加载 roles，
+    #   连"expire_all() 之后再 get()"也已加载。因此调用方可以放心直接读/写 user.roles。
+    #   唯一需要留意的是"用 load_only 之类只取部分列"的查询，
+    #   那种情况集合仍是未加载态（但本项目没有这种用法）。
     roles: Mapped[list["Role"]] = relationship(
         secondary=user_roles_table,
         back_populates="users",
+        lazy="selectin",
     )
