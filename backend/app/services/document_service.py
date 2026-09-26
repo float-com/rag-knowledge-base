@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.logging import get_logger
+from app.core.tags import normalize_tags
 from app.db.models import Document, DocumentChunk, DocumentStatus
 from app.db.repositories.chunk_repo import (
     ChunkStats,
@@ -166,33 +167,15 @@ logger = get_logger(__name__)
 def _normalize_tags(tags: Sequence[str]) -> list[str]:
     """标准化权限标签：去空白、丢弃空串、去重，并保持稳定顺序（第 11 期新增）。
 
-    【与 RoleService / UserService 里的同名函数是什么关系】
-    三处逻辑**完全相同**（去空白 / 去空串 / 去重 / 保序），但刻意各留一份副本。
-    原因是它们分属三个互不依赖的模块，抽公共函数反而要新建一个工具模块、
-    并让三个 service 都依赖它 —— 对一个 8 行的纯函数来说不划算。
-    真正需要统一的是**行为**（而不是代码位置），因此在三处都写了同样的说明。
+    【第 11 期 · 实现已上收到 `app/core/tags.py`，本函数保留为兼容垫片】
+    原先 `document_service` / `role_service` / `user_service` 各留一份完全相同的副本
+    （当时认为"8 行的纯函数不值得新建模块"）。但 `document_upload_service`
+    的 finalize 也要用它时，这个判断站不住了：要么 import 私有函数、要么抄第四份。
+    因此把实现上收到 core，三处只留转发，避免"清洗口径"再次分叉。
 
-    【为什么必须做这一步】
-    权限标签最终用于 PostgreSQL 的数组重叠运算（`&&`）。
-    若用户输入的是 `"hr, "`（带尾随空格）或 `" hr"`（带前导空格），
-    存进库里就是一个"看起来像 hr 但实际不相等"的字符串，检索时 `&&` 永远不命中 ——
-    表现为"权限明明配了却不生效"，极难排查。
-
-    【为什么用 seen 集合 + 结果列表，而不是 sorted(set(...))】
-    要同时满足"去重"与"保持用户输入顺序"：
-    - 纯 set 会丢顺序；
-    - sorted 会改变顺序（用户按 [sales, hr] 输入，回显却变成 [hr, sales]，容易以为没保存成功）。
+    详见 `app/core/tags.py` 的模块 docstring。
     """
-    seen: set[str] = set()
-    result: list[str] = []
-    for tag in tags:
-        t = tag.strip()
-        # 跳过空串（前端"回车新增标签"的操作很容易留下空项）
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        result.append(t)
-    return result
+    return normalize_tags(tags)
 
 
 # =============================================================================

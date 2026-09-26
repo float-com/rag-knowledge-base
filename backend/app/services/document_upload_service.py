@@ -28,6 +28,7 @@ from app.api.schemas.document_uploads import (
 )
 from app.core.config import settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.core.tags import normalize_tags
 from app.db.models import Document, DocumentStatus, UploadSession, UploadSessionStatus
 from app.db.repositories.document_repo import DocumentRepository
 from app.db.repositories.upload_session_repo import UploadSessionRepository
@@ -132,7 +133,10 @@ class DocumentUploadService:
             mime_type=mime_type,
             suffix=suffix,
             expected_size=payload.size,
-            permission_tags=payload.permission_tags,
+            # 【第 11 期补漏】init 阶段就清洗一次：让会话里暂存的就是"干净的标签"。
+            #   这样 finalize 搬过去时口径一致，也避免历史脏数据（带空格/重复项）
+            #   在库里流转。两处都清洗是刻意的"双保险"，不是重复劳动。
+            permission_tags=normalize_tags(payload.permission_tags or []),
             status=UploadSessionStatus.INITIATED,
             expires_at=datetime.now(timezone.utc)
             + timedelta(seconds=_PRESIGNED_EXPIRES_SECONDS),
@@ -294,6 +298,24 @@ class DocumentUploadService:
                     cos_object_key=upload_session.object_key,
                     cos_region=service.file_service.region,
                     status=DocumentStatus.UPLOADING,
+                    # 【第 11 期补漏】把 init 阶段暂存的权限标签沉淀到正式文档上。
+                    #
+                    # 【为什么不加这一行会造成安全事故（而不是"少个字段"）】
+                    # Document.permission_tags 的空数组语义是【公开】：
+                    #     permission_tags = []  →  任何登录用户都能看到并检索到这份文档
+                    # 于是"管理员上传时明确设了 ['hr']"的文档，会因为本行缺失而
+                    # 【静默变成全员可见】—— 界面上显示成功、没有任何报错，
+                    # 管理员根本不知道自己的保密设置没生效。
+                    #
+                    # 【为什么两处都要清洗】
+                    # init 阶段已用 normalize_tags 清洗过（写入 UploadSession 时），
+                    # 这里再清洗一次是"最后一道防线"：防止有人绕过 init 直接写库，
+                    # 也顺带把 JSONB 里可能存在的历史脏数据（带空格/重复项）挡在库外。
+                    #
+                    # 【类型说明】UploadSession 上是 JSONB，Document 上是 varchar[]；
+                    # SQLAlchemy 会按目标列类型绑定参数，这里只需给出 list[str]，
+                    # 不需要手工做 JSON↔数组 的转换。
+                    permission_tags=normalize_tags(upload_session.permission_tags or []),
                 )
 
                 # 语法（文档持久化注册）：调用 DocumentRepository 挂载新增记录并获取生成列

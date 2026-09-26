@@ -10,7 +10,7 @@ import {
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation } from 'react-router-dom'
 import { UserMenu } from '@/components/UserMenu'
-//import { useAuthStore } from '@/stores/authStore'
+import { useAuthStore } from '@/stores/authStore'
 
 const { Header, Sider, Content } = Layout
 
@@ -59,8 +59,10 @@ function resolveSelectedKey(pathname: string): string {
 export function BasicLayout() {
   const location = useLocation()
   const selectedKey = resolveSelectedKey(location.pathname)
-  //const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
-  const isAdmin = true // 临时 Mock 管理员权限，放行页面管理功能，方便本地接口联调
+  // 【第 11 期恢复】admin 菜单项按真实身份渲染，不再 Mock。
+  //   注意：这里只是"显示层"过滤，真正的准入由内层 <RequireAdmin /> 把关 ——
+  //   藏起菜单不等于拦住路由（用户仍可直接输 URL），两道都要有。
+  const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
 
   const menuItems = isAdmin
     ? [...baseMenuItems, ...adminMenuItems]

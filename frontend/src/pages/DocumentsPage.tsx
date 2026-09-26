@@ -36,7 +36,7 @@ import {
   getStatusLabel,
   isTerminalStatus,
 } from '@/utils/documentStatus'
-//import { useAuthStore } from '@/stores/authStore'
+import { useAuthStore } from '@/stores/authStore'
 
 const { Title, Paragraph } = Typography
 
@@ -79,8 +79,10 @@ export function DocumentsPage() {
   // 上传失败原因：弹窗内持久展示，避免直传链路的原始错误被静默吞掉
   const [uploadError, setUploadError] = useState<string | null>(null)
   const queryClient = useQueryClient()
-  //const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
-  const isAdmin = true // 临时 Mock 管理员权限，放行页面管理功能，方便本地接口联调
+  // 【第 11 期恢复】按真实身份决定是否渲染"操作"列与上传入口，不再 Mock。
+  //   也只是显示层过滤：删除 / 重试 / 上传三个接口在后端都挂了 CurrentAdmin，
+  //   普通用户即使绕过界面直接调也会拿到 403。
+  const isAdmin = useAuthStore((s) => Boolean(s.user?.isAdmin))
 
   const listQuery = useQuery({
     queryKey: ['documents', page, pageSize, statusFilter],

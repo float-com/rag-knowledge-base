@@ -24,6 +24,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.core.tags import normalize_tags
 from app.db.models import Role
 from app.db.repositories.role_repo import RoleRepository
 
@@ -159,28 +160,9 @@ class RoleService:
 def _normalize_tags(tags: list[str]) -> list[str]:
     """标准化权限标签：去空白、丢弃空串、去重，并保持稳定顺序。
 
-    【为什么必须做这一步】
-    `permission_tags` 最终会用于 PostgreSQL 的数组重叠运算（`&&`）。
-    如果管理员输入的是 `"hr, "`（带尾随空格）或 `" hr"`（带前导空格），
-    存进库里的是一个"看起来像 hr 但实际不相等"的字符串，
-    检索时 `&&` 永远不命中 —— 表现为"权限明明配了却不生效"，极难排查。
-
-    【为什么用 seen 集合 + 结果列表，而不是 sorted(set(...))】
-    要同时满足"去重"和"保持管理员输入顺序"：
-    - 纯 set 会丢顺序；
-    - sorted 会改变顺序（管理员按 [sales, hr] 输入，回显却变成 [hr, sales]，容易以为没保存成功）。
-    因此用一个 seen 集合判重、一个 list 保序。
-
-    :param tags: 原始标签列表（可能含空串、空白、重复项）
-    :return: 清洗后的标签列表
+    【第 11 期 · 实现已上收到 `app/core/tags.py`，本函数保留为兼容垫片】
+    原先本模块与 `document_service` / `user_service` 各留一份完全相同的副本；
+    第 11 期 `document_upload_service` 也需要清洗时，为免抄第四份而上收到 core。
+    详见 `app/core/tags.py`。
     """
-    seen: set[str] = set()
-    result: list[str] = []
-    for tag in tags:
-        t = tag.strip()
-        # 跳过空串（前端"回车新增标签"的操作很容易留下空项）
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        result.append(t)
-    return result
+    return normalize_tags(tags)
