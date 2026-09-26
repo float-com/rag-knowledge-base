@@ -91,3 +91,20 @@ class ConflictError(AppException):
     code = "conflict"
     message = "资源状态冲突"
     http_status = HTTPStatus.CONFLICT
+
+
+class UnauthorizedError(AppException):
+    """未认证 / 凭证失效异常（对应 HTTP 401）。
+
+    【与 PermissionDeniedError(403) 的区别 —— 这一对最容易混】：
+    - 401（本类）：**"你是谁"没证明成功** —— 没带 token / token 过期 / 签名不对 / 用户已停用。
+      前端约定：收到 401 就清掉登录态并跳转 /login，让用户重新登录。
+    - 403（PermissionDeniedError）：**身份已证明，但权限不够** —— 例如普通用户去访问 /api/users。
+      前端约定：收到 403 只提示"无权限"，**不跳登录页**（重登也没用）。
+
+    一句话：401 = "请先去登录"，403 = "登录了也没你的份"。
+    """
+
+    code = "unauthorized"
+    message = "请先登录"
+    http_status = HTTPStatus.UNAUTHORIZED
