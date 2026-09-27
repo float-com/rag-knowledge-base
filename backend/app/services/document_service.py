@@ -40,7 +40,13 @@ from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.logging import get_logger
 from app.core.tags import normalize_tags
-from app.db.models import Document, DocumentChunk, DocumentStatus, IngestionTaskType
+from app.db.models import (
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+    IngestionTask,
+    IngestionTaskType,
+)
 from app.db.repositories.chunk_repo import (
     ChunkStats,
     DocumentChunkRepository,
@@ -702,3 +708,141 @@ class DocumentService:
         # 提交后重新加载，保证返回对象所有字段都处于"已加载"状态、可直接序列化
         await self.session.refresh(doc)
         return doc
+
+    # =========================================================================
+    # 文档重新索引（上传新版本 → 触发增量重建）
+    # =========================================================================
+    async def reindex(
+        self,
+        document_id: UUID,
+        file: UploadFile,
+    ) -> Document:
+        """用新版本文件替换原文档，并触发按 chunk_hash 对齐的增量重建。
+
+        【三道状态与内容防线】：
+        - 状态检查：只允许 READY / FAILED 触发。PARSING / INDEXING / UPLOADING
+          时拒绝，避免与正在进行的 ingest 抢同一份文档的资源（两个任务同时写
+          chunks 会互相踩踏）。
+        - 文件类型一致：新版本的 MIME 必须与原文档相同。
+          否则会出现"PDF 文档被 Markdown 覆盖"——预览 / 下载分支按 MIME 走，
+          扩展名却还是 pdf，前端那条链路的状态就乱了。
+        - 内容去重：新文件的 SHA-256 与原文件一致时直接拒绝，
+          避免白跑一次 embedding（纯属浪费算力，用户也没有任何收益）。
+
+        【⚠️ 与教程的一处不同：新版本【不会】覆盖同一个 COS 对象】
+        教程的注释写的是"新文件覆盖到 COS 的同一个 object_key"，但本项目的
+        FileService 是【内容寻址（CAS）】的：
+            build_object_key(file_hash, suffix) = f"documents/{file_hash}{suffix}"
+        key 里嵌了 hash，所以 hash 一变，key 必然变 —— 新版本会落到一个全新的对象上，
+        旧对象并不会被覆盖。因此这里额外做两件事：
+          1. 上传前先查"这个 hash 是否已经被【别的文档】占用"（见下方防护 1）；
+          2. 提交成功后清理上一版遗留的旧对象（见方法末尾）。
+        """
+        doc = await self.repo.get_by_id(document_id)
+        if doc is None:
+            raise NotFoundError("文档不存在")
+
+        if doc.status not in (DocumentStatus.READY, DocumentStatus.FAILED):
+            raise ValidationError("文档处理中，请等待完成或失败后再重新索引")
+
+        mime_type, suffix = _resolve_mime_and_suffix(file)
+        if mime_type != doc.mime_type:
+            raise ValidationError(
+                f"新版本文件类型必须与原文档一致（当前为 {doc.mime_type}）"
+            )
+
+        content = await file.read()
+        max_bytes = settings.upload_max_size_mb * 1024 * 1024
+        if len(content) == 0:
+            raise ValidationError("上传文件为空")
+        if len(content) > max_bytes:
+            raise ValidationError(f"文件超过 {settings.upload_max_size_mb} MB 上限")
+
+        new_hash = hashlib.sha256(content).hexdigest()
+        # 防线 3：新版本与原版本内容完全一致 → 没有任何东西需要重建
+        if new_hash == doc.file_hash:
+            raise ValidationError("文件内容与现有版本一致，无需重新索引")
+
+        # ---------------------------------------------------------------------
+        # 【本项目补的防护 1，教程没有】跨文档的哈希唯一性检查
+        # ---------------------------------------------------------------------
+        # documents.file_hash 上有 UNIQUE 约束。如果新版本的内容恰好与
+        # 【库里另一份文档】完全相同，那么下面 `doc.file_hash = new_hash`
+        # 提交时会直接抛 IntegrityError → 用户看到 500，
+        # 而且此时新对象已经传上 COS 了，白白留下一个孤儿。
+        #
+        # 为什么只有 reindex 会撞上：另外两条入库入口（直传 finalize / 旧链路 upload）
+        # 在写库【之前】都会先 get_by_hash 做秒传去重，发现重复就直接复用已有记录、
+        # 根本不会去写一个重复的 hash。只有 reindex 是"把已有文档的 hash 改掉"，
+        # 它是唯一能撞上这条唯一约束的路径。
+        #
+        # 放在上传【之前】检查，是为了连那个孤儿对象都不要产生。
+        other = await self.repo.get_by_hash(new_hash)
+        if other is not None:
+            raise ValidationError(
+                f"新版本内容与库中已有文档《{other.name}》完全一致。"
+                "若想更新那一份，请直接对它执行重新索引"
+            )
+
+        # 记下旧对象 key：提交成功后要清理它（见方法末尾）
+        old_object_key = doc.cos_object_key
+
+        object_key = await self.file_service.upload(
+            content=content,
+            file_hash=new_hash,
+            suffix=suffix,
+            mime_type=mime_type,
+        )
+
+        doc.file_hash = new_hash
+        doc.size = len(content)
+        doc.cos_object_key = object_key
+        doc.cos_bucket = self.file_service.bucket
+        doc.cos_region = self.file_service.region
+        # 状态先推到 PARSING：worker 真正接手后还会再推一次，这里先占位是为了
+        # 让"投递出去到 worker 开工"之间那段空窗期，前端也能看到文档在动。
+        doc.status = DocumentStatus.PARSING
+        doc.error_message = None
+        if file.filename:
+            doc.name = file.filename
+
+        # 与 ingest 同一套：先落台账行，与文档改动同一次 commit，
+        # 最后才 delay —— 顺序不能颠倒（见 upload 方法里的详细说明）。
+        task = await self.task_repo.create(doc.id, IngestionTaskType.REINDEX)
+        await self.session.commit()
+        await self.session.refresh(doc)
+
+        reindex_document_task.delay(str(doc.id), str(task.id))
+        logger.info("document reindex scheduled: id=%s", document_id)
+
+        # ---------------------------------------------------------------------
+        # 【本项目补的防护 2，教程没有】清理上一版遗留的 COS 对象
+        # ---------------------------------------------------------------------
+        # 因为 key 是内容寻址的，每次 reindex 都会产生一个【全新的对象】，
+        # 旧对象再没有任何数据库记录指向它 —— 不清理的话，每重新索引一次
+        # 就往桶里堆一份永远没人读的垃圾，且不会自愈。
+        #
+        # 三点顺序上的讲究：
+        #   ① 放在 commit 【之后】：万一提交失败，数据库还指着旧 key，
+        #      这时绝不能先把旧对象删掉，否则文档指向一个不存在的对象。
+        #   ② 放在 delay 【之后】：任务已经投出去了，清理失败不影响重建。
+        #   ③ 整段包在 try 里只记警告：清理是"尽力而为"的收尾动作，
+        #      绝不能因为它的异常让整个 reindex 请求变成 500。
+        if old_object_key and old_object_key != object_key:
+            try:
+                await self.file_service.delete(old_object_key)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "旧版本 COS 对象清理失败，留待人工或定时批处理清理: %s",
+                    old_object_key,
+                )
+
+        return doc
+
+    async def get_latest_task(self, document_id: UUID) -> IngestionTask | None:
+        """取某份文档最近一次入库任务（给路由层组装 DocumentRead 用）。
+
+        路由层不直接碰仓储，所以这里包一层薄薄的转发 ——
+        让"路由 -> Service -> Repository"这条分层不被打破。
+        """
+        return await self.task_repo.get_latest_by_document(document_id)

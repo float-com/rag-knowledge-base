@@ -32,7 +32,7 @@ import { CitationList, type CitationListHandle } from '@/components/CitationList
 import { ConversationSidebar } from '@/components/ConversationSidebar'
 import { QueryRoutePanel } from '@/components/QueryRoutePanel'
 import { TraceIdPanel } from '@/components/TraceIdPanel'
-import { formatApiError } from '@/utils/errors'
+import { toReadableError } from '@/utils/errors'
 
 const { Text } = Typography
 const { TextArea } = Input
@@ -60,6 +60,8 @@ interface UiMessage {
   refused?: boolean
   status?: AssistantStatus
   error?: string | null
+  /** 错误码（来自后端 {code,message}）。用来区分"限流"这类可预期状况，换更合适的提示样式 */
+  errorCode?: string | null
 }
 
 function fromServerMessage(m: MessageRead): UiMessage {
@@ -268,7 +270,14 @@ export function ChatPage() {
               }))
               break
             case 'error':
-              updateAssistant((prev) => ({ ...prev, status: 'error', error: event.message }))
+              // 流内错误事件（生成过程中出错，不是限流那一类）—— 也要带上 code，
+              // 否则气泡只能按"通用错误"渲染，丢失了可区分的信息
+              updateAssistant((prev) => ({
+                ...prev,
+                status: 'error',
+                error: event.message,
+                errorCode: event.code,
+              }))
               break
           }
         },
@@ -279,13 +288,18 @@ export function ChatPage() {
         queryClient.invalidateQueries({ queryKey: conversationsQueryKey }),
       ])
     } catch (err) {
-      const fallback = err instanceof Response ? await formatApiError(err) : (err as Error).message
+      // 用统一入口把任意异常转成"人话 + 错误码"（详见 utils/errors.ts 的 toReadableError）。
+      // 以前这里写的是 `err instanceof Response ? formatApiError(err) : err.message`，
+      // 但 SSE 客户端抛的是普通 Error（不是 Response），那条分支永远走不到，
+      // 兜底就把后端的整串 {"code":"...","message":"..."} 显示了出来。
+      const { code, message } = await toReadableError(err)
       updateAssistant((prev) => ({
         ...prev,
         status: 'error',
-        error: fallback || '请求失败',
+        error: message,
+        errorCode: code,
       }))
-      antdMessage.error(fallback || '问答请求失败')
+      antdMessage.error(message)
     } finally {
       setIsStreaming(false)
       abortRef.current = null
@@ -450,7 +464,25 @@ function MessageBubble({ message }: MessageBubbleProps) {
         }}
       >
         {message.error ? (
-          <Alert type="error" message={message.error} style={{ marginBottom: 8 }} />
+          message.errorCode === 'rate_limited' ? (
+            // 限流不是"系统出错了"，而是"你发得太快，稍等一下" ——
+            // 所以用警告色而不是错误色，并把"为什么"和"该怎么办"一次讲清楚。
+            <Alert
+              type="warning"
+              showIcon
+              // 标题直接用后端那句话（它已经带了具体次数），避免再写一遍"请求过于频繁"造成重复
+              message={message.error}
+              description={
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  限流按 60 秒滑动窗口统计，连续重试不会让窗口更快恢复；
+                  请稍等约 1 分钟再发送。
+                </Text>
+              }
+              style={{ marginBottom: 8 }}
+            />
+          ) : (
+            <Alert type="error" showIcon message={message.error} style={{ marginBottom: 8 }} />
+          )
         ) : null}
         {!isUser ? <AssistantHeader message={message} /> : null}
         {message.content ? (

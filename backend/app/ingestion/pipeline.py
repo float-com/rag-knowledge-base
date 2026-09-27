@@ -39,12 +39,20 @@
 都必须改用 Celery 的 .delay()，否则模块 import 会直接失败。
 """
 
-import asyncio
 from typing import Any
 from uuid import UUID
 
+# LangChain 的切片对象。
+# 【为什么要重命名成 LangChainDocument】
+# 本模块同时用到两个都叫 Document 的东西：
+#   · app.db.models.Document        —— 数据库里的"文档主表"ORM 实体
+#   · langchain_core.documents.Document —— 解析/切分产出的"文本切片"对象
+# 直接都叫 Document 会撞名，所以把后者显式改成 LangChainDocument。
+from langchain_core.documents import Document as LangChainDocument
+
 from app.core.logging import get_logger
 from app.db.models import (
+    Document,
     DocumentChunk,
     DocumentStatus,
 )
@@ -252,8 +260,11 @@ async def _run_ingest(document_id: UUID, task_id: UUID) -> None:
         #    也就是说：幂等性目前是【靠外部前提撑着的】，并不是这段代码自带的。
         #    这一点与 celery_app.py 里 task_acks_late=False 直接绑定 ——
         #    正因为任务不幂等，才不敢开"跑完再 ACK"（否则重投会写出两套切片）。
-        #    如果将来在这里补上"同一事务内先删旧切片、再写新切片"，
-        #    任务才算真正幂等，那时才该回去重新评估 task_acks_late。
+        #    📌 第 5 节复查：增量索引那条路径（_run_incremental / _run_full_rebuild）
+        #    已经做到了"先删后插、同一事务"，所以 reindex_document 任务是幂等的；
+        #    但【这一段（阶段 6）始终没改】，于是 ingest_document 仍然不幂等 ——
+        #    这正是 task_acks_late 必须继续维持 False 的原因。
+        #    哪天想让这里也变成"先删后插"，记得同时回 celery_app.py 更新那段结论。
         # 开启独立的数据库短事务会话，执行批量落盘
         async with AsyncSessionLocal() as session:
             chunk_repo = DocumentChunkRepository(session)
@@ -323,16 +334,222 @@ def _make_chunk(
 
 
 # ==============================================================================
-# 增量重建索引（占位）
+# 增量重建索引（第 5 节）
 # ==============================================================================
+# 【增量索引要解决什么问题】
+# 文档改了一小段，如果走全量重建，就得把整份文档重新解析、切分，并把【每一个切片】
+# 都重新算一遍 embedding —— 而 embedding 是按量计费的，一份十万字的文档
+# 只改了一个错别字，却要重新烧掉全部算力。
+#
+# 增量索引的思路：把 chunk_hash 当作每个切片的"身份证"。
+#   · 某个 hash 在【新切片集合】里、也在【旧集合】里 → 内容没变，embedding 直接复用
+#   · 只在新的里有 → 是新增内容，必须算 embedding
+#   · 只在旧的有   → 内容被删了，把这一行删掉
+# 于是需要算 embedding 的切片数，从"整篇的切片数"降到"真正变化的切片数"。
 async def _run_reindex(document_id: UUID, task_id: UUID) -> None:
-    """增量重建索引：按 chunk_hash 对齐，仅对变化 chunk 重新 embedding。
+    """增量重建：按 chunk_hash 对齐，仅对变化部分重新 embedding。
 
-    ⚠️ 本函数将在下面「5、增量索引」一节实现。
-    这里先留一个显式的占位，是为了让下面的 run_reindex_sync 有一个明确的落点，
-    而不是引用一个不存在的名字（那样报错会是一句很难懂的 NameError）。
+    与 _run_ingest 的区别：
+    - 命中的 chunk 不重新计算 embedding，仅更新 chunk_index / metadata
+    - 新增 chunk 才做 embedding；progress_total 也只统计新增数量
+    - 全删全插作为 hash 冲突场景的兜底
     """
-    raise NotImplementedError("增量索引将在下一节实现")
+    logger.info("reindex start: document_id=%s task_id=%s", document_id, task_id)
+    await _mark_task(task_id, running=True)
+
+    try:
+        # 阶段 1：查文档（独立短事务）—— 与 _run_ingest 完全一致
+        async with AsyncSessionLocal() as session:
+            document = await DocumentRepository(session).get_by_id(document_id)
+            if document is None:
+                logger.warning("document not found, skip reindex: %s", document_id)
+                await _mark_task_failed(task_id, "文档不存在")
+                return
+            object_key = document.cos_object_key
+            filename = document.name
+
+        # 阶段 2-3：下载 + 解析
+        #   ⚠️ 这里下载到的是【新版本】的内容 —— 本任务被投递之前，
+        #      DocumentService.reindex 已经把新文件传上 COS、
+        #      并把 doc.cos_object_key 换成新 key 了。
+        await _set_status(document_id, DocumentStatus.PARSING)
+        content = await get_file_service().download(object_key)
+        parsed = await parser.parse(filename, content)
+
+        # 阶段 4：切分
+        await _set_status(document_id, DocumentStatus.INDEXING)
+        new_chunks = splitter.split(parsed)
+        if not new_chunks:
+            raise ValueError("切分后没有任何 chunk，请检查文档内容")
+
+        # 阶段 5：拉出旧切片，准备按 chunk_hash 对齐
+        async with AsyncSessionLocal() as session:
+            old_chunks = await DocumentChunkRepository(
+                session
+            ).list_all_by_document(document_id)
+
+        if _has_duplicate_hash(new_chunks):
+            # 新切片集合内部就有重复 hash → 增量对齐的语义不成立
+            # （见 _has_duplicate_hash 的注释），退化为「全删全插」是最稳的兜底
+            logger.warning(
+                "reindex fallback to full rebuild due to duplicate chunk_hash: %s",
+                document_id,
+            )
+            await _run_full_rebuild(document_id, task_id, new_chunks)
+        else:
+            await _run_incremental(document_id, task_id, old_chunks, new_chunks)
+
+        # 阶段 6：内容已经真正重建完成 → 版本号 +1
+        #   ⚠️ 只有走到这里才 +1。失败路径【不】+1 ——
+        #   否则前端列表里会出现"版本号变了、内容却没变"的假象。
+        #   这也解释了版本号为什么不在 Service.reindex 里加：
+        #   那边只是"提交任务"，还没真正重建成功。
+        async with AsyncSessionLocal() as session:
+            doc = await DocumentRepository(session).get_by_id(document_id)
+            if doc is not None:
+                doc.version += 1
+            await session.commit()
+
+        # 阶段 7：状态收尾
+        await _set_status(document_id, DocumentStatus.READY, error_message=None)
+        await _mark_task_success(task_id)
+        logger.info("reindex done: document_id=%s", document_id)
+
+    except Exception as exc:
+        logger.exception("reindex failed: document_id=%s", document_id)
+        message = str(exc).strip() or exc.__class__.__name__
+        await _set_status(
+            document_id, DocumentStatus.FAILED, error_message=message[:500]
+        )
+        await _mark_task_failed(task_id, message)
+
+
+def _has_duplicate_hash(chunks: list[LangChainDocument]) -> bool:
+    """预检：同一批新切片内部是否存在重复的 chunk_hash。
+
+    【为什么必须先检这一下 —— 这是增量算法的前提条件】
+    对齐逻辑的核心是拿 chunk_hash 当唯一键：
+        old_by_hash = {c.chunk_hash: c for c in old_chunks}
+    如果【同一批新切片】里有两个切片 hash 相同（例如文档里有完全重复的段落，
+    或者极短的文档被切成了若干内容相同的小片），后果是：
+      · 新的 hash 集合是用 set 建的，重复值会被【静默去重】，
+        于是"本该插入 2 条"变成"只插入 1 条"，切片表数量对不上；
+      · 配对时"哪个新切片对应哪条旧记录"也出现歧义。
+    这种情况下增量对齐的语义已经不成立了，所以直接退化成"全删全插" ——
+    宁可多花一次 embedding 的钱，也不要写出一份数量对不上的切片表。
+    """
+    seen: set[str] = set()
+    for c in chunks:
+        h = c.metadata["chunk_hash"]
+        if h in seen:
+            return True
+        seen.add(h)
+    return False
+
+
+async def _run_incremental(
+    document_id: UUID,
+    task_id: UUID,
+    old_chunks: list[DocumentChunk],
+    new_chunks: list[LangChainDocument],
+) -> None:
+    """按 chunk_hash 对齐增删改。
+
+    【分类规则】（整个增量索引的核心，就三句话）
+      old 里有、new 里没有的 hash   →  DELETE    这段内容被删了
+      new 里有、old 里也有的 hash   →  UPDATE    内容没变，只更新位置与元数据
+      new 里有、old 里没有的 hash   →  INSERT    新增内容，需要算 embedding
+
+    【为什么"内容没变"也要 UPDATE】
+    常见场景：文档改了一小段，导致后面某段被挪到了别的章节、页码变了，
+    但那段的文字一字未改 —— 它的 hash 不变，所以不必重算 embedding，
+    可它的 chunk_index / page_no / section_path 变了。
+    这几个字段是检索结果回显"这段出自哪一页、哪一章"的依据，
+    不更新的话，用户点开引用会跳到错误的章节。所以只更新这些定位字段。
+    """
+    old_by_hash: dict[str, DocumentChunk] = {c.chunk_hash: c for c in old_chunks}
+    new_hashes: set[str] = {c.metadata["chunk_hash"] for c in new_chunks}
+
+    # ① 要删的：旧切片里 hash 已经不在新集合中的那些
+    to_delete_ids: list[UUID] = [
+        c.id for c in old_chunks if c.chunk_hash not in new_hashes
+    ]
+
+    # ② 把新切片分成"要插入"与"要更新"两堆
+    to_insert: list[LangChainDocument] = []
+    to_update: list[tuple[DocumentChunk, LangChainDocument]] = []
+    for nc in new_chunks:
+        h = nc.metadata["chunk_hash"]
+        existing = old_by_hash.get(h)
+        if existing is None:
+            to_insert.append(nc)
+        else:
+            to_update.append((existing, nc))
+
+    # ③ 进度分母只统计【真正需要 embedding 的新增切片】
+    #    ⚠️ 不是 len(new_chunks)。前端进度条上的"已完成 / 总数"反映的是
+    #    【embedding 的推进进度】，而不是"本次任务一共处理了多少切片"——
+    #    命中的切片只是改几个字段、几乎不耗时，把它们算进分母
+    #    会让进度条显得很慢，与真实耗时完全不成比例。
+    await _set_task_total(task_id, len(to_insert))
+    new_embeddings = await _embed_with_progress(
+        [c.page_content for c in to_insert], task_id
+    )
+
+    # ④ 三种操作放进【同一个事务】一次提交
+    #    删除、更新、插入必须原子：中途出错就整体回滚，
+    #    否则会留下"旧的删了、新的还没写进去"的空档 ——
+    #    那份文档会短暂地检索不到任何内容。
+    async with AsyncSessionLocal() as session:
+        chunk_repo = DocumentChunkRepository(session)
+        await chunk_repo.delete_by_ids(to_delete_ids)
+
+        # 更新命中切片的位置 / 段落元数据：内容（即 hash）未变，所以不动 embedding 列
+        for old, nc in to_update:
+            old.chunk_index = nc.metadata["chunk_index"]
+            old.page_no = nc.metadata.get("page_no")
+            old.section_path = nc.metadata.get("section_path")
+            old.extra_metadata = nc.metadata
+
+        await chunk_repo.bulk_add(
+            [
+                _make_chunk(document_id, c, vec)
+                for c, vec in zip(to_insert, new_embeddings, strict=True)
+            ]
+        )
+        await session.commit()
+
+
+async def _run_full_rebuild(
+    document_id: UUID,
+    task_id: UUID,
+    new_chunks: list[LangChainDocument],
+) -> None:
+    """hash 冲突场景的兜底：清空旧切片、全量 embedding 后写入。
+
+    【它与 _run_ingest 的写库阶段长得几乎一样，为什么还要单独一个函数】
+    因为两者的【语义】不同，将来会分头演化：
+      · _run_ingest        是"首次入库"，那时文档里本来就不该有切片；
+      · _run_full_rebuild  是"重建"，它【必须】显式 delete_by_document 清掉旧数据 ——
+        这一步正是它存在的理由，也是让 reindex 任务【幂等】的关键
+        （同一个任务跑第二遍不会写出两套切片）。
+    分开写之后，将来谁往这里加逻辑，都不会波及首次入库那条路径。
+    """
+    await _set_task_total(task_id, len(new_chunks))
+    embeddings = await _embed_with_progress(
+        [c.page_content for c in new_chunks], task_id
+    )
+
+    async with AsyncSessionLocal() as session:
+        chunk_repo = DocumentChunkRepository(session)
+        await chunk_repo.delete_by_document(document_id)
+        await chunk_repo.bulk_add(
+            [
+                _make_chunk(document_id, c, vec)
+                for c, vec in zip(new_chunks, embeddings, strict=True)
+            ]
+        )
+        await session.commit()
 
 
 # ==============================================================================

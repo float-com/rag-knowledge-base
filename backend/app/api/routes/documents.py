@@ -62,8 +62,9 @@ from app.api.schemas.documents import (
     DocumentPermissionTagsUpdate,
     DocumentRead,
     DocumentStatusValue,
+    IngestionTaskRead,
 )
-from app.db.models import DocumentStatus, User
+from app.db.models import Document, DocumentStatus, User
 from app.services.document_service import DocumentService
 from app.services.permission_service import compute_user_permission_tags, is_admin
 
@@ -99,6 +100,58 @@ def _viewer_tags(user: User) -> list[str] | None:
     （后者还得随新标签同步维护）。
     """
     return None if is_admin(user) else compute_user_permission_tags(user)
+
+
+async def _to_document_read(
+    document: Document,
+    service: DocumentService,
+) -> DocumentRead:
+    """把 Document ORM 组装成 DocumentRead，并【附带最近一次入库任务】。
+
+    :param document: 已经查出来的 Document 实体
+    :param service: 当前请求的 DocumentService（借它去查 latest_task）
+    :return: 可直接作为响应体的 DocumentRead
+
+    【为什么要绕开 DocumentRead.model_validate(document) 而手工摊平成字典】
+    因为 latest_task 不是 documents 表上的列，ORM 实体上根本没有这个属性，
+    直接 model_validate(orm) 拿不到它。所以这里先把 ORM 的列摊平成一个字典，
+    再把 latest_task 塞进去一起交给 Pydantic 校验。
+
+    【用 document.__table__.columns 摊平，会不会把物理存储字段泄露出去】
+    不会。这个字典里确实带上了 cos_bucket / cos_object_key / cos_region 等敏感列，
+    但 DocumentRead 并没有声明它们，而 Pydantic v2 的默认行为是【忽略】多出来的键
+    （model_config 的 extra 默认为 'ignore'）。
+    也就是说：响应体里出现什么字段，仍然只由 DocumentRead 这个白名单决定 ——
+    脱敏的边界没有被这次改动打开。
+    （反过来提醒一句：如果哪天给 DocumentRead 设了 extra='forbid'，这里就必须改成显式取字段。）
+
+    【⚠️ 列表页的 N+1 问题】
+    list_documents 会对本页【每一条】文档各调用一次本函数，于是：
+        本页 20 篇文档  →  1 次文档列表查询 + 20 次 latest_task 查询 = 21 次 SQL
+    而前端文档列表是【每 3 秒轮询一次】的。
+
+    单就本项目的数据量（十几篇）完全无感；但文档量上千之后，这里会成为主要瓶颈。
+    真要优化，PostgreSQL 的 DISTINCT ON 可以一次取回全部文档的最新任务：
+        SELECT DISTINCT ON (document_id) *
+        FROM ingestion_tasks
+        WHERE document_id = ANY(:ids)
+        ORDER BY document_id, created_at DESC
+    它恰好能走 ix_ingestion_tasks_document_created 这个复合索引 ——
+    索引的列顺序 (document_id, created_at DESC) 与这条 SQL 的 WHERE + ORDER BY 完全对齐。
+    （顺带回答一个自然疑问：模型里那个复合索引现在终于有第二个使用者了，
+      第一个是仓储层的 get_latest_by_document。）
+
+    本节先按教程保留"逐条查询"的写法，优化留到真的需要时再做。
+    """
+    latest = await service.get_latest_task(document.id)
+    return DocumentRead.model_validate(
+        {
+            **{c.name: getattr(document, c.name) for c in document.__table__.columns},
+            "latest_task": IngestionTaskRead.model_validate(latest)
+            if latest is not None
+            else None,
+        }
+    )
 
 # =============================================================================
 # 阶段 1:文档基础操作 API（增、查、删、重试）
@@ -181,10 +234,10 @@ async def upload_document(
         permission_tags=tags,
     )
 
-    # 语法（Pydantic 序列化）：DocumentRead.model_validate(document)
-    #   特性：基于 from_attributes=True 将 SQLAlchemy ORM 实体转换为安全的出参 DTO
-    #   通俗来讲：把存好的数据装进脱敏包装盒里交给前端。
-    return DocumentRead.model_validate(document)
+    # 语法（Pydantic 序列化）：await _to_document_read(document, service)
+    #   特性：把 Document ORM 转成脱敏 DTO，并【附带最近一次入库任务】
+    #   通俗来讲：把存好的数据装进脱敏包装盒，同时塞进一张"这次入库跑到哪了"的卡片。
+    return await _to_document_read(document, service)
 
 
 # =============================================================================
@@ -226,11 +279,12 @@ async def list_documents(
         permission_tags=_viewer_tags(user),
     )
 
-    # 语法（列表推导式 DTO 批量映射）：[DocumentRead.model_validate(d) for d in items]
-    #   特性：逐条执行 DTO 转换，并聚合总条数与分页信息统一返回
-    #   通俗来讲：把查出来的每一篇文档都包装成标准模型，连同总数装入分页箱子发给前端。
+    # 语法（列表推导式 + await 批量映射）：[await _to_document_read(d, service) for d in items]
+    #   特性：逐条执行 DTO 转换（每条都附带 latest_task），并聚合总条数与分页信息统一返回
+    #   通俗来讲：把查出来的每一篇文档都包装成标准模型、都贴上进度卡片，连同总数装入分页箱子发给前端。
+    #   ⚠️ 这里是 N+1 查询：本页 N 篇文档 → N 次 latest_task 查询。详见 _to_document_read 的说明。
     return DocumentListResponse(
-        items=[DocumentRead.model_validate(d) for d in items],
+        items=[await _to_document_read(d, service) for d in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -265,7 +319,7 @@ async def get_document(
     #   通俗来讲：拿着文档 ID 去库里找详情，找不到或你没权限看，service 层都报 404。
     document = await service.get(document_id, permission_tags=_viewer_tags(user))
 
-    return DocumentRead.model_validate(document)
+    return await _to_document_read(document, service)
 
 
 # =============================================================================
@@ -338,7 +392,47 @@ async def retry_document(
     #   通俗来讲：让总管打扫干净上次失败留下的烂摊子，然后把文档重新塞回处理流水线。
     document = await service.retry(document_id)
 
-    return DocumentRead.model_validate(document)
+    return await _to_document_read(document, service)
+
+
+# =============================================================================
+# 5.5 文档重新索引接口（上传新版本 → 触发按 chunk_hash 对齐的增量重建）
+# =============================================================================
+@router.post(
+    "/{document_id}/reindex",
+    response_model=DocumentRead,
+    operation_id="reindexDocument",
+)
+async def reindex_document(
+    _: CurrentAdmin,
+    # 【第 12 期】限流：它和 upload 一样属于"重"入口 ——
+    #   要往 COS 传一份新文件、还可能触发上百次 embedding 调用。
+    _rate_limit: RateLimited,
+    document_id: UUID,
+    session: DbSession,
+    file: UploadFile = File(
+        ..., description="新版本文件（MIME 必须与原文档一致）"
+    ),
+) -> DocumentRead:
+    """上传新版本文件，触发按 chunk_hash 对齐的增量重建。
+
+    【它和 POST /documents 的区别（两个入口别混淆）】
+    - POST /documents                ：上传一份【新文档】，会【新建】一条 Document 记录；
+    - POST /documents/{id}/reindex   ：给【已有文档】换内容，Document 记录不变、只改字段，
+      重建成功后 version +1，前端列表里显示成 v2 / v3。
+
+    【为什么必须走 multipart 而不是 JSON】
+    它和 upload_document 一样要承载真实的文件字节流。也正因如此，
+    前端契约里它是 `BodyReindexDocument = { file: Blob | File }`，
+    而不是一个 JSON 请求体。
+
+    【为什么挂限流 + 要求管理员】
+    同 upload_document：要落 COS、要投递 Celery 任务、可能烧掉上百次 embedding，
+    属于"未登录也能让别人替我烧算力"的那类入口。
+    """
+    service = DocumentService(session)
+    document = await service.reindex(document_id, file)
+    return await _to_document_read(document, service)
 
 
 # =============================================================================
@@ -603,5 +697,5 @@ async def update_document_permission_tags(
     document = await service.update_permission_tags(
         document_id, payload.permission_tags
     )
-    return DocumentRead.model_validate(document)
+    return await _to_document_read(document, service)
 

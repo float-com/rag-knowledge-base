@@ -36,6 +36,7 @@ import {
   getStatusLabel,
   isTerminalStatus,
 } from '@/utils/documentStatus'
+import { toReadableError } from '@/utils/errors'
 import { useAuthStore } from '@/stores/authStore'
 
 const { Title, Paragraph } = Typography
@@ -121,12 +122,15 @@ export function DocumentsPage() {
       // 失败时保持弹窗打开，把 Alert 里的失败原因留在屏幕上，而不是一闪而过。
       setUploadOpen(false)
     },
-    onError: (error: unknown) => {
+    onError: async (error: unknown) => {
       // 直传链路有三种失败：init 接口报错、浏览器直传 COS 失败（含 CORS 预检被拒）、complete 接口报错。
       // 原始错误来自原生 fetch，不走 client.ts 的响应拦截器，必须在这里兜住并写进 uploadError，
       // 由弹窗内的 Alert 展示，否则用户只会看到"点了没反应"。
-      const detail =
-        error instanceof Error && error.message ? error.message : '未知错误'
+      //
+      // 【为什么用 toReadableError 而不是自己判断 instanceof Error】
+      // 统一走那一个入口，将来这条链路改成别的客户端、
+      // 或者某人手滑把一整串错误体 JSON 塞进 message，界面都不会漏出原文。
+      const { message: detail } = await toReadableError(error)
       setUploadError(detail)
     },
   })

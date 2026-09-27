@@ -60,6 +60,7 @@ import {
   isMarkdownMime,
   isPdfMime,
 } from '@/utils/documentFile'
+import { toReadableError } from '@/utils/errors'
 import { useAuthStore } from '@/stores/authStore'
 
 const { Title, Text, Paragraph } = Typography
@@ -92,14 +93,20 @@ function MarkdownPreview({ url }: { url: string }) {
         : undefined,
     })
       .then(async (r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        // 非 2xx 时抛 Response 本身，而不是自己拼状态码文案：
+        // body 里是后端的 {code, message}，交给 toReadableError 才能显示
+        // "没有权限查看该文档" 这类中文原因，而不是 "404 Not Found" 这种英文状态行。
+        if (!r.ok) throw r
         return r.text()
       })
       .then((text) => {
         if (!cancelled) setContent(text)
       })
-      .catch((e: Error) => {
-        if (!cancelled) setError(e.message)
+      .catch((e: unknown) => {
+        // toReadableError 是异步的（要读 Response 的 body），所以这里不能再同步 setError
+        void toReadableError(e).then(({ message }) => {
+          if (!cancelled) setError(message)
+        })
       })
     return () => {
       cancelled = true

@@ -5,11 +5,16 @@
  * - 原生 EventSource 不支持 POST + JSON body，而我们的 SSE 入口是 POST
  * - 需要手动取消（用户切换页面 / 点"中止"）
  * - 需要带 Authorization header；EventSource 也不支持自定义 header
+ *
+ * 【错误处理约定】
+ * 非 2xx 时不要抛响应体原文：后端错误体是 {code, message}，
+ * 原文抛出去会让界面显示一串 JSON。统一抛 ApiStreamError（message 给人看、code 给程序判断）。
  */
 
 import { fetchEventSource } from '@microsoft/fetch-event-source'
 import type { AgentStep, CitationRead, QueryRouteRead } from '@/client/types.gen'
 import { getAuthToken, useAuthStore } from '@/stores/authStore'
+import { parseApiErrorText } from '@/utils/errors'
 
 export interface ChatStartEvent {
   type: 'start'
@@ -74,7 +79,27 @@ interface StreamChatParams {
   onEvent: (event: ChatStreamEvent) => void
 }
 
-class FatalSseError extends Error {}
+/**
+ * SSE 请求"流还没开始"就失败时抛出的错误。
+ *
+ * 【为什么要专门一个类、还要带 code】
+ * 后端的错误体是 `{code, message}`。界面层需要两样东西：
+ *   · message —— 直接展示给人看（绝不能再把整串 JSON 显示出去）
+ *   · code    —— 用来区分"限流"这类可预期的状况，换个更合适的提示样式
+ * 例如 code === 'rate_limited' 时，聊天页会渲染成"警告"而不是"错误"，
+ * 并补一句"连续重试不会更快恢复"。
+ *
+ * 导出它是为了让上层可以 `instanceof ApiStreamError` 做判断。
+ */
+export class ApiStreamError extends Error {
+  readonly code: string
+
+  constructor(message: string, code = '') {
+    super(message)
+    this.name = 'ApiStreamError'
+    this.code = code
+  }
+}
 
 /** 发起 SSE 问答请求；resolve 时代表流已正常结束。 */
 export async function streamChat({
@@ -105,13 +130,21 @@ export async function streamChat({
             const back = window.location.pathname + window.location.search
             window.location.replace(`/login?back=${encodeURIComponent(back)}`)
           }
-          throw new FatalSseError('请先登录')
+          throw new ApiStreamError('请先登录', 'unauthorized')
         }
         if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
           return
         }
+        // ⚠️ 绝不能把响应体原文直接当消息抛出去。
+        //    后端错误体是 {"code":"...","message":"..."}，
+        //    原样抛出会让聊天气泡里显示一整串 JSON（本项目真实出现过这个现象）。
+        //    正确做法是把 message 取出来，把 code 带在错误对象上给上层用。
         const text = await response.text().catch(() => '')
-        throw new FatalSseError(text || `HTTP ${response.status}`)
+        const parsed = parseApiErrorText(text)
+        throw new ApiStreamError(
+          parsed?.message || text.trim() || `请求失败（HTTP ${response.status}）`,
+          parsed?.code ?? '',
+        )
       },
       onmessage(msg) {
         if (!msg.event) return

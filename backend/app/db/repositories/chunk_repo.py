@@ -96,6 +96,46 @@ class DocumentChunkRepository:
         # 语法（SQLAlchemy 异步执行）：发送 SQL 执行物理删除
         await self.session.execute(stmt)
 
+    async def delete_by_ids(self, chunk_ids: Sequence[UUID]) -> None:
+        """按主键批量删除切片（增量索引「删除失效 chunks」用）。
+
+        【参数说明】：
+        - chunk_ids (Sequence[UUID]): 待删除的切片主键集合
+
+        【为什么先判空】
+        `IN ()` 是非法 SQL。增量索引里最常见的场景恰恰是"没有任何切片要删"
+        （只改了内容不改段落结构时），若每次都在这里拼一个空 IN，
+        要么报语法错，要么得让调用方每次都自己判空 —— 把判断收在这里更省事。
+        """
+        if not chunk_ids:
+            return
+        stmt = delete(DocumentChunk).where(DocumentChunk.id.in_(list(chunk_ids)))
+        await self.session.execute(stmt)
+
+    async def list_all_by_document(self, document_id: UUID) -> list[DocumentChunk]:
+        """拉取一篇文档的全部切片（增量索引做 chunk_hash 对齐用）。
+
+        【为什么可以一次性全加载进内存】
+        单文档的切片数量有天然上限 —— splitter 控制每片约 600 字，
+        即便是 50MB 的超大文档也只有几百到几千条切片，量级可控。
+        增量索引需要拿新旧切片的 chunk_hash 逐条配对比较，
+        全部加载进内存用字典查找是这里最直接的写法。
+
+        【如果将来要处理真正意义上的超大文档】
+        可以改成游标或分页拉取，但那会把"哈希对齐"变成多趟扫描 ——
+        在切片数量达到那个量级之前不值得。
+
+        【按 chunk_index 升序】
+        一来让 `old_chunks` 的顺序与文档自然顺序一致（便于调试时肉眼比对），
+        二来对齐逻辑本身不依赖顺序，排序只是让日志与内存快照更可读。
+        """
+        stmt = (
+            select(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_paginated_by_document(
         self,
         document_id: UUID,

@@ -51,6 +51,50 @@ DocumentStatusValue = Literal[
 
 
 # =============================================================================
+# 1.5 入库任务字面量联合类型与快照模型（第 12 期 / 增量索引一节新增）
+# =============================================================================
+# 与 app/db/models.py 的 IngestionTaskType / IngestionTaskStatus 严格保持值同步。
+# 【为什么用 Literal 而不是 str】
+# 前端页面里有 `TASK_TYPE_LABEL[task.task_type]` 这样的映射表，
+# 用 Literal 生成精确的字面量联合类型之后，前端的 switch / 映射分支
+# 能在【编译期】保证穷尽 —— 后端将来新增一个状态，前端立刻编译报错，
+# 而不是等到运行时界面上显示出一个空白标签。
+IngestionTaskTypeValue = Literal["ingest", "reindex"]
+IngestionTaskStatusValue = Literal["pending", "running", "success", "failed"]
+
+
+class IngestionTaskRead(BaseModel):
+    """单条入库任务快照（详情页「最近一次任务」卡片用）。
+
+    【它解决的是什么问题】
+    前端详情页要展示"这次入库跑到哪了、成功还是失败、进度多少"。
+    最省事的做法是让前端拿着 document_id 再发一次请求去查任务；
+    但那是多一次往返、还多一个要维护的接口。
+    直接把最近一条任务挂在 DocumentRead 上，前端轮询文档时顺带就拿到了。
+
+    【为什么只给"最近一次"而不是全部任务流水】
+    界面上只需要展示当下这一次的进度；完整流水属于排查用途，
+    真要看得走专门的列表接口，不该塞进详情响应里把响应体撑大。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    task_type: IngestionTaskTypeValue
+    status: IngestionTaskStatusValue
+    # 预留字段：目前不自动重试，前端卡片也不展示，但契约里保留它
+    retry_count: int
+    error_message: str | None = None
+    # 进度：progress_total 是分母（切分后的总数），progress_done 是分子。
+    # ⚠️ progress_total 可能为 0（pending 阶段还没定分母），前端算百分比前必须先判它 > 0。
+    progress_total: int
+    progress_done: int
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+
+
+# =============================================================================
 # 2. 单文档详情读取响应模型
 # =============================================================================
 class DocumentRead(BaseModel):
@@ -103,6 +147,19 @@ class DocumentRead(BaseModel):
     #   特性：可选异常说明；仅当 status 为 failed 时记录底层解析或向量化的具体堆栈摘要，其余状态均为 None
     #   通俗来讲：只有在文档处理失败时才记录报错原因，平时正常就留空。
     error_message: str | None = None
+
+    # 【第 12 期新增】文档内容版本号：
+    # - 首次入库建出来就是 1；此后每次 reindex【成功】才 +1（失败不变）；
+    # - 列表页与详情页都展示它（形如 v2），用来标识"这份文档的内容已经换过一版"。
+    # 通俗来讲：这份文档被重新上传过几次。
+    version: int = 1
+
+    # 【第 12 期新增】最近一次入库任务快照：
+    # - 由路由层的 _to_document_read 从 ingestion_tasks 里查出来挂上去；
+    # - 为 None 表示这份文档还没有过任何任务流水（理论上不该出现，
+    #   因为三条入库入口都会在建文档的同时落一条台账行）。
+    # 通俗来讲：附带一张"这次入库跑到哪了"的卡片，前端不必再发一次请求。
+    latest_task: IngestionTaskRead | None = None
 
     # 【第 11 期新增】数据权限标签：
     # - 空数组视为"公开"（任何登录用户都可见）；

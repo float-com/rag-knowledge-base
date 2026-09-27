@@ -84,7 +84,17 @@ class IngestionTaskRepository:
             .limit(1)
         )
         # 步骤 2：执行查询并用 scalar_one_or_none 提取对象（0 条返回 None，1 条返回解包后的对象）
-        return await self.session.execute(stmt).scalar_one_or_none()
+        #
+        # ⚠️ 这里【必须分两步写】：先把 execute 的结果 await 出来，再调用 .scalar_one_or_none()。
+        #    写成一行 `await self.session.execute(stmt).scalar_one_or_none()` 是【错的】：
+        #    Python 里 `.` 的优先级高于 `await`，那一行实际等价于
+        #        await (self.session.execute(stmt).scalar_one_or_none())
+        #    而 AsyncSession.execute() 是协程函数，返回的是一个【协程对象】，
+        #    协程上根本没有 scalar_one_or_none 这个方法 → AttributeError。
+        #    （这个坑在教程原文里就存在。它在第 12 期没被发现，唯一的原因是当时
+        #      【没有任何调用方】—— 本方法到「增量索引」一节才第一次被真正调用。）
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def mark_running(self, task_id: UUID) -> None:
         """标记任务开始执行（状态流转为 RUNNING）。
