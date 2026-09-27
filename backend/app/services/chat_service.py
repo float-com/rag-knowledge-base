@@ -52,11 +52,13 @@ from app.db.models import AnswerCitation, Conversation, Message, User
 from app.db.repositories.citation_repo import AnswerCitationRepository
 from app.db.repositories.conversation_repo import ConversationRepository
 from app.db.session import AsyncSessionLocal
+from app.ingestion.embedder import get_embeddings
 from app.llm.answer_verifier import VerifyResult, get_answer_verifier
 from app.llm.prompts import REFUSAL_ANSWER
 from app.retrieval.vector_retriever import RetrievedChunk
 from app.core.permissions import WILDCARD_PERMISSION_TAG
 from app.services.permission_service import compute_user_permission_tags
+from app.services.semantic_cache_service import CachedAnswer, get_semantic_cache
 from app.workflows.graph import get_rag_graph
 from app.workflows.nodes import load_context, stream_generate
 from app.workflows.rag_state import RAGState
@@ -493,11 +495,30 @@ class ChatService:
                     "trace_id": trace_id,
                 }
 
-                # 3. 装载上下文（取历史消息）、查询标准化与策略路由。
+                # 3. 装载上下文（取历史消息）。
                 #    注意：这一步必须早于用户提问落库，否则 load_context 会把本轮提问也当成历史读回来。
                 state.update(await load_context(state, session))
 
-                # 3.1 图执行：加载上下文之后、检索之前。
+                # 3.1 【第 12 期】查语义缓存：放在 load_context 之后、图执行之前。
+                #     【为什么必须在这个位置】
+                #       ① 缓存命中要走 _persist_user_message 落库，而落库需要 load_context
+                #          先把聊天历史读出来（否则本轮提问会被当成历史）；
+                #       ② 必须在 ainvoke 【之前】——图一跑，LLM 的钱就已经花了，缓存也就没意义了。
+                #     【为什么把 embedding 一起带出来】
+                #       查缓存本来就要先向量化；这份向量在下面的 save 阶段可以复用，
+                #       否则"查一次 + 存一次"要算两遍 embedding。
+                cache_hit, query_embedding = await self._try_cache_lookup(
+                    question, permissions
+                )
+                if cache_hit is not None:
+                    # ★ 命中：完全跳过整张图与 LLM，但【落库与事件一件都不能少】
+                    async for event in self._stream_cache_hit(
+                        state, session, cache_hit, trace_id
+                    ):
+                        yield event
+                    return
+
+                # 3.2 图执行：检索之前。
                 #     按最初设计，load_context 与 stream_generate 仍由 service 直接调用 ——
                 #     前者需要 AsyncSession（唯一带 DB IO 的节点），后者要逐 token yield 给 SSE；
                 #     两者都不适合放进图。图内只负责
@@ -627,6 +648,42 @@ class ChatService:
                 await self._persist_assistant_message(
                     state, session, verify_result=verify_result
                 )
+
+                # 11.1 【第 12 期】写回缓存：只写"非拒答 且 校验通过"的答案。
+                #     【为什么必须在这两个条件之后】
+                #       拒答意味着"知识库里没有依据"，把它缓存下来只会让下次问到同样问题时
+                #       继续拒答 —— 而用户可能刚刚上传了能回答这个问题的文档。
+                #       校验失败（verify_result.verified=False）更严重：那段答案已经被判定为
+                #       "缺乏引用支撑"，是本系统自己都不信的内容，缓存它等于把不可信答案固化。
+                #     【query_embedding 为什么能直接复用】
+                #       它在 3.1 查缓存时已经算过；这里若再算一次，等于同一句话算两遍 embedding。
+                #     【为什么要求 not state.get("refused")】
+                #       校验失败会把 refused 置 True，所以这一个条件同时覆盖了
+                #       "原本就拒答"与"校验后被替换成拒答"两种情况。
+
+                # === 步骤 1：前置准入校验（三项全满足才写入，宁缺毋滥）===
+                if (
+                        # 条件 1：全局配置开关开启（若为 False 则主链路完全跳过缓存写操作）
+                        settings.semantic_cache_enabled
+                        # 条件 2：答案必须未被拒答（拦截原生的"无相关知识"，以及因幻觉/无支撑被校验逻辑置为 True 的垃圾答案）
+                        and not state.get("refused")
+                        # 条件 3：向量必须有效（复用 3.1 查缓存时算好的结果，不重复花钱重复向量化）
+                        and query_embedding is not None
+                ):
+                    # === 步骤 2：获取全局单例并执行异步写入 ===
+                    # get_semantic_cache() 获取唯一的服务实例，避免每个请求重复创建 Redis 连接池
+                    await get_semantic_cache().save(
+                        # 用户的原始提问文本，存入 Redis 便于排查"到底是哪句话命中了缓存"
+                        question=question,
+                        # 复用当前问题的向量，供下次近邻检索做相似度比对
+                        query_embedding=query_embedding,
+                        # 大模型生成的最终文本回答（已被前置校验确认为可信内容）
+                        answer=state["answer"],
+                        # 本次回答关联的结构化引用切片，原样存入 metadata 供命中时回显
+                        citations=citations_payload,
+                        # 当前用户的权限列表，方法内会将其算成 SHA-256 Tag 做严格权限隔离
+                        permission_scope=permissions,
+                    )
 
                 # 12. 收尾事件：下发 assistant_message_id 与拒答标志，前端据此结束流式状态并回填正式消息
                 yield {
@@ -989,6 +1046,12 @@ class ChatService:
             #   【为什么不在这里把 URL 一并算好】拼接规则属于表现层关切，
             #   放在 API 模型层能在每次响应时反映最新配置。
             "trace_id": state.get("trace_id"),
+            # 【第 12 期】正常路径显式写 cache_hit=False，让这个键在【所有】assistant
+            #   消息上都存在，而非只在缓存命中的消息上出现。两个好处：
+            #     ① 前端读 m.cache_hit 时不必区分"没有这个键"与"值是 false"；
+            #     ② 历史数据里第 12 期之前的老消息读出来是 None（字段缺失），
+            #        与"明确没命中"能区分开 —— 需要时可用于统计缓存上线后的命中率。
+            "cache_hit": False,
         }
         if verify_result is not None:
             # verify_result 复用 SSE 的载荷格式，但 metadata【不需要】replacement_answer：
@@ -1034,4 +1097,314 @@ class ChatService:
 
         # 单次提交：助手消息 + 引用一起落盘，或一起回滚
         await session.commit()
+        state["assistant_message_id"] = assistant_msg.id
+
+    # =========================================================================
+    # 内部方法：语义缓存（第 12 期）
+    # =========================================================================
+
+    async def _try_cache_lookup(
+            self,
+            question: str,
+            permissions: list[str],
+    ) -> tuple[CachedAnswer | None, list[float] | None]:
+        """查语义缓存：结合问题语义向量与权限范围检索 Redis 缓存。
+
+        :param question: 用户当前的原始提问文本
+        :param permissions: 当前用户的有效权限列表（用于构造权限隔离 Tag）
+        :return: (cached_answer, query_embedding) 二元组
+                - cached_answer: 命中且满足相似度阈值时返回 CachedAnswer 快照，否则返回 None；
+                - query_embedding: 本次问题计算出的向量（float 列表）；
+                ★ 设计考量：无论是否命中缓存，算好的向量均会向后传递，供后续 save 阶段直接复用，
+                    避免同一请求内对同一问题产生两次 Embedding 开销。
+
+        【三种短路与降级情形（绝不阻断问答）——注意第 3 种是唯一带回向量的】
+        1. 配置短路 → 返回 (None, None)：全局缓存开关关闭时直接提前返回，连向量模型都不调。
+        2. 旁路容错 → 返回 (None, None)：调用向量模型网络波动 / 超时 / 额度耗尽，静默降级。
+        3. 未命中或无权限 → 返回 (None, embedding)：★ 与前两种的【关键差异】——
+           embedding 此时已经算出来了，必须带回去给 save 阶段复用，
+           否则同一句话要算两遍向量（多花钱、多耗时）。
+        主链路统一对待上述三种：无可用缓存即无缝降级执行完整 RAG 链路。
+        """
+        # 步骤 1：检查全局配置开关
+        # 若缓存功能未开启，直接返回空元组提前短路，既不查 Redis 也不浪费算力去调用 Embedding 模型
+        if not settings.semantic_cache_enabled:
+            return None, None
+
+        # 步骤 2：对当前提问生成向量（带异常兜底）
+        try:
+            # 异步调用向量模型将问题文本转为 float 列表；向量算好后会在返回时向后传递，避免后续写缓存时重复计算
+            embedding = await get_embeddings().aembed_query(question)
+        except Exception:
+            # 旁路容错策略：模型接口超时、网络波动或额度用尽时仅打日志，不阻断问答主流程，降级走无缓存模式
+            logger.exception("semantic cache embedding failed, skip lookup")
+            return None, None
+
+        # 步骤 3：检索向量索引与权限比对
+        # 调用单例服务的 lookup 方法，基于余弦相似度 + SHA-256 权限 Tag 进行联合匹配
+        cached = await get_semantic_cache().lookup(embedding, permissions)
+
+        # 步骤 4：打包返回结果
+        # 返回二元组：cached（命中对象或 None）供主链路判断是否直接返回，embedding 留给后续 save 阶段直接复用
+        return cached, embedding
+
+    @staticmethod
+    def _safe_uuid(raw: str | None) -> UUID | None:
+        """把缓存里的字符串安全转换为 UUID 对象。
+
+        :param raw: 待转换的值（可能为 None、空字符串，或从 Redis JSON 反序列化出的字符串）
+        :return: 成功返回 Python 内置的 UUID 实例；若为空或格式非法则返回 None
+
+        【为什么必须转回 UUID】
+        缓存存储在 Redis 中，所有数据经过 JSON 序列化后均退化成了普通字符串（str）。
+        而在后续将回答落库写入 PostgreSQL 时，数据表字段声明为原生 UUID 类型，
+        SQLAlchemy / 数据库驱动要求写入的对象必须是标准的 UUID 实例，否则会引发类型不匹配报错。
+
+        【容错设计：静默返回 None 的业务考量】
+        缓存数据本质上是“历史快照”。如果底层数据格式损坏、遭到非法篡改或字段缺失，
+        最差的结果也只是“前端展示该引用的关联跳转不可用”，绝不能因为单条引用 ID 解析失败，
+        而抛出未捕获异常导致用户的整个问答会话落库事务回滚中断。
+        """
+        # ==========================================
+        # 步骤 1：空值过滤与快速短路
+        # ==========================================
+        # 拦截 None、空字符串 "" 等假值输入，提前结束，避免触发无意义的异常分支
+        if not raw:
+            return None
+
+        # ==========================================
+        # 步骤 2：安全构造与异常拦截
+        # ==========================================
+        try:
+            # 显式转为 str 确保入参类型符合要求，构造并返回标准 UUID 对象
+            return UUID(str(raw))
+        except (TypeError, ValueError):
+            # 捕获格式错误（如非法字符、长度不足 32 位等）与类型异常，
+            # 遵循降级策略直接返回 None，确保外层主链路平稳运行
+            return None
+
+    async def _stream_cache_hit(
+            self,
+            state: RAGState,
+            session: AsyncSession,
+            cached: CachedAnswer,
+            trace_id: str | None,
+    ) -> AsyncIterator[dict]:
+        """缓存命中路径：跳过整张图与 LLM，但**事件与落库一件都不能少**。
+
+        :param state: 当前会话的上下文状态机字典
+        :param session: 数据库异步会话（用于持久化用户提问与助手回答）
+        :param cached: 从 Redis 命中并反序列化出来的缓存快照对象
+        :param trace_id: 链路追踪 ID（传给前端用于排查问题，保持监控一致性）
+        :return: 异步生成器，产出符合前端 SSE 规范的事件字典流
+
+        【为什么不能"直接把缓存的答案 return 出去"】
+        那样虽然前端也能显示回答，但会丢掉四样东西（对应第 12 期的四条硬要求）：
+            ① 用户提问不落库 → 会话历史里"用户问了什么"缺失；
+            ② citations 事件不发 → 前端引用来源列表空白；
+            ③ assistant 消息不落库 → 刷新页面后这条回答凭空消失；
+            ④ cache_hit 标记不写 → 前端无法显示「缓存命中」，也失去统计依据。
+
+        【事件协议与常规路径保持一致】
+        message_start → citations → token → message_end
+        刻意【不发】query_route / agent_steps / verify_result：
+          - query_route / agent_steps：缓存命中压根没走路由与检索，发出去是伪造轨迹；
+          - verify_result：命中的答案在写入缓存前已经校验通过（见 save 的三个前提条件），
+            再校验一次毫无意义，还会白花一次模型调用。
+        前端对这几个事件的缺失已有处理（面板不渲染），因此少发不会破坏契约。
+        """
+        # ==========================================
+        # 步骤 1：持久化用户提问（写入会话记录）
+        # ==========================================
+        # 用户本轮真实的提问必须写入 PostgreSQL，若为首次提问还会触发根据问题更新会话标题；
+        # 此步骤会生成并向 state 中写入 state["user_message_id"]
+        await self._persist_user_message(state, session)
+
+        # ==========================================
+        # 步骤 1.1：回填缓存答案至状态机（★ 严防踩坑点）
+        # ==========================================
+        # 【为什么这一行绝对不能少】：
+        # 后续的持久化逻辑 `_persist_cached_assistant_message` 统一约定从 `state["answer"]` 中取值。
+        # 缓存命中时由于绕过了 LangGraph/流式生成图，如果不显式把 cached.answer 回写进来，
+        # 后续落库时会直接抛出 `KeyError: 'answer'`；
+        # 此时前端已经收到了流式答案，但后端因报错导致事务回滚，表现为“页面看着有，一刷新就消失”。
+        state["answer"] = cached.answer
+
+        # ==========================================
+        # 步骤 2：下发首屏事件（message_start）
+        # ==========================================
+        # 通知前端流式输出开始，带上刚才落库生成的 user_message_id 供前端绑定消息气泡；
+        # 显式传递 cache_hit=True，让前端能够在气泡 UI 上点亮「缓存命中」标记
+        yield {
+            "event": "message_start",
+            "data": {
+                "user_message_id": str(state["user_message_id"]),
+                "trace_id": trace_id,
+                "trace_url": build_trace_url(trace_id),
+                "cache_hit": True,
+            },
+        }
+
+        # ==========================================
+        # 步骤 3：下发引用来源事件（citations）
+        # ==========================================
+        # 将缓存快照里保存的切片信息（写入时已格式化）直接下发，点亮前端底部的引用卡片
+        yield {
+            "event": "citations",
+            "data": {"citations": cached.citations},
+        }
+
+        # ==========================================
+        # 步骤 4：整段下发回答内容（token）
+        # ==========================================
+        # 【设计抉择：为什么不人为延时逐字输出】：
+        # 缓存的核心收益是“快”（响应从几秒压缩至几十毫秒），人为模拟打字动画反而消除了这一核心优势；
+        # 一次性将完整的 delta 发给前端，前端流式组件能直接处理大段 delta 并完成瞬间渲染
+        yield {"event": "token", "data": {"delta": cached.answer}}
+
+        # ==========================================
+        # 步骤 5：异步落库助手回答（持久化到 DB）
+        # ==========================================
+        # 将助手的完整回答和引用元数据写入 DB，并在 metadata 中标明 cache_hit=True；
+        # 执行完毕后会将新生成的 assistant_message_id 注入到 state 中
+        await self._persist_cached_assistant_message(
+            state, session, citations=cached.citations
+        )
+
+        # ==========================================
+        # 步骤 6：下发结束收尾事件（message_end）
+        # ==========================================
+        # 与常规 LLM 链路返回统一契约：带上生成的 message_id，且 refused 固定为 False
+        # （因为当初只有 non-refused 的内容才会被存进缓存）
+        yield {
+            "event": "message_end",
+            "data": {
+                "message_id": str(state["assistant_message_id"]),
+                # 缓存库中的数据在写入前均严格经过了校验，因此此处确认为未拒答
+                "refused": False,
+            },
+        }
+
+    async def _persist_cached_assistant_message(
+            self,
+            state: RAGState,
+            session: AsyncSession,
+            *,
+            citations: list[dict],
+    ) -> None:
+        """缓存命中路径下落库 assistant 消息与其引用。
+
+        与 `_persist_assistant_message` 的差异只有一处：
+        **metadata 里写 `cache_hit=True`** —— 刷新历史时前端仍能看到「缓存命中」标签。
+
+        【为什么引用要"原样搬运"而不是重新从库里查】
+        缓存条目里的 citations 是写入那一刻的快照（含 retrieval_meta）。
+        原样搬运保证"实时展示"与"历史回看"看到的是同一份内容；
+        若重新查库，原文被删改后引用会与当时看到的对不上。
+        """
+        # ==========================================
+        # 步骤 1：初始化 Repository 仓储实例
+        # ==========================================
+        # 传入当前的 DB 异步会话 session，统一由会话管理底层的连接与事务生命周期
+        conv_repo = ConversationRepository(session)
+        citation_repo = AnswerCitationRepository(session)
+
+        # ==========================================
+        # 步骤 2：构建并写入 Assistant 消息记录
+        # ==========================================
+        # 构造助手消息实体，显式注入 extra_metadata：
+        # - refused: False（因为能进缓存的必然都是可信的非拒答内容）
+        # - trace_id: 链路追踪 ID，方便全链路观测
+        # - cache_hit: True（★ 核心差异：写入 DB 的 json 字段，确保后续刷新页面依然能渲染「缓存命中」徽标）
+        assistant_msg = ConversationRepository.make_assistant_message(
+            state["conversation_id"],
+            content=state["answer"],
+            extra_metadata={
+                "refused": False,
+                "trace_id": state.get("trace_id"),
+                # ★ 与常规路径的唯一差异
+                "cache_hit": True,
+            },
+        )
+        # 将消息实体添加至会话事务队列（内部会预生成 assistant_msg.id 供下方引用绑定）
+        await conv_repo.add_messages([assistant_msg])
+
+        # ==========================================
+        # 步骤 3：外键存活性批量校验（★ 核心避坑防御）
+        # ==========================================
+        # ⚠️ 【为什么必须查】：
+        # 缓存有效期内（如 1 小时内），知识库里的原文件/切片可能已被管理员彻底删除。
+        # 此时若直接将带有已删除 chunk_id / document_id 的实体写进 DB，
+        # 会直接触发 PostgreSQL 的 ForeignKeyViolation 外键约束错误，导致整个数据库事务回滚，
+        # 用户刚问完刷新页面就会发现回答全没了。
+        #
+        # 【优雅降级策略】：
+        # 收集当前引用的所有 ID，批量查一次 PostgreSQL 看它们是否还存活。
+        alive_chunks = await citation_repo.existing_chunk_ids(
+            [u for u in (self._safe_uuid(c.get("chunk_id")) for c in citations) if u]
+        )
+        alive_docs = await citation_repo.existing_document_ids(
+            [u for u in (self._safe_uuid(c.get("document_id")) for c in citations) if u]
+        )
+
+        # ==========================================
+        # 步骤 4：组装引用实体并做失效外键置空降级
+        # ==========================================
+        citation_rows = []
+        dropped = 0
+        for idx, c in enumerate(citations):
+            # 安全将字符串格式反序列化为 UUID 对象
+            chunk_id = self._safe_uuid(c.get("chunk_id"))
+            doc_id = self._safe_uuid(c.get("document_id"))
+
+            # 只对"原本有 ID 但数据库已查无此人"的过时外键做降级置空（设为 None）。
+            #
+            # 【为什么置成 None 就能避免插入报错】
+            #   因为这两个外键列本身【允许为空】（document_id / chunk_id 都是 nullable=True）。
+            # ⚠️ 别把它记成"靠 ON DELETE SET NULL 兜住的" —— 那是【删除父行时】的行为：
+            #   ON DELETE SET NULL 只保证"删除文档时引用行不被级联删掉、而是被置空"，
+            #   而【插入时】PostgreSQL 仍然会校验被引用的行是否存在。
+            #   两者一个管删、一个管插，互不相干 —— 本项目实测踩过这个理解偏差。
+            if chunk_id is not None and chunk_id not in alive_chunks:
+                chunk_id = None
+                dropped += 1
+            if doc_id is not None and doc_id not in alive_docs:
+                doc_id = None
+
+            citation_rows.append(
+                AnswerCitation(
+                    # 绑定刚创建的助手消息 ID
+                    message_id=assistant_msg.id,
+                    # ordinal 序号：严格保持原缓存序号（从 1 开始），防止前端 [1] [2] 角标错乱
+                    ordinal=int(c.get("ordinal") or idx + 1),
+                    # 若源文档已被删除，此处存为 None，但下方的 document_name/quote 快照依然完好保留
+                    document_id=doc_id,
+                    chunk_id=chunk_id,
+                    document_name=c.get("document_name", ""),
+                    page_no=c.get("page_no"),
+                    quote=c.get("quote", ""),
+                    retrieval_meta=c.get("retrieval_meta"),
+                )
+            )
+
+        # 若检测到引用原件已被删除，记录一条 warning 日志，便于排查数据生命周期
+        if dropped:
+            logger.warning(
+                "cached citations reference %d deleted chunk(s); "
+                "kept snapshot text, cleared the stale id",
+                dropped,
+            )
+
+        # ==========================================
+        # 步骤 5：批量写入引用记录
+        # ==========================================
+        if citation_rows:
+            await citation_repo.bulk_add(citation_rows)
+
+        # ==========================================
+        # 步骤 6：事务原子提交与状态同步
+        # ==========================================
+        # 保证「助手回答消息」与「关联引用」在同一个事务中原子提交，要么全成要么全败
+        await session.commit()
+        # 将持久化后的 assistant_message_id 回写进状态机，供后续收尾事件通知前端
         state["assistant_message_id"] = assistant_msg.id

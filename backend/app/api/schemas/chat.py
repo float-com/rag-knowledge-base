@@ -380,6 +380,31 @@ def _parse_trace_id(metadata: dict | None) -> str | None:
     return raw
 
 
+def _parse_cache_hit(metadata: dict | None) -> bool:
+    """从 messages.extra_metadata 提取 cache_hit 标记。
+
+    【默认值为什么是 False 而不是 None】
+    这里与 `_parse_trace_id`（拿不到就给 None）的取舍**刻意相反**，
+    因为下游的语义不同：
+
+        trace_id   ：None = "没有追踪信息"，前端据此**隐藏**面板 —— 需要一个"没有"的表达
+        cache_hit  ：这是一个**布尔判断**，前端只问"这条是不是缓存来的"
+
+    若返回 None，前端就要写 `m.cache_hit === true` 才能正确判断，
+    而 `undefined` / `null` / `false` 三种取值混在一起，很容易在 UI 分支里漏判。
+    统一收敛成 bool，前端只写 `if (cache_hit)` 即可。
+
+    【历史数据怎么区分】
+    第 12 期之前写入的老消息**没有这个键**，读出来是 False（= 没命中）。
+    这是正确的：那时根本没有缓存功能，"不是缓存命中"如实成立。
+    若将来需要统计"缓存上线后的命中率"，用 `cache_hit is True` 与
+    "元数据里存在该键"两个条件即可区分，接口层面不必为此多暴露一个字段。
+    """
+    if not metadata:
+        return False
+    return bool(metadata.get("cache_hit"))
+
+
 # =============================================================================
 # 4. 消息模型
 # =============================================================================
@@ -410,6 +435,12 @@ class MessageRead(BaseModel):
     #   不会自己拿 trace_id 去拼（拼接需要私有的 URL 前缀，前端无从得知）。
     trace_id: str | None = None
     trace_url: str | None = None
+    # 【第 12 期】本条回答是否来自语义缓存。
+    #   实时对话时由 SSE 的 message_start 事件下发（cache_hit=true）；
+    #   历史回看时从这里取（读 messages.extra_metadata 的 cache_hit 键）。
+    #   【为什么默认 False 而不是 None】见 _parse_cache_hit 的说明：
+    #   它是布尔判断，收敛成 bool 能让前端只写 `if (cache_hit)`。
+    cache_hit: bool = False
 
     @classmethod
     def from_orm(cls, message: Message) -> "MessageRead":
@@ -465,6 +496,11 @@ class MessageRead(BaseModel):
             # 【第 9 期】追踪标识来自落库的元数据；跳转链接按当前配置现拼
             trace_id=trace_id,
             trace_url=build_trace_url(trace_id),
+            # 【第 12 期】缓存命中标记同理只从 assistant 消息的元数据取；
+            #   解析失败 / 老数据缺键 → False（"这条不是缓存来的"）
+            cache_hit=(
+                _parse_cache_hit(message.extra_metadata) if is_assistant else False
+            ),
         )
 
 

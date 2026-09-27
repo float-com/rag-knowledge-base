@@ -14,12 +14,14 @@
 """
 
 from collections.abc import Sequence
+from uuid import UUID
 
 # 引入异步数据库会话类
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# 引入回答引用持久层实体模型
-from app.db.models import AnswerCitation
+# 引入回答引用持久层实体模型；另需两张父表做存在性校验（第 12 期缓存路径）
+from app.db.models import AnswerCitation, Document, DocumentChunk
 
 
 class AnswerCitationRepository:
@@ -48,3 +50,37 @@ class AnswerCitationRepository:
 
         # 3. 推送至底层数据库事务缓冲区，生成自增主键与触发完整性约束检查（不主动 commit）
         await self.session.flush()
+
+    # =========================================================================
+    # 第 12 期：缓存引用落库前的存在性校验
+    # =========================================================================
+    async def existing_chunk_ids(self, chunk_ids: Sequence[UUID]) -> set[UUID]:
+        """返回这批 chunk_id 中【仍然存在】的那些。
+
+        【为什么需要它】引用表的 `chunk_id` 外键指向 `document_chunks(id)`
+        （`ON DELETE SET NULL` —— 删除时把引用行的该列置空）。
+        但**插入时 PostgreSQL 仍会校验 id 是否存在**：
+        拿一个已删除的 chunk_id 去插 → ForeignKeyViolation → 整个事务回滚 →
+        连带把同一事务里的助手消息一起丢掉。
+
+        语义缓存里的引用是"当时那一刻的快照"，最长可能存活 1 小时，
+        期间文档被删是完全可能的 —— 所以落库前必须过滤一遍。
+
+        :param chunk_ids: 待校验的 chunk 主键序列
+        :return: 其中真实存在的 id 集合（不存在的不在集合里）
+        """
+        if not chunk_ids:
+            return set()
+        stmt = select(DocumentChunk.id).where(DocumentChunk.id.in_(list(chunk_ids)))
+        return set((await self.session.execute(stmt)).scalars().all())
+
+    async def existing_document_ids(self, document_ids: Sequence[UUID]) -> set[UUID]:
+        """返回这批 document_id 中【仍然存在】的那些。理由同 existing_chunk_ids。
+
+        :param document_ids: 待校验的 document 主键序列
+        :return: 其中真实存在的 id 集合
+        """
+        if not document_ids:
+            return set()
+        stmt = select(Document.id).where(Document.id.in_(list(document_ids)))
+        return set((await self.session.execute(stmt)).scalars().all())
