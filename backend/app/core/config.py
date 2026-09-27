@@ -298,6 +298,34 @@ class Settings(BaseSettings):
                 "请在 .env 中设置 JWT_SECRET（生成示例：openssl rand -hex 32）"
             )
 
+    # ===== Redis 配置（第 12 期）：语义缓存 / 限流 / Celery broker =====
+    # 【为什么三个 URL 而不是一个】
+    #   Redis 的 16 个逻辑库共用一个端口，靠 URL 末尾的 /N 区分（N = db 编号）。
+    #   三处用途的生命周期完全不同，混在一个库里会互相干扰：
+    #     - 缓存/限流：应用数据，可能需要随时 FLUSHDB 清掉重来；
+    #     - broker    ：队列数据，清掉等于丢弃所有待执行任务；
+    #     - result    ：任务结果，清掉只是查不到历史结果，影响最小。
+    #   分开之后"清理某一类数据"就变成一次精确操作，而不是"全库清空"。
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "redis://localhost:6379/1"
+    celery_result_backend: str = "redis://localhost:6379/2"
+
+    # ----- 语义缓存 -----
+    # 总开关：关掉后 chat 主链路完全跳过缓存的查询与写入（便于做有/无对比）
+    semantic_cache_enabled: bool = True
+    # 单条缓存最大存活时间（秒）。本项目目前【仅靠 TTL 失效】，
+    #   所以这个值同时也是"文档权限被改后，旧答案最多还能存活多久"的上界。
+    semantic_cache_ttl_seconds: int = 3600
+    # 余弦相似度命中阈值。注意它只解决"问题像不像"，
+    #   "权限范围一不一致"必须另外用 Tag 过滤解决 —— 两者都满足才算命中。
+    semantic_cache_min_similarity: float = 0.92
+
+    # ----- 滑动窗口限流 -----
+    # 总开关：关掉后 RateLimiter 直接放行（依赖仍然挂载，便于本地压测）
+    rate_limit_enabled: bool = True
+    # 单用户每分钟最大请求数（chat / 上传 / 重新索引共用同一个窗口）
+    rate_limit_per_minute: int = 60
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

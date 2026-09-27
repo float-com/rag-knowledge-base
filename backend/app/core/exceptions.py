@@ -108,3 +108,19 @@ class UnauthorizedError(AppException):
     code = "unauthorized"
     message = "请先登录"
     http_status = HTTPStatus.UNAUTHORIZED
+
+
+class RateLimitError(AppException):
+    """请求过于频繁 / 触发限流（对应 HTTP 429）。
+
+    【为什么单独一个类，而不是复用 PermissionDeniedError】
+    两者语义与前端行为都不同：
+    - 403：**身份不够**，重试也没用，前端应提示"无权限"且不重试；
+    - 429（本类）：**身份没问题，只是频率超了** —— 等一会儿重试是有效的，
+      因此前端/调用方应当看到明确的"请稍后再试"，并可以按 Retry-After 做退避。
+    把 429 混进 403 会让调用方误判为"权限问题"而放弃重试。
+    """
+
+    code = "rate_limited"
+    message = "请求过于频繁，请稍后再试"
+    http_status = HTTPStatus.TOO_MANY_REQUESTS
