@@ -15,7 +15,10 @@
      * 针对网络中断或客户端主动中止场景，暴露 /{upload_id} DELETE 端点提供幂等取消与云端垃圾回收。
    - 极速响应与非阻塞计算流水线：
      * complete 接口经由轻量级 HEAD 请求完成元数据校验后，立刻返回 FINALIZING 态，释放客户端等待；
-     * 文件完整性哈希计算、内容去重与高长耗时向量化提取（Ingestion）交由 BackgroundTasks 异步挂载。
+     * 文件完整性哈希计算、内容去重与高长耗时向量化提取（Ingestion）交由 Celery worker 异步执行。
+       【第 12 期】原先这里写的是 BackgroundTasks —— 它虽然在"响应后执行"，
+       但仍然跑在 API 进程里；现在的重活全部落在独立 worker 进程，
+       API 进程即使重启也不会弄丢已经投递出去的任务。
 
 通俗来讲：
 这是整个直传体系的“机场大件行李直运接待处”——
@@ -31,7 +34,7 @@
 # =============================================================================
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Response
+from fastapi import APIRouter, Response
 
 # 【第 12 期补漏】本模块的三个端点此前【既没有鉴权、也没有限流】：
 #   - 第 11 期加鉴权时按"文件"排查，只改了 routes/documents.py 的 multipart 旧链路；
@@ -107,14 +110,13 @@ async def init_upload(
 async def complete_upload(
     upload_id: UUID,
     session: DbSession,
-    background_tasks: BackgroundTasks,
     # 【第 12 期】写操作，要求管理员；同时限流 ——
     #   它会让服务端去 COS 校验对象、建出 Document 记录并触发解析流水线，
     #   是"未登录也能让别人替我烧算力"的那扇门，必须挂闸门。
     _: CurrentAdmin,
     _rate_limit: RateLimited,
 ) -> UploadSessionRead:
-    """校验 COS 对象并将会话交给后台 finalize。
+    """校验 COS 对象并将会话交给 Celery 收尾。
 
     【调用时机】：
     - 客户端使用预签名 URL 成功向 COS 完成 HTTP PUT 上传（收到 COS 200 响应）后触发。
@@ -122,15 +124,21 @@ async def complete_upload(
     【核心职责与非阻塞架构】：
     - 服务端权威校验：向 COS 发起轻量 HEAD 请求校验文件真实存在性与大小匹配度；
     - 会话状态原子推进入 FINALIZING，避免前端重复提交；
-    - 将独立事务的 finalize 任务加入 BackgroundTasks 任务池，迅速给客户端响应解除 UI 阻塞。
+    - 把收尾任务投递给独立 Celery worker，迅速给客户端响应解除 UI 阻塞。
+
+    【第 12 期】原先的 `background_tasks: BackgroundTasks` 形参已删除。
+    这里必须再强调一次它的重要性：**前端实际上传走的就是这条链路**
+    （directDocumentUpload.ts → /uploads/init + /complete），
+    而不是 documents.py 里的 multipart 旧链路。教程只改了旧链路，
+    若这条不改，整个 Celery 改造对真实上传行为【零影响】——
+    与第 12 期加限流时踩的坑完全同类。
     """
-    # 语法（跨服务协同与后台任务注册）：
-    #   将 BackgroundTasks 作为参数穿透给服务层，供其在数据库校验完成之后挂载重型异步流水线
-    #   通俗来讲：前台查验无误后，把状态盖成“处理中”，同时把耗时的数据分析任务丢给后台工班，直接打发前端走人。
-    return await DocumentUploadService(session).complete_upload(
-        upload_id,
-        background_tasks,
-    )
+    # 语法（跨服务协同与任务投递）：
+    #   服务层在确认 COS 对象合规、把会话推入 FINALIZING 并 commit 之后，
+    #   再往 Celery 队列投递收尾任务，随后立刻返回。
+    #   通俗来讲：前台查验无误后，把状态盖成“处理中”，再把工单投进邮筒，
+    #            由独立厂区的工人去做哈希、去重与建档，这边直接打发前端走人。
+    return await DocumentUploadService(session).complete_upload(upload_id)
 
 
 # =============================================================================

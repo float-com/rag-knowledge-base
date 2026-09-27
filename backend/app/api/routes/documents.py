@@ -7,7 +7,9 @@
    严格承担协议解析、参数安检、依赖注入调度与 DTO 序列化脱敏，不编写具体持久化与算法。
 
 2. 核心架构与设计亮点：
-   - 依赖注入统一管控：通过 DbSession 管理异步会话生命周期，利用 BackgroundTasks 承接长耗时异步流水线；
+   - 依赖注入统一管控：通过 DbSession 管理异步会话生命周期；
+     【第 12 期】长耗时入库流水线已不再由本层的 BackgroundTasks 承接，改为投递给独立 Celery worker，
+     路由层因此变得更薄 —— 它只负责鉴权、限流、落库与"把工单投进邮筒"；
    - 协议与状态码严格对齐：
      * 新建落库 201 Created，常规查询 200 OK，删除 204 No Content；
      * 文件流采用原生二进制 Response 响应，遵循 RFC 5987 标准化文件名编码彻底杜绝中文乱码；
@@ -36,7 +38,6 @@ import json
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     File,
     Form,
     Header,
@@ -124,7 +125,6 @@ async def upload_document(
     #   前端文档列表有 3 秒轮询，给读接口限流会误伤正常用户。
     _rate_limit: RateLimited,
     session: DbSession,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(
         ...,
         description="待上传文档 (PDF / DOCX / Markdown / HTML)",
@@ -134,13 +134,16 @@ async def upload_document(
         description='JSON 数组字符串，例如 ["public","hr"]；空 / 不传视为公开',
     ),
 ) -> DocumentRead:
-    """上传文档：写入 COS、落库后立即返回，解析与向量化通过 BackgroundTasks 异步进行。
+    """上传文档：写入 COS、落库后立即返回，解析与向量化通过 Celery 异步进行。
 
     【依赖注入说明】：
     - admin (CurrentAdmin): 【第 11 期】上传是写操作，要求管理员；
     - session (DbSession): 当前请求生命周期专属的异步数据库会话，请求结束自动释放；
-    - background_tasks (BackgroundTasks): 异步任务池，待当前响应发送给前端后再执行重型计算；
     - file (UploadFile): 上传文件的二进制数据流及文件名、MIME 等元信息。
+
+    【第 12 期】原先的 `background_tasks: BackgroundTasks` 形参已删除 ——
+    入库任务改由 service 层投递给 Celery，路由层不再接触任何后台任务对象。
+    这也是"路由层只做协议与编排"的一次归位：它不该知道重活是在本进程还是别的进程跑。
 
     【⚠️ permission_tags 为什么是字符串而不是 list[str]】
     这是 multipart/form-data 的固有限制：**表单里所有字段都以字符串传输**，
@@ -172,7 +175,6 @@ async def upload_document(
     service = DocumentService(session)
     document = await service.upload(
         file,
-        background_tasks,
         # 【第 11 期】上传者记为当前登录的管理员（审计用）；
         # 权限标签传下去，由 Service 统一做 _normalize_tags 清洗
         created_by=admin.id,
@@ -318,23 +320,23 @@ async def retry_document(
     _: CurrentAdmin,
     document_id: UUID,
     session: DbSession,
-    background_tasks: BackgroundTasks,
 ) -> DocumentRead:
     """对处理失败（FAILED）的文档清理历史脏分块并重新调度入库流水线。
 
     【核心防线】：
     - 仅 FAILED 状态允许重试，防止并发竞争或对正常文档重复计算；
-    - 清理上次失败残留的中间半成品切块，重置为 UPLOADING 态并向 BackgroundTasks 重新挂载任务。
+    - 清理上次失败残留的中间半成品切块，重置为 UPLOADING 态、
+      新建一条任务台账行，并把任务投递给 Celery worker。
 
     【第 11 期】同删除：重试会把文档重新送回解析/向量化流水线（消耗算力、可能改写切片），
     属于管理动作，因此要求管理员。
     """
     service = DocumentService(session)
 
-    # 语法（服务层重试调用）：await service.retry(document_id, background_tasks)
-    #   特性：防御性清理脏切片数据，重置错误状态并重启后台异步流水线
-    #   通俗来讲：让总管打扫干净上次失败留下的烂摊子，然后把文档重新塞回后台处理流水线。
-    document = await service.retry(document_id, background_tasks)
+    # 语法（服务层重试调用）：await service.retry(document_id)
+    #   特性：防御性清理脏切片数据，重置错误状态并把任务投递给 Celery
+    #   通俗来讲：让总管打扫干净上次失败留下的烂摊子，然后把文档重新塞回处理流水线。
+    document = await service.retry(document_id)
 
     return DocumentRead.model_validate(document)
 

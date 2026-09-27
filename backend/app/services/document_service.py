@@ -15,8 +15,10 @@
    在文件落盘前计算二进制内容的哈希摘要，若库中已存在同源文件则直接复用现有记录，
    避免重复占用对象存储空间，从源头杜绝大模型切分与向量化的重复算力开销。
 
-4. 异步后台调度与生命周期管控：
-   协调 FastAPI 的 BackgroundTasks，安全触发长耗时的文档解析与向量化后台任务；
+4. 异步任务派发与生命周期管控：
+   【第 12 期】把文档入库从"FastAPI 进程内的 BackgroundTasks"改为投递给独立的
+   Celery worker 执行，并在投递前先落一条 ingestion_tasks 台账行，让任务状态与
+   向量化进度可以被前端轮询追踪；
    同时实施严格的状态机约束（如仅允许删除非处理中的文档、仅重试失败文档、重试前清理脏切片），
    采用“先删 DB、后删 COS”的容错策略，确保运行期的数据一致性与事务安全。
 
@@ -31,20 +33,21 @@ from collections.abc import Sequence
 from pathlib import PurePath
 from uuid import UUID
 
-from fastapi import BackgroundTasks, UploadFile
+from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.logging import get_logger
 from app.core.tags import normalize_tags
-from app.db.models import Document, DocumentChunk, DocumentStatus
+from app.db.models import Document, DocumentChunk, DocumentStatus, IngestionTaskType
 from app.db.repositories.chunk_repo import (
     ChunkStats,
     DocumentChunkRepository,
 )
 from app.db.repositories.document_repo import DocumentRepository
-from app.ingestion.pipeline import ingest_document
+from app.db.repositories.ingestion_task_repo import IngestionTaskRepository
+from app.ingestion.tasks import ingest_document_task, reindex_document_task
 from app.storage.file_service import FileService, get_file_service
 
 # =============================================================================
@@ -141,8 +144,11 @@ def _resolve_mime_and_suffix(file: UploadFile) -> tuple[str, str]:
 #   业务状态约束策略（状态机安全锁）：
 #     - 允许删除：终态（READY 成功入库、FAILED 失败放弃）以及初始态（UPLOADING 尚未开始切分落盘）；
 #     - 绝对禁止：PARSING（文档解析中）、INDEXING（向量化与写库中）等中间运行态。
-#       原因：此时后台异步任务 BackgroundTasks 正在高频对切片表执行写入/落盘事务，
+#       原因：此时独立 Celery worker 正在高频对切片表执行写入/落盘事务，
 #             强行并发删除文档会导致主外键孤儿数据、死锁或引发不可控的数据写写竞争冲突。
+#       ⚠️ 第 12 期把执行者从 BackgroundTasks 换成 Celery 之后，这道防线的必要性【只增不减】：
+#          BackgroundTasks 至少还跑在同一个进程里，而 worker 是完全独立的进程，
+#          删除请求与它的写入在数据库层面是货真价实的并发，冲突只会更直接。
 #   通俗来讲：这是文档删除的“免死金牌/安全白名单”——只能删已经办完事的、办砸了的和还没动工的；
 #            要是后台正热火朝天切分向量（PARSING/INDEXING）时你去删，数据库两边打架非崩溃不可，所以用不可变集合死死锁住。
 _DELETABLE_STATUSES: frozenset[DocumentStatus] = frozenset(
@@ -217,6 +223,12 @@ class DocumentService:
         #   通俗来讲：招募一个专门操作 document_chunks 切片表的“数据库账房先生”。
         self.chunk_repo = DocumentChunkRepository(session)
 
+        # 语法（仓储层实例化装配）：IngestionTaskRepository(session)
+        #   特性：【第 12 期】将数据库连接句柄注入入库任务台账仓储层
+        #   通俗来讲：再招一个专门记账「这次入库跑成什么样」的账房先生 ——
+        #            文档状态只记「成品到哪一步」，任务台账记「这一次尝试的全过程」。
+        self.task_repo = IngestionTaskRepository(session)
+
         # 语法（默认值兜底与依赖注入）：file_service or get_file_service()
         #   特性：若外部未手动传入云存储服务实例，则自动触发内部工厂函数完成实例化
         #   通俗来讲：有现成的云存储工具就直接用，没有就临时造一个（便于写单元测试时换成假对象）。
@@ -225,7 +237,6 @@ class DocumentService:
     async def upload(
         self,
         file: UploadFile,
-        background_tasks: BackgroundTasks,
         *,
         created_by: UUID | None = None,
         permission_tags: Sequence[str] | None = None,
@@ -339,13 +350,20 @@ class DocumentService:
         )
 
         # 语法（仓储层入库挂载）：await self.repo.add(document)
-        #   特性：将新文档模型附加至当前会话中
+        #   特性：将新文档模型附加至当前会话中；内部会 flush 一次，因此此刻 document.id 已生成
         #   通俗来讲：告诉数据库准备保存这一条新文档。
         await self.repo.add(document)
 
+        # ---------------------------------------------------------------------
+        # 阶段 6：落一条任务台账 + 调度 Celery 异步任务（Ingestion Pipeline）
+        # ---------------------------------------------------------------------
+        # 【第 12 期改造 1/2：先建台账行，且与文档同一次 commit】
+        #   为什么不分开提交：否则可能出现"文档建好了、任务记录没建"的半成品状态 ——
+        #   前端看到一份永远没人处理的文档，而且没有任何记录能解释它为什么没动。
+        task = await self.task_repo.create(document.id, IngestionTaskType.INGEST)
+
         # 语法（事务提交与持久化落盘）：await self.session.commit()
-        #   特性：触发数据库 COMMIT 操作，释放当前短事务连接
-        #   通俗来讲：盖章确认，把文档数据真正物理写入数据库磁盘。
+        #   通俗来讲：盖章确认，把文档和它的任务台账一起真正物理写入数据库磁盘。
         await self.session.commit()
 
         # 语法（实体状态刷新）：await self.session.refresh(document)
@@ -353,18 +371,23 @@ class DocumentService:
         #   通俗来讲：让数据对象和数据库同步一下，把数据库刚生成的 ID 和时间戳拉回内存里。
         await self.session.refresh(document)
 
-        # ---------------------------------------------------------------------
-        # 阶段 6：调度异步后台任务（Ingestion Pipeline）
-        # ---------------------------------------------------------------------
-        # 语法（FastAPI 后台任务投递）：background_tasks.add_task(...)
-        #   核心机制：
-        #     1. 严禁在 commit 前调度：后台流水线内部会开辟独立全新的数据库 Session 查询该记录，
-        #        若未 commit 提前投递，后台任务可能因为读未提交而查不到文档抛出 404；
-        #     2. 非阻塞响应：注册后台任务后，upload 方法立即结束并向前端返回 HTTP 200，
-        #        解析、切分、向量化等重活在后台默默异步执行。
-        #   通俗来讲：等数据库真正落盘确认后，派发后台小工去执行耗时的 AI 提取切片任务；
-        #            这样接口不用等漫长的 AI 计算，能瞬间给前端返回成功，体验极快。
-        background_tasks.add_task(ingest_document, document.id)
+        # 语法（Celery 任务投递）：ingest_document_task.delay(str(document.id), str(task.id))
+        #   【第 12 期改造 2/2：BackgroundTasks → Celery .delay()】
+        #   三个必须记住的点：
+        #     1. 【顺序不可颠倒 —— 必须 commit 之后才能 delay】
+        #        Celery worker 是【独立进程】，拿到任务后会用自己全新的数据库会话
+        #        去 SELECT documents / ingestion_tasks。若在 commit 之前投递，
+        #        worker 可能抢在提交前把任务领走、查不到记录，直接
+        #        `_mark_task_failed("文档不存在")`。
+        #        这是一次竞态：本地跑得快时往往复现不出来，是最难查的一类问题。
+        #     2. 参数只传 UUID 字符串：broker 序列化用的是 JSON，
+        #        ORM 对象 / Session / 文件内容都传不过去；worker 也必须自己重新获取这些资源。
+        #     3. 非阻塞响应：delay() 只是往 Redis 队列写一条消息，微秒级返回；
+        #        解析、切分、向量化都在 worker 进程里跑，API 进程完全不参与。
+        #        代价是——worker 没启动时接口照样返回成功，文档会一直停在 uploading/pending。
+        #   通俗来讲：等数据库真正落盘确认后，把工单投进邮筒；由独立厂区（worker）的
+        #            工人取走干活。这边接口立刻返回，不必等活干完，但也【不再保证】有人来干。
+        ingest_document_task.delay(str(document.id), str(task.id))
 
         return document
 
@@ -460,7 +483,7 @@ class DocumentService:
 
         【状态机约束】：
         - 仅允许删除处于 `_DELETABLE_STATUSES` 白名单中的文档（READY, FAILED, UPLOADING）；
-        - 处于 PARSING 或 INDEXING 中间态的文档禁止删除，防范与 BackgroundTasks 的写冲突。
+        - 处于 PARSING 或 INDEXING 中间态的文档禁止删除，防范与 Celery worker 的写冲突。
         """
         # 语法（主键检索与存在性断言）：await self.repo.get_by_id(document_id)
         #   特性：校验目标文档是否存在，缺失则主动抛出 NotFoundError 映射为 HTTP 404
@@ -502,7 +525,6 @@ class DocumentService:
     async def retry(
         self,
         document_id: UUID,
-        background_tasks: BackgroundTasks,
     ) -> Document:
         """针对处理失败的文档重新触发异步解析入库流水线。
 
@@ -511,7 +533,8 @@ class DocumentService:
         - 防御性清理残留切块（chunks）：虽然理论上失败的文档不应该有 chunks，
           但若当初任务是在“写 chunk 事务提交的一半”时崩溃，底层表中可能已污染了残余切片；
           因此在重跑前必须显式执行清理，杜绝产生脏分块或重复向量数据；
-        - 重置状态为 UPLOADING 并清空原有的 error_message，随后重新投递到后台流水线。
+        - 重置状态为 UPLOADING 并清空原有的 error_message，
+          【第 12 期】再新建一条 ingestion_tasks 台账行，最后投递 Celery 任务。
         """
         # 语法（主键精确查找）：await self.repo.get_by_id(document_id)
         #   特性：确保目标重试文档客观存在
@@ -537,16 +560,21 @@ class DocumentService:
         doc.status = DocumentStatus.UPLOADING
         doc.error_message = None
 
+        # 【第 12 期】重试也要新开一条任务台账行 —— 而不是复用上次那条失败记录。
+        #   复用的话，"这份文档一共失败过几次"就彻底查不出来了；
+        #   任务流水式记录的价值正在于每一次尝试都留下独立痕迹。
+        task = await self.task_repo.create(doc.id, IngestionTaskType.INGEST)
+
         # 语法（事务提交流水线更新）：await self.session.commit()
-        #   特性：立刻提交状态变更，确保后续独立的后台任务协程能读到 UPLOADING 的最新状态
-        #   通俗来讲：先把这次状态改动落盘记在数据库里。
+        #   特性：立刻提交状态变更，确保后续独立的 Celery worker 能读到 UPLOADING 的最新状态
+        #   通俗来讲：先把这次状态改动与新建的工单一起落盘记在数据库里。
         await self.session.commit()
         await self.session.refresh(doc)
 
-        # 语法（派发异步后台任务）：background_tasks.add_task(ingest_document, doc.id)
-        #   特性：在事务提交安全落盘后，重新唤起异步流水线
-        #   通俗来讲：派工单给后台流水线，通知小工“带上这个文档的 ID，重新给我跑一遍 AI 切片和入库”。
-        background_tasks.add_task(ingest_document, doc.id)
+        # 语法（Celery 任务投递）：ingest_document_task.delay(...)
+        #   与 upload 同一铁律：必须 commit 之后再 delay，否则 worker 可能查不到刚建的记录。
+        #   通俗来讲：派工单给邮筒，由独立厂区的工人取走，重新跑一遍解析切分与向量化。
+        ingest_document_task.delay(str(doc.id), str(task.id))
         logger.info("document retry scheduled: id=%s", document_id)
         return doc
 

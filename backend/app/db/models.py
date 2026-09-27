@@ -4,15 +4,19 @@ RAG 知识库系统数据模型模块 (backend/app/db/models.py)
 【模块核心职责】
 本模块基于 SQLAlchemy 2.0 现代声明式映射（Mapped/mapped_column）规范与 PostgreSQL 原生扩展，
 集中定义系统全部持久化实体与生命周期状态机，是数据库结构的【唯一真实来源】。
-按业务域分为五组，共 11 张表：
+按业务域分为五组，共 12 张表：
 
-一、文档接入域（第 1-3 期）
+一、文档接入域（第 1-3 期；第 12 期补 1 张任务台账表）
 1. UploadSessionStatus: 预签名直传会话状态枚举。
 2. UploadSession: 预签名上传会话表（upload_sessions），承载分片直传的会话级状态与过期控制。
 3. DocumentStatus: 文档处理状态枚举，基于 (str, Enum) 实现，支持状态约束与零成本 JSON 序列化。
 4. Document: 原始文档元数据表（documents），负责文件防重哈希、对象存储（COS）定位、状态追踪及审计时间戳。
 5. DocumentChunk: 语义检索切片明细表（document_chunks），承载正文内容、pgvector 高维嵌入向量、
    层级面包屑与检索调试元数据（JSONB）。
+   【第 12 期新增】IngestionTaskType / IngestionTaskStatus / IngestionTask:
+   文档入库任务台账（ingestion_tasks）。Celery 只负责「把任务送出去」，
+   任务的类型、状态与向量化进度真相全部落在这张表里 —— 前端不必连 Celery
+   的 result backend，查一张普通表就能展示进度与失败原因。
 
 二、对话问答域（第 4-5 期）
 6. MessageRole: 消息角色枚举（user / assistant / system）。
@@ -84,6 +88,10 @@ from sqlalchemy import (
     # Table 构造器：第 11 期声明 user_roles 多对多关系表（不经过 ORM 类）
     Table,
     Text,
+    # text() 构造器：第 12 期声明「表达式索引」用的 ——
+    # IngestionTask 的复合索引第二段是 `created_at DESC`，它不是单纯的列名，
+    # 而是一段 SQL 表达式，必须用 text() 包起来才能被 DDL 编译器原样渲染。
+    text,
     func,
 )
 # PostgreSQL 方言类型：支持 JSONB 高效二进制存储及原生 UUID 映射
@@ -374,6 +382,21 @@ class Document(Base):
         comment="解析/索引失败时的错误信息堆栈"
     )
 
+    # 文档内容版本号（第 12 期）：
+    # - 每次 reindex 成功后 +1，前端列表直接可见，用来标识「这份文档的内容已变更」。
+    # - default=1 + server_default="1" 两者都要给：
+    #     * default=1：走 ORM 新增时由 Python 侧填值，new 出来的对象立刻就有 version；
+    #     * server_default="1"：保证【不走 ORM 的插入】（原生 SQL / 数据导入）
+    #       以及【存量行】也有值 —— 否则 NOT NULL 加列时数据库会直接拒绝 ALTER TABLE
+    #       （第 11 期给 users 补 updated_at 时踩过同一个坑）。
+    version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+        comment="文档内容版本号，每次重建索引成功后 +1"
+    )
+
     # --------------------------------------------------------------------------
     # 权限标签与归属（第 11 期新增）
     # --------------------------------------------------------------------------
@@ -482,6 +505,26 @@ class Document(Base):
     #   selectin 的语义是"主查询结束后，用一条 IN 查询把关联对象一次性取回"，
     #   因此查询 Document 时不会在序列化 / 日志阶段意外触发惰性加载。
     creator: Mapped["User | None"] = relationship(lazy="selectin")
+
+    # 一对多关系：一份文档的全部入库任务记录（第 12 期）
+    # - 【为什么要存成"多条"而不是"一个状态字段"】：
+    #   同一份文档会被反复入库 —— 首次入库、失败重试、将来第 5 节的重新索引。
+    #   只存一个状态，第二遍就把第一遍的记录覆盖了，失败历史无从追溯。
+    #   存成任务流水，每一次尝试都是一条独立记录，可回看"上次为什么失败"。
+    # - order_by="IngestionTask.created_at.desc()"：
+    #   按创建时间倒序。这样 `document.ingestion_tasks[0]` 天然就是「最近一次任务」，
+    #   前端详情页要展示的正是它，不必再自己去排序。
+    #   ⚠️ 它是一个【字符串表达式】而不是 lambda —— 因为 IngestionTask 定义在下面，
+    #      此刻这个名字还不存在，只能用字符串交给 SQLAlchemy 稍后解析。
+    # - cascade="all, delete-orphan" + passive_deletes=True：
+    #   与 chunks 同一套策略 —— 文档被删时，任务记录交给数据库的
+    #   ON DELETE CASCADE 一次性清掉，而不是先把它们全查进内存再逐条 DELETE。
+    ingestion_tasks: Mapped[list["IngestionTask"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="IngestionTask.created_at.desc()",
+    )
 
 
 # ==============================================================================
@@ -683,6 +726,135 @@ class DocumentChunk(Base):
     document: Mapped[Document] = relationship(
         back_populates="chunks"
     )
+
+# ==============================================================================
+# 第 12 期：IngestionTask 文档入库任务表（Celery 异步任务台账）
+# ==============================================================================
+# 【为什么第 12 期要多这一张表 —— 这是本节最核心的设计决策】
+# 第 4.1 节的 Celery 配置里写了 task_acks_late=False，含义是
+# 「worker 一拿到任务就向 broker 确认收到」，于是 broker 这条队列【不再负责重传】。
+# 那么"任务到底跑到哪一步了"就必须由业务自己回答 —— 这张表就是那个答案：
+#   FastAPI 进程投递前先写一条 pending 行，worker 内一路更新 running → success/failed。
+# 换句话说：Celery 只负责「把任务送出去」，状态真相始终在 PostgreSQL 里。
+# 这样做的好处是前端不需要连 Celery 的 result backend，只查一张普通表就够了。
+class IngestionTaskType(str, Enum):
+    """入库任务类型。
+
+    ingest:  首次入库（解析 → 切分 → 全量 embedding → 写入）
+    reindex: 增量重建（按 chunk_hash 对齐，仅对变化 chunk 重新 embedding）
+    """
+
+    INGEST = "ingest"
+    REINDEX = "reindex"
+
+
+class IngestionTaskStatus(str, Enum):
+    """Celery 任务生命周期。
+
+    pending: 已入库表、还没被 worker 拉走
+    running: worker 已开始执行
+    success / failed: 终态
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class IngestionTask(Base):
+    """文档入库任务记录。
+
+    Celery 拉起 worker 前先在 DB 落一条 pending 行；worker 内根据生命周期更新
+    running → success / failed。前端轮询 documents 接口附带 `latest_task` 即可
+    展示进度（progress_total / progress_done）与失败原因。
+    """
+
+    __tablename__ = "ingestion_tasks"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+
+    # 所属文档：ON DELETE CASCADE —— 文档被删除时任务流水一并清理。
+    # 任务记录脱离文档没有任何意义，没有必要像 created_by 那样用 SET NULL 保全。
+    # index=True：详情页要按 document_id 查「最近一次任务」，这是最高频的访问路径。
+    document_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # 任务类型与状态：均以 String(16) 落库而非 PostgreSQL 物理 ENUM。
+    # 理由与 EvaluationRun.status 一致 —— 用原生 ENUM 类型时，
+    # 将来新增一个状态就要 ALTER TYPE，会带来 DDL 锁表与迁移复杂度。
+    task_type: Mapped[IngestionTaskType] = mapped_column(String(16), nullable=False)
+    status: Mapped[IngestionTaskStatus] = mapped_column(
+        String(16), nullable=False, default=IngestionTaskStatus.PENDING
+    )
+
+    # 重试次数：留给失败重投计数用（本节只建字段，不自动重试）。
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # 失败原因：仓储层写入时统一截断到 500 字符，防止超长堆栈撑爆列。
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 进度：reindex 时 total=新增 chunks 数，done=已 embedding 的批次累计
+    # ingest 走全量 embedding，total=切分后总 chunks 数
+    # 【为什么要有这两个字段】：向量化是全流程最慢的一步（本项目 10 个文档 259 个
+    # chunk 要发几十次 embedding 请求），如果只暴露"运行中"这一个状态，
+    # 前端进度条会长时间僵在原处，用户分不清"在跑"还是"卡死了"。
+    progress_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # 实际开始 / 结束时间：created_at 是"投递时间"，started_at 是"worker 真正拿到的时间"。
+    # 两者之差就是任务在队列里的排队时长 —— 排查"为什么上传后半天没动静"时，
+    # 第一步就是看这个差值：差得大说明 worker 没起来或队列积压，差得小说明卡在执行里。
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # --------------------------------------------------------------------------
+    # 表级索引
+    # --------------------------------------------------------------------------
+    # 【为什么必须把迁移里建的索引在这里再声明一遍 —— 本项目已经踩过两次的坑】
+    # Alembic 的 autogenerate 只拿【模型侧推导出的结构】和【数据库实际结构】做差集，
+    # 迁移脚本里 create_index 建出来、但模型里没声明的索引，在它眼里就是
+    # "数据库里多出来的东西"，于是下一次 autogenerate 会生成 drop_index 把它悄悄删掉。
+    #
+    # 本项目前两次踩坑记录：
+    #   * 第 10 期：DocumentChunk 的 GIN / HNSW 索引；
+    #   * 第 11 期：Document 的 ix_documents_permission_tags。
+    # 所以第 11 期之后定下的规矩是：**任何索引都要在模型里声明**。
+    #
+    # ⚠️ 教程 4.2 只交代"在迁移里补一个联合索引"，没有交代要在模型里同步声明 ——
+    #    那等于把坑又埋了一次。本次改造实测验证过：不声明时，紧接着的一次
+    #    autogenerate 生成的就是一句
+    #        op.drop_index(op.f('ix_ingestion_tasks_document_created'), table_name='ingestion_tasks')
+    #    补上下面这个声明之后，同一个命令再跑一遍是干净的（不再产生任何操作）。
+    __table_args__ = (
+        # (document_id, created_at DESC) 复合索引：
+        # 服务的是仓储层 get_latest_by_document —— 「取某个文档最近一次入库任务」。
+        # DESC 必须显式写出：B-Tree 默认升序，索引顺序与 ORDER BY 方向一致时
+        # 才能直接沿索引取第一条，不必额外排序。
+        Index(
+            "ix_ingestion_tasks_document_created",
+            "document_id",
+            text("created_at DESC"),
+        ),
+    )
+
+    # 多对一回到父文档，与 Document.ingestion_tasks 构成双向指针。
+    document: Mapped[Document] = relationship(back_populates="ingestion_tasks")
+
 
 # ==============================================================================
 # 4. 会话角色与对话模型定义 (Conversations & Messages)

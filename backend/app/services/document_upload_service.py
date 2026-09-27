@@ -11,13 +11,22 @@
 【与 FileService 的边界】：
 - FileService：纯底层存储适配器，专注提供 COS Key 路径规范、PUT 预签名 URL 签发、HEAD 元数据校验、流式计算哈希、对象删除等通用存储能力；
 - DocumentUploadService：业务编排服务，掌控“何时触发存储能力”、“校验不一致如何降级回滚”以及“校验通过后如何创建持久化 Document 实体并派发解析任务”。
+
+【第 12 期：整条直传链路也搬到了 Celery（教程未覆盖，本项目自己补的）】
+改造前的调用关系是「进程内串行」的：
+    complete_upload ──BackgroundTasks──> finalize_upload ──await──> ingest_document（跑几十秒）
+改造后变成「两个 Celery 任务串联」：
+    complete_upload ──.delay()──> finalize_upload（worker）
+                                      └──建档 + 落任务台账──> .delay() ──> ingest_document（worker）
+这样 API 进程彻底不碰重活。更重要的是：finalize 以前挂在 FastAPI 的
+BackgroundTasks 上，一旦开发时 uvicorn --reload 重启，正在跑的 finalize 会连人带活
+一起消失，会话永远卡在 FINALIZING；搬到 Celery 之后它由独立 worker 持有，不再受影响。
 """
 
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePath
 from uuid import UUID, uuid4
 
-from fastapi import BackgroundTasks
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,10 +38,18 @@ from app.api.schemas.document_uploads import (
 from app.core.config import settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.core.tags import normalize_tags
-from app.db.models import Document, DocumentStatus, UploadSession, UploadSessionStatus
+from app.db.models import (
+    Document,
+    DocumentStatus,
+    IngestionTaskType,
+    UploadSession,
+    UploadSessionStatus,
+)
 from app.db.repositories.document_repo import DocumentRepository
+from app.db.repositories.ingestion_task_repo import IngestionTaskRepository
 from app.db.repositories.upload_session_repo import UploadSessionRepository
-from app.ingestion.pipeline import ingest_document
+from app.db.session import run_worker_coro
+from app.ingestion.tasks import finalize_upload_task, ingest_document_task
 from app.storage.file_service import FileService
 
 # 语法（模块级常量配置）：文件后缀与标准 MIME Type 白名单映射字典
@@ -99,6 +116,9 @@ class DocumentUploadService:
         # 语法（仓储模式组装）：为会话与文档分别初始化独立的 Repository 实例，复用同一事务连接
         self.upload_repo = UploadSessionRepository(session)
         self.document_repo = DocumentRepository(session)
+
+        # 【第 12 期】入库任务台账仓储：建档后要落一条 ingestion_tasks 行再投递 Celery
+        self.task_repo = IngestionTaskRepository(session)
 
         # 语法（短路求值与默认依赖注入）：外部未提供 mock 服务时降级回退至真实云存储服务
         self.file_service = file_service or FileService()
@@ -172,16 +192,21 @@ class DocumentUploadService:
     async def complete_upload(
         self,
         upload_id: UUID,
-        background_tasks: BackgroundTasks,
     ) -> UploadSessionRead:
-        """接收前端上传完成通知，校验云端对象合规性并注册后台异步归档任务。
+        """接收前端上传完成通知，校验云端对象合规性并把收尾任务投递给 Celery。
 
         【参数说明】：
         - upload_id (UUID): 客户端声明已完成上传操作的目标会话主键 ID
-        - background_tasks (BackgroundTasks): FastAPI 框架提供的非阻塞后台任务管理器
 
         【返回值】：
         - UploadSessionRead: 状态流转为 FINALIZING 后的上传会话最新只读视图
+
+        【第 12 期】原先第三个形参 `background_tasks: BackgroundTasks` 已删除：
+        收尾任务改为投递给独立 Celery worker。这里有一个容易被忽略的连带影响 ——
+        worker 是独立进程，`self.finalize_upload` 这个【绑定方法】再也传不过去了
+        （JSON 序列化不了对象，而且另一个进程里也没有这个 self 实例）。
+        所以 finalize 必须先"降级"成一个模块级可导入的任务函数
+        （见文件末尾的 run_finalize_upload_sync）。
 
         【异常说明】：
         - ConflictError: 当会话处于不可完成状态（如非法重入或已过期）时抛出
@@ -220,8 +245,13 @@ class DocumentUploadService:
         upload_session.status = UploadSessionStatus.FINALIZING
         await self.session.commit()
 
-        # 语法（非阻塞异步后台派发）：将耗时的哈希计算、去重排查与建档任务推入后台协程执行
-        background_tasks.add_task(self.finalize_upload, upload_id)
+        # 语法（Celery 任务投递）：finalize_upload_task.delay(str(upload_id))
+        #   【必须 commit 之后再 delay】：worker 拿到任务后会用自己的会话
+        #   SELECT upload_sessions，看不到未提交的 FINALIZING 态就会直接 return，
+        #   表现为"接口返回成功了，但文档永远没建出来"。
+        #   通俗来讲：前台查验无误后把状态盖成"处理中"，再把工单投进邮筒，
+        #            由独立厂区的工人去做哈希、去重与建档，这边立刻打发前端走人。
+        finalize_upload_task.delay(str(upload_id))
 
         # 语法（DTO 映射返回）：将持久态实体映射为 API 响应 Schema
         return UploadSessionRead.model_validate(upload_session)
@@ -257,89 +287,101 @@ class DocumentUploadService:
         await self.session.commit()
 
     async def finalize_upload(self, upload_id: UUID) -> None:
-        """在完全独立的后台数据库会话中，执行哈希指纹提取、秒传去重、生成 Document 实体及解析管线触发。
+        """执行哈希指纹提取、秒传去重、生成 Document 实体，并把入库任务投递给 Celery。
 
         【参数说明】：
         - upload_id (UUID): 待正式归档入库的上传会话主键 ID
+
+        【第 12 期改造：会话来源变了，方法体因此少了一层缩进】
+        改造前它由 FastAPI 的 BackgroundTasks 直接调用，所以自己
+        `async with AsyncSessionLocal()` 开了一个独立会话。
+        现在它由 Celery 任务调用（见文件末尾的 run_finalize_upload_sync），
+        会话改由【调用方】创建并注入 —— 这与 init / complete / abort 三个方法的约定一致：
+        服务方法只使用 self.session，不自己造会话。
         """
-        # 语法（延迟按需导入）：避免在模块顶部形成潜在循环依赖并隔离后台异步上下文
-        from app.db.session import AsyncSessionLocal
+        upload_session = await self.upload_repo.get_by_id(upload_id)
+        if upload_session is None:
+            return
 
-        # 语法（异步上下文管理器）：为后台异步任务独立开辟全新的数据库 Session，杜绝与前台请求会话冲突
-        async with AsyncSessionLocal() as session:
-            # 语法（上下文子服务实例构建）：基于独立 Session 组装当前执行上下文的 Service 实例
-            service = DocumentUploadService(session, file_service=self.file_service)
-            upload_session = await service.upload_repo.get_by_id(upload_id)
-            if upload_session is None:
-                return
+        try:
+            # 语法（流式指纹计算）：通知存储服务拉取流式数据，计算该文件的全局 SHA256 指纹
+            file_hash = await self.file_service.hash_object(upload_session.object_key)
 
-            try:
-                # 语法（流式指纹计算）：通知存储服务拉取流式数据，计算该文件的全局 SHA256 指纹
-                file_hash = await service.file_service.hash_object(upload_session.object_key)
-
-                # 语法（秒传/内容去重排查）：根据指纹在文档表中检索是否已有相同内容的记录
-                existing = await service.document_repo.get_by_hash(file_hash)
-                if existing is not None:
-                    # 语法（重复文件静默去重）：物理清理刚上传的副本对象，直接标记会话完成以实现空间节约
-                    await service.file_service.delete(upload_session.object_key)
-                    upload_session.status = UploadSessionStatus.COMPLETED
-                    upload_session.completed_at = datetime.now(timezone.utc)
-                    await session.commit()
-                    return
-
-                # 语法（正式业务领域实体构建）：当文件内容唯一时，正式创建 Document 持久态实体
-                document = Document(
-                    name=upload_session.original_name,
-                    file_hash=file_hash,
-                    mime_type=upload_session.mime_type,
-                    size=upload_session.expected_size,
-                    storage_provider="cos",
-                    cos_bucket=service.file_service.bucket,
-                    cos_object_key=upload_session.object_key,
-                    cos_region=service.file_service.region,
-                    status=DocumentStatus.UPLOADING,
-                    # 【第 11 期补漏】把 init 阶段暂存的权限标签沉淀到正式文档上。
-                    #
-                    # 【为什么不加这一行会造成安全事故（而不是"少个字段"）】
-                    # Document.permission_tags 的空数组语义是【公开】：
-                    #     permission_tags = []  →  任何登录用户都能看到并检索到这份文档
-                    # 于是"管理员上传时明确设了 ['hr']"的文档，会因为本行缺失而
-                    # 【静默变成全员可见】—— 界面上显示成功、没有任何报错，
-                    # 管理员根本不知道自己的保密设置没生效。
-                    #
-                    # 【为什么两处都要清洗】
-                    # init 阶段已用 normalize_tags 清洗过（写入 UploadSession 时），
-                    # 这里再清洗一次是"最后一道防线"：防止有人绕过 init 直接写库，
-                    # 也顺带把 JSONB 里可能存在的历史脏数据（带空格/重复项）挡在库外。
-                    #
-                    # 【类型说明】UploadSession 上是 JSONB，Document 上是 varchar[]；
-                    # SQLAlchemy 会按目标列类型绑定参数，这里只需给出 list[str]，
-                    # 不需要手工做 JSON↔数组 的转换。
-                    permission_tags=normalize_tags(upload_session.permission_tags or []),
-                )
-
-                # 语法（文档持久化注册）：调用 DocumentRepository 挂载新增记录并获取生成列
-                await service.document_repo.add(document)
-
-                # 语法（双边状态同步与事务提交）：置会话为 COMPLETED，锁定完成时间并统一 Commit
+            # 语法（秒传/内容去重排查）：根据指纹在文档表中检索是否已有相同内容的记录
+            existing = await self.document_repo.get_by_hash(file_hash)
+            if existing is not None:
+                # 语法（重复文件静默去重）：物理清理刚上传的副本对象，直接标记会话完成以实现空间节约
+                await self.file_service.delete(upload_session.object_key)
                 upload_session.status = UploadSessionStatus.COMPLETED
                 upload_session.completed_at = datetime.now(timezone.utc)
-                await session.commit()
+                await self.session.commit()
+                return
 
-                # 语法（异步编排解耦派发）：事务成功提交后，正式将文档 ID 移交给下游解析摄取流水线
-                await ingest_document(document.id)
+            # 语法（正式业务领域实体构建）：当文件内容唯一时，正式创建 Document 持久态实体
+            document = Document(
+                name=upload_session.original_name,
+                file_hash=file_hash,
+                mime_type=upload_session.mime_type,
+                size=upload_session.expected_size,
+                storage_provider="cos",
+                cos_bucket=self.file_service.bucket,
+                cos_object_key=upload_session.object_key,
+                cos_region=self.file_service.region,
+                status=DocumentStatus.UPLOADING,
+                # 【第 11 期补漏】把 init 阶段暂存的权限标签沉淀到正式文档上。
+                #
+                # 【为什么不加这一行会造成安全事故（而不是"少个字段"）】
+                # Document.permission_tags 的空数组语义是【公开】：
+                #     permission_tags = []  →  任何登录用户都能看到并检索到这份文档
+                # 于是"管理员上传时明确设了 ['hr']"的文档，会因为本行缺失而
+                # 【静默变成全员可见】—— 界面上显示成功、没有任何报错，
+                # 管理员根本不知道自己的保密设置没生效。
+                #
+                # 【为什么两处都要清洗】
+                # init 阶段已用 normalize_tags 清洗过（写入 UploadSession 时），
+                # 这里再清洗一次是"最后一道防线"：防止有人绕过 init 直接写库，
+                # 也顺带把 JSONB 里可能存在的历史脏数据（带空格/重复项）挡在库外。
+                #
+                # 【类型说明】UploadSession 上是 JSONB，Document 上是 varchar[]；
+                # SQLAlchemy 会按目标列类型绑定参数，这里只需给出 list[str]，
+                # 不需要手工做 JSON↔数组 的转换。
+                permission_tags=normalize_tags(upload_session.permission_tags or []),
+            )
 
-            except Exception as exc:
-                # 语法（失败主动回滚与孤儿状态标记）：捕获未知异常，回滚未决变更，并将该会话标记为 FAILED 并存入错误堆栈
-                await session.rollback()
-                upload_session = await service.upload_repo.get_by_id(upload_id)
-                if upload_session is not None:
-                    upload_session.status = UploadSessionStatus.FAILED
-                    # 语法（字符串截断保护）：限制错误堆栈长度不超过 2000 字符，防止溢出数据库列宽
-                    upload_session.error_message = str(exc)[:2000]
-                    await session.commit()
-                # 语法（异常继续冒泡）：供上层监控和日志中间件捕获感知
-                raise
+            # 语法（文档持久化注册）：调用 DocumentRepository 挂载新增记录并获取生成列
+            #   add() 内部会 flush 一次，因此下一行就能安全地取到 document.id。
+            await self.document_repo.add(document)
+
+            # 【第 12 期】建档与任务台账【同一次 commit】。
+            #   为什么要绑在一起：否则可能出现"文档建好了、任务记录没建"的半成品状态 ——
+            #   前端看到一份永远没人处理的文档，而且没有任何记录能解释它为什么没动。
+            task = await self.task_repo.create(document.id, IngestionTaskType.INGEST)
+
+            # 语法（双边状态同步与事务提交）：置会话为 COMPLETED，锁定完成时间并统一 Commit
+            upload_session.status = UploadSessionStatus.COMPLETED
+            upload_session.completed_at = datetime.now(timezone.utc)
+            await self.session.commit()
+
+            # 语法（Celery 任务投递）：事务成功提交后，把文档移交给下游解析摄取流水线
+            #   【第 12 期最关键的一处改动】改造前这里是 `await ingest_document(document.id)`
+            #   —— 它会【当场】把下载、解析、切分、向量化、落库全部跑完，
+            #   于是 finalize 这个"收尾任务"实际要跑几十秒，而且还是在 API 进程里跑。
+            #   现在只往队列投一条消息就返回，重活交给独立 worker。
+            #   ⚠️ 这正是教程漏掉的位置：教程只改了 DocumentService.upload / retry，
+            #      而前端【实际走的是直传链路】，不改这里等于整个改造没生效。
+            ingest_document_task.delay(str(document.id), str(task.id))
+
+        except Exception as exc:
+            # 语法（失败主动回滚与孤儿状态标记）：捕获未知异常，回滚未决变更，并将该会话标记为 FAILED 并存入错误堆栈
+            await self.session.rollback()
+            upload_session = await self.upload_repo.get_by_id(upload_id)
+            if upload_session is not None:
+                upload_session.status = UploadSessionStatus.FAILED
+                # 语法（字符串截断保护）：限制错误堆栈长度不超过 2000 字符，防止溢出数据库列宽
+                upload_session.error_message = str(exc)[:2000]
+                await self.session.commit()
+            # 语法（异常继续冒泡）：供上层监控和日志中间件捕获感知
+            raise
 
     async def cleanup_expired(self) -> int:
         """周期性清理已超时的未完成会话，物理回收孤儿存储对象，并同步更新状态为 EXPIRED。
@@ -409,3 +451,44 @@ class DocumentUploadService:
 
             # 语法（业务冲突中断抛出）：终止业务链路继续执行
             raise ConflictError("上传会话已过期")
+
+
+# ==============================================================================
+# Celery sync 入口（直传链路专用）
+# ==============================================================================
+# 【为什么直传链路需要这一层，而旧链路不需要】
+# 旧链路的入库重活（解析/切分/向量化）本来就在 pipeline 里，只要给 pipeline
+# 加一个 run_ingest_sync 就够了。
+# 但直传链路不一样：它的"收尾"是【服务层的一个方法】(finalize_upload)，
+# 而 Celery 的任务必须是【模块级、可导入、同步】的可调用对象 ——
+#   * 绑定方法 self.finalize_upload 序列化不了，另一个进程里也没有那个 self；
+#   * 它本身还是 async 的，而任务函数必须同步。
+# 所以这里把它包装成"模块级 async 函数 + 同步入口"两级：
+#   finalize_upload_task（app/ingestion/tasks.py）
+#       → run_finalize_upload_sync（本文件，同步入口）
+#           → _run_finalize_upload（本文件，自己开会话）
+#               → DocumentUploadService.finalize_upload（真正的业务方法）
+#
+# 【同步入口为什么用 run_worker_coro 而不是 asyncio.run】
+# 与 pipeline.run_ingest_sync 同一个原因，而且这里正是实测【第一个】踩中的位置：
+# 本例的 finalize_upload 与 ingest_document 是串联投递的两个任务，
+# 前者用 asyncio.run 关掉循环后，后者复用到池中那条"属于已关闭循环"的连接，
+# 直接 AttributeError: 'NoneType' object has no attribute 'send'。
+# 完整根因与修法见 app/db/session.py 中 run_worker_coro 的注释。
+async def _run_finalize_upload(upload_id: UUID) -> None:
+    """在【独立数据库会话】中执行 finalize。
+
+    worker 进程与 API 进程完全隔离，没有任何请求级会话可以复用，
+    因此必须在这里自己开一个 —— 与 pipeline._run_ingest 的做法一致。
+    """
+    # 语法（延迟按需导入）：与改造前 finalize_upload 内部的写法保持一致，
+    #   目的是隔离"后台异步上下文"，同时避免模块顶层形成潜在循环依赖。
+    from app.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        await DocumentUploadService(session).finalize_upload(upload_id)
+
+
+def run_finalize_upload_sync(upload_id: UUID) -> None:
+    """同步入口：由 Celery worker 的任务函数调用。"""
+    run_worker_coro(_run_finalize_upload(upload_id))
