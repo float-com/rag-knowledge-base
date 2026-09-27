@@ -28,7 +28,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, RateLimited
 from app.api.schemas.chat import (
     ChatRequest,
     ConversationCreate,
@@ -139,6 +139,11 @@ async def get_conversation(
 async def stream_chat(
     conversation_id: UUID,
     user: CurrentUser,
+    # 【第 12 期】限流闸门：SSE 问答是最"贵"的入口（一次调用要烧 embedding、
+    #   检索、rerank 与 LLM 生成），因此必须挂限流。
+    #   下划线前缀表示函数体不用它的值，但 FastAPI 仍会完整执行依赖 ——
+    #   超限时在进入函数体之前就抛 429，前端拿到的是明确的"请求过于频繁"。
+    _rate_limit: RateLimited,
     payload: ChatRequest,
     session: DbSession,
 ) -> AsyncIterable[ServerSentEvent]:

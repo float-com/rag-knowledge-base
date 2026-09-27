@@ -6,7 +6,9 @@ from uuid import UUID
 from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.exceptions import PermissionDeniedError, UnauthorizedError
+from app.core.rate_limiter import get_rate_limiter
 from app.core.security import decode_access_token
 from app.db.models import User, UserStatus
 from app.db.repositories.user_repo import UserRepository
@@ -190,3 +192,44 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 # 用法：@router.delete("/users/{id}")
 #      async def delete_user(admin: CurrentAdmin): return "ok"
 CurrentAdmin = Annotated[User, Depends(get_current_admin)]
+
+
+# =============================================================================
+# 限流依赖（第 12 期）：滑动窗口，按 user_id 维度
+# =============================================================================
+async def enforce_rate_limit(
+    user: Annotated[User, Depends(get_current_user)],
+) -> None:
+    """滑动窗口限流：按 user_id 维度，每分钟最多 RATE_LIMIT_PER_MINUTE 次。
+
+    :param user: 由 get_current_user 注入的已认证用户（这里只用到它的 id）
+    :raises RateLimitError: 窗口内超限时抛 429
+
+    【为什么依赖里要 Depends(get_current_user)，而不是自己解析令牌】
+    两个好处：
+      ① 顺序天然正确 —— FastAPI 会先解析当前用户、再执行本函数，
+         所以走到限流时 user 一定已经就绪，可以拿到稳定的 user_id 做维度；
+      ② 未登录请求在 get_current_user 那一步就 401 了，根本进不到限流逻辑 ——
+         **匿名请求不该占用限流配额**（它们连身份都没有，无从谈起"按用户限"）。
+    代价是同一请求会解析两次令牌？不会：FastAPI 的依赖缓存让
+    get_current_user 在一次请求内只执行一次，路由里再声明 CurrentUser 也复用同一结果。
+
+    【挂在哪些接口上一一有讲究（教程明确划分）】
+    - 挂：chat（SSE 问答）、upload（上传）、reindex（重建索引）
+          —— 这三个都是"重"操作：要么烧 token，要么烧解析与向量化算力；
+    - 不挂：list / get 等读接口
+          —— 前端文档列表有 3 秒轮询，若给读接口也限流，
+             正常用户光靠轮询就会把自己限住，得不偿失。
+    - 匿名 / API Key 入口的限流：留给第 13 章的 MCP，本期不做。
+    """
+    if not settings.rate_limit_enabled:
+        # 总开关关掉时直接放行（依赖仍挂在路由上，便于本地压测时一键关闭限流）
+        return
+    await get_rate_limiter().check(f"user:{user.id}")
+
+
+# 【限流闸门】：只用于触发依赖，函数体里用不到它的值。
+# 用法：async def stream_chat(user: CurrentUser, _rate_limit: RateLimited, ...): ...
+#   ⚠️ 下划线前缀只是"我不使用这个值"的约定，**不会**影响 FastAPI 执行依赖 ——
+#      超限时照样在进入函数体之前就抛 429。
+RateLimited = Annotated[None, Depends(enforce_rate_limit)]

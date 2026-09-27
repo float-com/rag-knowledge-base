@@ -33,7 +33,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Response
 
-from app.api.deps import DbSession
+# 【第 12 期补漏】本模块的三个端点此前【既没有鉴权、也没有限流】：
+#   - 第 11 期加鉴权时按"文件"排查，只改了 routes/documents.py 的 multipart 旧链路；
+#   - 第 12 期加限流时又踩了同一个坑（教程说"upload"，于是只改 documents.py 的 upload）。
+#   而【前端实际上传用的是直传链路】（directDocumentUpload.ts → /uploads/init + /complete），
+#   所以那两次改造对真正的上传行为都没有生效。
+#   前端一直带着 Bearer 令牌（requestJson 内部已注入 authHeaders），
+#   因此补上依赖是纯后端改动、前端零改动。
+from app.api.deps import CurrentAdmin, DbSession, RateLimited
 from app.api.schemas.document_uploads import (
     InitUploadRequest,
     InitUploadResponse,
@@ -61,6 +68,13 @@ router = APIRouter(prefix="/documents/uploads", tags=["document-uploads"])
 async def init_upload(
     payload: InitUploadRequest,
     session: DbSession,
+    # 【第 12 期】写操作，要求管理员 —— 与旧链路 POST /documents 保持一致口径。
+    #   未登录 → 401；非管理员 → 403。
+    _: CurrentAdmin,
+    # 【第 12 期】限流：init 会给出一枚有效的 COS 预签名 URL（可往桶里写对象），
+    #   属于必须保护的重操作。它同样依赖 get_current_user，
+    #   与上面的 CurrentAdmin 复用同一次用户解析（FastAPI 依赖缓存）。
+    _rate_limit: RateLimited,
 ) -> InitUploadResponse:
     """创建直传会话并返回 COS 预签名 PUT 地址。
 
@@ -73,7 +87,11 @@ async def init_upload(
     - 生成客户端可直传的有时效性预签名 PUT URL。
     """
     # 语法（服务装配与用例调用）：await DocumentUploadService(session).init_upload(payload)
-    #   特性：注入当前请求的异步数据库会话，由领域服务执行鉴权、入库与签名计算
+    #   特性：注入当前请求的异步数据库会话，由领域服务执行【入库与签名计算】
+    #   ⚠️ 更正：这里原先写的是"由领域服务执行鉴权" —— 那是错的。
+    #      服务层拿不到请求上下文，从来不做鉴权；鉴权由上面新增的 CurrentAdmin 依赖完成。
+    #      错误的注释比没有注释更危险：它会让下一个人以为"鉴权已经做过了"而不去检查，
+    #      第 11 期的漏检就与它有关。第 12 期补依赖时一并更正。
     #   通俗来讲：叫直传总管来开一张通行证，登记在册并把直传链接交出来。
     return await DocumentUploadService(session).init_upload(payload)
 
@@ -90,6 +108,11 @@ async def complete_upload(
     upload_id: UUID,
     session: DbSession,
     background_tasks: BackgroundTasks,
+    # 【第 12 期】写操作，要求管理员；同时限流 ——
+    #   它会让服务端去 COS 校验对象、建出 Document 记录并触发解析流水线，
+    #   是"未登录也能让别人替我烧算力"的那扇门，必须挂闸门。
+    _: CurrentAdmin,
+    _rate_limit: RateLimited,
 ) -> UploadSessionRead:
     """校验 COS 对象并将会话交给后台 finalize。
 
@@ -121,7 +144,18 @@ async def complete_upload(
     status_code=204,
     operation_id="abortDocumentUpload",
 )
-async def abort_upload(upload_id: UUID, session: DbSession) -> Response:
+async def abort_upload(
+    upload_id: UUID,
+    session: DbSession,
+    # 【第 12 期】只补鉴权，【不挂限流】。两个理由：
+    #   ① 它不可限流漏 —— 只要知道 upload_id 就能删掉 COS 上的临时对象，
+    #      未登录可调用是明确的安全缺口；
+    #   ② 但它是低频操作（用户取消上传时才触发），不是"烧钱"的重操作，
+    #      挂限流收益很小，反而可能干扰"连点取消"这类正常交互。
+    #   ⚠️ 注意：本端点不会校验该 upload_id 属于谁 —— 会话表里没有 owner 字段
+    #      （见 BUG发现与处理/02_2026.9.26/02 的说明）。当前只做到"必须是管理员"。
+    _: CurrentAdmin,
+) -> Response:
     """取消未完成上传并清理临时 COS 对象。
 
     【调用时机】：

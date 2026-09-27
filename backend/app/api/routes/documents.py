@@ -45,7 +45,13 @@ from fastapi import (
     UploadFile,
 )
 
-from app.api.deps import CurrentAdmin, CurrentUser, DbSession, get_current_user
+from app.api.deps import (
+    CurrentAdmin,
+    CurrentUser,
+    DbSession,
+    RateLimited,
+    get_current_user,
+)
 from app.api.schemas.documents import (
     DocumentChunkDetail,
     DocumentChunkListResponse,
@@ -112,6 +118,11 @@ def _viewer_tags(user: User) -> list[str] | None:
 )
 async def upload_document(
     admin: CurrentAdmin,
+    # 【第 12 期】限流闸门：上传是另一个"重"入口 ——
+    #   一次上传要落 COS、启动解析流水线、上百次 embedding。
+    #   ⚠️ 注意只给 upload 挂，不给列表/详情等读接口挂：
+    #   前端文档列表有 3 秒轮询，给读接口限流会误伤正常用户。
+    _rate_limit: RateLimited,
     session: DbSession,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(
