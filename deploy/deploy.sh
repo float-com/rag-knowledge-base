@@ -123,8 +123,16 @@ if [[ -L docker-compose.override.yml ]]; then
 elif [[ -e docker-compose.override.yml ]]; then
   c_warn "docker-compose.override.yml 已存在但不是软链接，跳过（请确认内容是否为端口覆盖）"
 else
+  # ⚠️ 建链接前必须确认目标存在。历史上真出过这个坑：
+  #   .gitignore 里的规则写成了不带前导斜杠的 `docker-compose.override.yml`，
+  #   于是它把 deploy/ 下的【源文件】也一起忽略了 → 服务器 clone 下来没有源文件，
+  #   这里就会建出一个【悬空软链接】，端口覆盖静默失效，PG/Redis 仍绑 0.0.0.0。
+  #   悬空链接本身不报错，compose 也照跑 —— 属于"看起来成功、实际没生效"那类失败。
+  [[ -f deploy/docker-compose.override.yml ]] || die "找不到 deploy/docker-compose.override.yml
+      （它本该在仓库里；若缺失说明被 .gitignore 误伤或未提交 —— 没有它端口覆盖会失效）"
   ln -s deploy/docker-compose.override.yml docker-compose.override.yml
   c_ok "已创建软链接 → deploy/docker-compose.override.yml"
+  [[ -f docker-compose.override.yml ]] || die "软链接建好后仍取不到文件（悬空链接），请检查符号链接支持"
 fi
 
 # ---------- 3. 起 postgres + redis 并【验证端口收回回环】 ----------

@@ -63,8 +63,44 @@ def check_config_gate():
 
 
 def check_rate_limit_module():
-    print("\n=== 修复 4：MCP 限流（真实实现 + 阈值打桩）===")
+    print("\n=== 修复 4：MCP 限流（先验接线，再验行为）===")
     sys.path.insert(0, str(ROOT / "backend"))
+
+    # ---------------------------------------------------------------
+    # ★ 第一层：静态接线检查（这一层是 2026-09-28 补上的盲区）
+    # ---------------------------------------------------------------
+    # 【为什么必须单独加这一层】
+    # 下面那层"行为测试"是直接调 enforce_tool_limit 的 ——
+    # 所以即使 tools.py 里【一行调用都没有】，行为测试照样全绿。
+    # 真实发生过：limits.py 存在、行为测试通过，但工具里没有接线，
+    # 等于 P0-4 完全没生效，而测试却报 OK。属于"测了模块、没测装配"。
+    import ast
+    tools_src = (ROOT / "backend/app/mcp_server/tools.py").read_text(encoding="utf-8")
+    tree = ast.parse(tools_src)
+    wired: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in (
+            "ask_knowledge_base", "upload_document", "list_documents",
+            "get_document_status", "get_knowledge_base_stats",
+        ):
+            body = ast.get_source_segment(tools_src, node) or ""
+            wired[node.name] = "enforce_tool_limit" in body
+
+    if "from app.mcp_server.limits import enforce_tool_limit" not in tools_src:
+        bad("tools.py 没有 import enforce_tool_limit —— 限流器不会被调用")
+    else:
+        ok("tools.py 已 import enforce_tool_limit")
+
+    for name in ("ask_knowledge_base", "upload_document"):
+        (ok(f"{name} 已挂限流") if wired.get(name) else
+         bad(f"★ {name} 没挂限流 —— MCP 烧钱工具可被无限刷"))
+    for name in ("list_documents", "get_document_status", "get_knowledge_base_stats"):
+        (ok(f"{name} 未挂限流（只读，符合设计）") if not wired.get(name) else
+         warn(f"{name} 也挂了限流", "只读工具不该限流：会让 Agent 的正常轮询被限死"))
+
+    # ---------------------------------------------------------------
+    # 第二层：行为测试（阈值打桩，真实实现）
+    # ---------------------------------------------------------------
     from app.core.config import settings
     from app.core.exceptions import RateLimitError
     from app.core.redis import get_redis

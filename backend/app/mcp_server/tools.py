@@ -77,6 +77,11 @@ from app.core.logging import get_logger
 from app.db.models import DocumentStatus, IngestionTask, User
 from app.db.session import AsyncSessionLocal
 from app.mcp_server.auth import require_admin, resolve_current_user
+# ★ MCP 工具级限流（第 13 期上线前补齐）：
+#   MCP 是 app.mount("/mcp", ...) 挂进来的独立 ASGI 子应用，**不走 FastAPI 依赖链**，
+#   所以第 12 期给 REST 挂的 enforce_rate_limit 对它完全无效。
+#   只给"烧钱"的工具挂（ask 烧 LLM、upload 烧 embedding+COS），只读工具刻意不挂。
+from app.mcp_server.limits import enforce_tool_limit
 from app.mcp_server.schemas import (
     MCPAnswer,
     MCPCitation,
@@ -132,6 +137,10 @@ def register_tools(mcp: FastMCP) -> None:
         （第 2 章 resolve_current_user：Context → Bearer 令牌 → 查库 → 活跃用户）。
         """
         user = await resolve_current_user(ctx)
+
+        # 【步骤 1b：限流】★ 必挂：本工具会真实调用 LLM（第 4 章 answer_for_mcp）。
+        # 没有这一行，MCP 通道就是绕过第 12 期限流设计的一条捷径。
+        await enforce_tool_limit(user, scope="ask")
 
         # 【步骤 2：挡参数】MCP 的参数来自外部 Agent，不能假设它一定传了有效内容。
         # 空字符串也能通过协议层的类型校验（str 类型本身没问题），所以必须自己挡。
@@ -200,6 +209,10 @@ def register_tools(mcp: FastMCP) -> None:
         """
         admin = await resolve_current_user(ctx)
         require_admin(admin)
+
+        # 【步骤 1b：限流】★ 必挂：上传会烧 embedding（Celery 里向量化）并写入 COS。
+        # 用独立 scope，避免"传一个大文件把问答额度吃光"。
+        await enforce_tool_limit(admin, scope="upload")
 
         # 【步骤 2：挡参数】文件名不能是空白 —— 服务层要靠后缀与 MIME 双向比对来拦截非法类型。
         if not filename.strip():

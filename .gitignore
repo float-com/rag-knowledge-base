@@ -10,11 +10,11 @@ AGENTS.md.local
 *.key
 
 # ===== 生产部署的 compose override 软链接（第 13 期）=====
-# deploy/docker-compose.override.yml 是【源文件】（要进仓库），
-# 而根目录这个同名软链接是【服务器上临时建立的】——它会被 compose 自动加载，
-# 一旦提交，别人 clone 后本地 `docker compose up` 就会套用生产端口（55432/56379），
-# 而他们本地 .env 写的是 5432/6379 → 连不上库且现象诡异。
-docker-compose.override.yml
+# ⚠️ 必须写成 /docker-compose.override.yml（带前导斜杠 = 只匹配仓库根目录）：
+#   不带斜杠的写法会匹配【任意目录】下的同名文件，把 deploy/docker-compose.override.yml
+#   这个【源文件】也一起忽略掉 —— 那样服务器 clone 下来就没有覆盖文件，
+#   表现为"软链接指向不存在的文件"，端口覆盖失效 → PG/Redis 仍绑 0.0.0.0（数据库裸奔）。
+/docker-compose.override.yml
 
 # ===== Python =====
 __pycache__/
