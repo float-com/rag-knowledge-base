@@ -6,6 +6,9 @@ AGENTS.md.local
 .env
 .env.*
 !.env.example
+# 生产变量文件模板（第 13 期）：只含占位符、可以提交；
+# 真正填了值的 .env.prod 仍被上面的 .env.* 规则忽略
+!.env.prod.example
 *.pem
 *.key
 
