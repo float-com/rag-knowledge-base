@@ -1,0 +1,36 @@
+[Unit]
+# RAG KB 后端（uvicorn）——由 systemd 常驻管理
+#
+# 【为什么需要它】开发环境用 `uv run uvicorn app.main:app --reload` 跑在终端里，
+# 关掉终端进程就没了。生产环境要让它在后台长期运行、崩溃自动重启、开机自启。
+Description=RAG KB API (uvicorn)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# 工作目录必须是 backend：alembic.ini / .env 的相对路径都基于它
+WorkingDirectory=/www/wwwroot/rag-kb/backend
+# 从项目根的 .env 读配置（app.core.config.settings 会读这个文件）
+EnvironmentFile=/www/wwwroot/rag-kb/.env
+
+# ⚠️ 【部署时必改】下面这个 uv 路径是宝塔面板安装 Python 环境的实际路径。
+#    用 `which uv` 查你自己服务器上的位置，然后替换掉。
+#    —— 路径写错的表现是"服务启动即失败"，systemctl status 里能看到找不到可执行文件。
+#
+# --host 127.0.0.1：只监听本地，对外由 Nginx 反代（不要把后端直接暴露到公网）
+# --port 8100：避开开发环境常用的 8000，也避开面板占用
+ExecStart=/www/server/pyporject_evn/versions/3.12.3/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8100
+
+# 首次启动时 uv 可能要解析/下载依赖，给足超时（5 分钟）
+TimeoutStartSec=300
+# 进程异常退出时自动重启，隔 3 秒重试
+Restart=on-failure
+RestartSec=3
+
+# 日志落到文件，方便排查（目录由 deploy.sh 创建）
+StandardOutput=append:/var/log/rag-kb/api.log
+StandardError=append:/var/log/rag-kb/api.err.log
+
+[Install]
+WantedBy=multi-user.target

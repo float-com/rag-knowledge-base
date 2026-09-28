@@ -1,0 +1,33 @@
+[Unit]
+# RAG KB Celery Worker ——文档解析 / 切分 / 向量化（第 12 期）
+#
+# 【负责什么】文档上传后，重活（Docling 解析、embedding、写切片）由它异步执行。
+# 没有它，上传的文档会永远停在 uploading/parsing。
+Description=RAG KB Celery worker
+After=network.target docker.service rag-kb-api.service
+# 比 api 多依赖一个 rag-kb-api.service：让 worker 在后端之后启动
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/www/wwwroot/rag-kb/backend
+EnvironmentFile=/www/wwwroot/rag-kb/.env
+
+# ⚠️ 【部署时必改】同 api：用 `which uv` 查实际路径后替换
+#
+# --concurrency=2：2 核服务器开 2 个 worker。
+#   文档解析本身是 CPU 密集型（Docling 版面分析），开太多反而互相抢资源；
+#   且 4GB 内存下并发解析极易 OOM（单个 PDF 解析峰值可达 1.5~3GB）。
+#   ⚠️ 本机（Windows）开发时用的是 --pool=solo，那是 Windows 不支持 prefork 的缘故；
+#      Linux 生产环境用默认 prefork 池即可，不加 --pool 参数。
+ExecStart=/www/server/pyporject_evn/versions/3.12.3/bin/uv run celery -A app.celery_app worker -l info --concurrency=2
+
+# 进程异常退出时自动重启
+Restart=on-failure
+RestartSec=3
+
+StandardOutput=append:/var/log/rag-kb/celery.log
+StandardError=append:/var/log/rag-kb/celery.err.log
+
+[Install]
+WantedBy=multi-user.target

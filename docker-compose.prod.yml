@@ -5,29 +5,37 @@
 # 一旦撤掉端口映射，本地立刻就连不上库。所以生产形态单独成文件：
 #
 #     本地开发：docker compose up -d postgres redis    +  宿主机跑 uvicorn / celery
-#     生产部署：docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#     生产部署：docker compose --env-file .env -f docker-compose.prod.yml up -d --build
 #
 # 生产形态的三个关键差异（都是上线前必须解决的 P0）：
 #   ① 数据库与 Redis【不发布端口到宿主机】—— 只留在 compose 内网，外部扫不到 5432/6379
 #   ② 连接串走服务名（postgres / redis），api / worker 进容器，不再依赖 localhost
-#   ③ ★ 用独立的 .env.prod：这是唯一能真正换掉弱口令的办法（见下）
+#   ③ ★ 服务器上的 .env 必须换成生产值（弱口令、localhost 连接串都要换掉）
 #
 # =============================================================================
-# ★ 为什么必须用 --env-file .env.prod（这一条踩过坑，值得单独说）
+# ★ 为什么命令里要显式写 --env-file .env
 # =============================================================================
-# 第一版我在这里写了 `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?...}`，以为能用 ${VAR:?} 强制要求
-# 显式提供口令。实测【无效】：因为项目根目录已经有一个 .env（本地开发用的，里面是
-# POSTGRES_PASSWORD=rag），docker compose 会【自动读取 .env】并把它当作变量来源 ——
-# 于是 ${VAR:?} 拿到的是 "rag"，检查通过，弱口令照样生效。
+# 【第一版踩的两个坑，都留在这里别再犯】
 #
-# 结论：compose 的变量插值永远会先看自动加载的 .env，靠 :? 拦不住"存在的弱值"。
-# 正确做法是【换一个变量文件】：
+# 坑 1：写过 `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?...}`，以为 ${VAR:?} 能强制要求口令。
+#   实测【无效】—— docker compose 会【自动读取项目根目录的 .env】并把它当作变量来源，
+#   而那份 .env 是本地开发用的（POSTGRES_PASSWORD=rag），于是 :? 拿到的是 "rag"，
+#   检查通过、弱口令照样生效。结论：**compose 的 :? 拦不住"存在的弱值"**。
 #
-#     cp .env.example .env.prod      # 然后逐项改成生产值
-#     docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+# 坑 2：本文件早期版本引用过 env_file: .env.prod。那样等于要维护【第二个变量文件】，
+#   和 .env.example 必然漂移（多一处维护 = 迟早漏同步）。已改为只认一个文件名：.env。
 #
-# 注意顺序：--env-file 既提供插值变量（POSTGRES_PASSWORD 等），
-# 也通过 env_file 注入容器（见下面 api/worker 的 env_file），两处都用它。
+# 现在只保留一个变量文件（服务器上的 .env，从 .env.example 复制而来），
+# 命令里显式写 `--env-file .env` 是为了【明确表达意图】：
+#   不加这个参数，compose 也会自动读 .env；加上它，读的是同一个文件、但语义清楚，
+#   将来若改用别的文件名（如 .env.server）只需改命令，不用动本文件。
+#
+#     cp .env.example .env     # 服务器上：复制模板
+#     vi .env                  # 改 4 项（见 08_上线前检查单.md）
+#     docker compose --env-file .env -f docker-compose.prod.yml up -d --build
+#
+# ⚠️ 变量是通过本文件里逐项写出的 `environment:` 注入容器的（不是 env_file），
+#    所以新增配置项时要在这里补一行 —— 属于刻意：让"容器拿到什么配置"一眼可查。
 
 services:
   postgres:
@@ -36,7 +44,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-rag}
-      # 生产值必须来自 .env.prod；这里不写 :-rag 兜底，缺了就连接失败而不是静默用弱口令
+      # 生产值必须来自服务器上的 .env；这里不写 :-rag 兜底，缺了就连接失败而不是静默用弱口令
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-rag_kb}
     # ★ 只在内网暴露，不映射到宿主机
@@ -78,11 +86,11 @@ services:
       # 【为什么这里不用 env_file，而是逐项列出】
       # ① env_file 指向的文件必须【真实存在】，否则连 `config` 都跑不起来 ——
       #    而生产密钥文件不该进仓库，等于给部署加了一道"先手动建文件"的隐性门槛；
-      # ② 用 --env-file .env.prod 时，compose 会把这些变量渲染进下面的 environment，
+      # ② 用 --env-file .env 时，compose 会把这些变量渲染进下面的 environment，
       #    效果等价，但缺文件时报错信息清楚得多（"env file not found"）。
       # 因此：所有配置项显式列出，值全部来自部署时提供的变量文件 / 环境变量。
       #
-      # ---- 应用配置（生产值来自 .env.prod）----
+      # ---- 应用配置（生产值来自服务器 .env）----
       APP_NAME: ${APP_NAME:-rag-knowledge-base}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: production          # ★ 触发 config.py 里的 JWT 硬失败检查
@@ -210,7 +218,7 @@ volumes:
   rag_kb_models:
 
 # =============================================================================
-# 生产 .env.prod 必须确认的项（复制 .env.example 后逐项修改）
+# 生产 .env 必须确认的项（复制 .env.example 后逐项修改）
 # =============================================================================
 #
 #   ENVIRONMENT=production                  ← 触发 JWT 硬失败检查（见 config.py）
@@ -219,7 +227,7 @@ volumes:
 #   DEFAULT_ADMIN_PASSWORD=<强口令>         ← 不要再用 admin
 #   CORS_ORIGINS=https://你的前端域名       ← 不能留 localhost:5173
 #
-#   ⚠️ DATABASE_URL / REDIS_URL / CELERY_* 在 .env.prod 里可以保留 localhost 写法：
+#   ⚠️ DATABASE_URL / REDIS_URL / CELERY_* 在服务器 .env 里可以保留 localhost 写法：
 #      本文件的 api / worker 已用 environment 段【覆盖】成服务名（postgres / redis）。
 #      但如果你直接在宿主机跑 uvicorn 连生产库，就必须自己把 host 改掉 ——
 #      那种"半容器半宿主机"的混合部署最容易连错库，建议统一走容器。
@@ -228,5 +236,5 @@ volumes:
 #      docker exec rag-kb-postgres psql -U rag -d postgres -c "ALTER USER rag WITH PASSWORD '<新口令>';"
 #
 #   ⚠️ 首次部署要预热 Docling 模型（否则 PDF 解析必失败，第 12 期 BUG-05 那个坑）：
-#      docker compose --env-file .env.prod -f docker-compose.prod.yml \
+#      docker compose --env-file .env -f docker-compose.prod.yml \
 #        run --rm api python scripts/preheat_models.py

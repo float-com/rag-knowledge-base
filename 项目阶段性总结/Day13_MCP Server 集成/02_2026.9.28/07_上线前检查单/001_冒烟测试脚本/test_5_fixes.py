@@ -209,22 +209,43 @@ def check_prod_compose():
 
 
 def check_env_examples():
-    print("\n=== 修复 3：默认口令不再可直接登录 ===")
+    """检查默认口令与部署开关的"必须有文档说明"。
+
+    【本函数在 2026-09-28 修订，记录一次返工】
+    原版本检查的是 `.env.prod.example`（一个额外加的生产模板文件）。
+    后来确认那是多余设计 —— 项目本来就只有一个 `.env.example`，
+    再加一个模板会造成【两处维护、必然漂移】（与项目里"只改一处漏掉同名清单"是同一类问题）。
+    因此该文件已删除，检查项改为：
+      ① `.env.example` 里的默认管理员口令不能是可直接登录的弱值
+      ② 部署时"要设 ENVIRONMENT=production"这件事必须写在部署文档里
+         （因为 config.py 的硬校验靠它触发，而它刻意不放进开发模板）
+    """
+    print("\n=== 修复 3：默认口令 + 部署开关有明确出处 ===")
     ex = (ROOT / ".env.example").read_text(encoding="utf-8", errors="ignore")
     line = [l for l in ex.splitlines() if l.startswith("DEFAULT_ADMIN_PASSWORD=")]
     if line and line[0].strip() != "DEFAULT_ADMIN_PASSWORD=admin":
         ok(".env.example 的默认口令已改成占位符", line[0].strip())
     else:
         bad("★ .env.example 仍是 admin", str(line))
-    if (ROOT / ".env.prod.example").exists():
-        ok(".env.prod.example 已提供（含占位说明）")
+
+    # ★ 关键校验：ENVIRONMENT=production 这个要求必须有文档承载
+    #   （它不在 .env.example 里是刻意的 —— 开发模板不该出现部署开关）
+    checklist = ROOT / "项目阶段性总结/Day13_MCP Server 集成/02_2026.9.28/07_上线前检查单/08_上线前检查单.md"
+    if checklist.exists():
+        text = checklist.read_text(encoding="utf-8", errors="ignore")
+        if "ENVIRONMENT=production" in text:
+            ok("部署文档里写明了必须设 ENVIRONMENT=production")
+        else:
+            bad("部署文档缺少 ENVIRONMENT=production 的说明", "P0-2 的硬校验将无法触发")
     else:
-        bad(".env.prod.example 缺失")
-    gi = (ROOT / ".gitignore").read_text(encoding="utf-8", errors="ignore")
-    if "!.env.prod.example" in gi and ".env.*" in gi:
-        ok(".gitignore：.env.prod 被忽略、模板被放行")
+        bad("上线前检查单不存在", str(checklist))
+
+    # 反面校验：不该再出现第二个环境变量模板（避免两处维护）
+    leftovers = [p.name for p in ROOT.glob(".env*.example") if p.name != ".env.example"]
+    if leftovers:
+        bad("存在多余的环境变量模板（会造成两处维护）", str(leftovers))
     else:
-        bad(".gitignore 规则缺失", "需要 .env.* 忽略 + !.env.prod.example 放行")
+        ok("只有一个环境变量模板（.env.example），无重复维护")
 
 
 def main():

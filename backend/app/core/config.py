@@ -22,6 +22,10 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 第 13 期：生产环境的配置硬校验要抛业务异常（详见 warn_if_jwt_unconfigured）。
+# 安全性：exceptions.py 只依赖标准库 http，不反向 import config，因此不会形成循环导入。
+from app.core.exceptions import ConfigurationError
+
 # 模块级打印器：用于在配置加载阶段输出告警（此时全局日志系统可能尚未初始化，
 # 因此不依赖 app.core.logging.get_logger，避免形成循环导入）
 logger = logging.getLogger(__name__)
@@ -56,6 +60,23 @@ class Settings(BaseSettings):
     # 应用基础配置（带默认缺省值）
     app_name: str = "rag-knowledge-base"  # 应用名称
     log_level: str = "INFO"  # 日志级别 (如 DEBUG, INFO, WARNING, ERROR)
+
+    # ===== 运行环境（第 13 期新增）=====
+    # development（默认）| production
+    #
+    # 【为什么需要这个开关，而不是靠"部署时记得改"】
+    # 有些配置在开发环境"缺了无所谓"，在生产环境"缺了就是事故"——
+    # 最典型的是 JWT_SECRET 为空（详见 warn_if_jwt_unconfigured）。
+    # 把"环境"显式写进配置，才能让同一份代码在两种环境下走不同的严格度：
+    #     开发：告警放行，别挡住学习与调试
+    #     生产：缺关键配置直接拒绝启动（fail-fast）
+    #
+    # 默认值是 development —— 保证"不配这一项时行为与第 12 期完全一致"，
+    # 必须显式声明 ENVIRONMENT=production 才会启用严格检查（避免误伤本地）。
+    #
+    # ⚠️ 这一项刻意【没有】写进 .env.example：那份模板是"开发者的配置字典"，
+    #    而"部署时要设 production"是部署者的操作项，写在 08_上线前检查单.md 里。
+    environment: str = "development"
 
     # ===== 数据库配置 =====
     # 异步数据库连接 URI（DSN）：
@@ -258,9 +279,17 @@ class Settings(BaseSettings):
     #   任何人都能自己伪造 admin 的 JWT。留空 + 启动告警，能把问题暴露在启动阶段。
     #
     # JWT 签名密钥（HMAC 的共享密钥）。生成示例：openssl rand -hex 32
-    #   ⚠️ 生产部署前务必改成足够长的随机串。为空时启动期打 ERROR 告警但不阻断
-    #   （教学场景下允许先跑起来，避免学员因忘记配这一项而完全跑不动）。
+    #   ⚠️ 生产部署前务必改成足够长的随机串。
+    #   【第 13 期改动】为空时是否阻断启动，改为按 environment 区分：
+    #     development（默认）→ 打 ERROR 告警但放行（教学场景允许先跑起来）
+    #     production        → 直接抛 ConfigurationError 拒绝启动
+    #   理由：密钥为空不是"降级"，而是"根本没有门" —— 任何人都能签一个合法令牌。
+    #   这种状态在生产环境必须 fail-fast，而不是靠人去读日志。
     jwt_secret: str = ""
+    # JWT 密钥的最小长度（仅 production 下强制）。
+    # 【为什么是 32】HS256 的密钥强度直接等于签名强度；32 个字符是 openssl rand -hex 32
+    # 的长度，也是"不是随手敲的弱串"的最低门槛（"123456" / "secret" 全都不够）。
+    jwt_secret_min_length: int = 32
     # JWT 签名算法。HS256 = HMAC-SHA256（对称密钥），单服务自签自验场景足够。
     jwt_algorithm: str = "HS256"
     # token 默认过期时间（分钟）。1440 分钟 = 24 小时。
@@ -276,6 +305,20 @@ class Settings(BaseSettings):
     default_admin_display_name: str = "管理员"
 
     @property
+    def is_production(self) -> bool:
+        """是否为生产环境（第 13 期）。
+
+        与 `jwt_configured` / `cos_configured` 同一思路：把"当前处于哪种环境"
+        收敛成一个布尔属性，避免各处散写 `settings.environment == "production"` ——
+        那样一旦将来支持 "staging" / "prod" 别名，就得满仓库改判断条件。
+
+        【为什么同时接受 production 与 prod】
+        部署脚本 / CI 里两种写法都很常见，收在这里做一次归一，调用方不必关心。
+        大小写与首尾空格也一并容错 —— 环境变量是最容易带空格的地方。
+        """
+        return self.environment.strip().lower() in ("production", "prod")
+
+    @property
     def jwt_configured(self) -> bool:
         """动态检测 JWT 是否已完成必要配置。
 
@@ -285,13 +328,46 @@ class Settings(BaseSettings):
         return bool(self.jwt_secret)
 
     def warn_if_jwt_unconfigured(self) -> None:
-        """启动自检：JWT 密钥缺失时打 ERROR 告警，但【不抛异常、不阻断启动】。
+        """启动自检：按 environment 决定"JWT 密钥缺失"是告警还是拒绝启动。
 
-        【设计取舍 - 为什么是告警而不是 raise ConfigurationError】：
-        本项目其它模块（COS / LangSmith）缺配置是"降级"，但 JWT 缺配置无法降级 ——
-        它会让所有登录失败。若在这里 raise，学员在还没学到"配密钥"这一步时就完全起不来。
-        因此选择"响亮地告警 + 允许带病启动"，让问题在第一次登录失败前就被看见。
+        【第 13 期改动的动机】（原实现只有告警、永不阻断）
+        原注释的取舍是"教学场景允许带病启动，避免学员还没学到配密钥就起不来"——
+        这个顾虑在本地开发成立，但在生产环境是致命的：密钥为空 = **任何人都能自己
+        签一个合法令牌**，此时"服务能起来"恰恰是最坏的结果（看起来一切正常，实际门没锁）。
+
+        【所以按环境分开，而不是一刀切】
+          development（默认）→ 保留原行为：ERROR 告警 + 放行。本地/教学不受影响。
+          production        → 抛 ConfigurationError，**拒绝启动**。
+        这样"想让服务起来"和"想让它安全"就不再冲突：开发图方便，生产图安全。
+
+        【为什么连长度也一起校验】
+        原来的 `jwt_configured` 只判断"非空"，于是 `JWT_SECRET=123456` 会被判定为"已配置"，
+        攻击者可离线暴力破解。production 下要求至少 `jwt_secret_min_length`（默认 32）个字符。
+
+        :raises ConfigurationError: 生产环境且密钥缺失或过短
         """
+        if self.is_production:
+            # ---- 生产：fail-fast，两条硬性要求 ----
+            if not self.jwt_configured:
+                raise ConfigurationError(
+                    "生产环境必须配置 JWT_SECRET：当前为空，任何人都能伪造令牌。"
+                    "请设置一个至少 32 字符的随机串（openssl rand -hex 32）"
+                )
+            if len(self.jwt_secret) < self.jwt_secret_min_length:
+                raise ConfigurationError(
+                    f"生产环境的 JWT_SECRET 过短（{len(self.jwt_secret)} < "
+                    f"{self.jwt_secret_min_length} 字符）：弱密钥可被离线暴力破解。"
+                    "请改用 openssl rand -hex 32 生成"
+                )
+            # 生产环境还额外提醒管理员口令，因为它同样是"人人皆知"的默认值
+            if self.default_admin_password.strip().lower() in ("", "admin", "password", "123456"):
+                logger.error(
+                    "⚠️ 生产环境仍在使用默认/弱管理员口令：种子里建出的 admin 账号可被直接登录。"
+                    "请在服务器 .env 里设置 DEFAULT_ADMIN_PASSWORD（注意：仅在库内无用户时生效）"
+                )
+            return
+
+        # ---- 开发/测试：保留原行为（告警 + 放行）----
         if not self.jwt_configured:
             logger.error(
                 "JWT_SECRET 未配置：登录签发的令牌可被任意伪造。"
