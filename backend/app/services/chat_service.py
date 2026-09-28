@@ -140,6 +140,42 @@ class EvaluationAnswer:
     citations: list[dict] = field(default_factory=list)
 
 
+# =============================================================================
+# MCP 专用非流式结果模型（第 13 章 · ask_knowledge_base）
+# =============================================================================
+#
+# 【为什么在 ChatService 里再加一个 dataclass，而不是复用 EvaluationAnswer】
+# 两者都跑同一张 RAG 图，但【面向的调用方完全不同】：
+#
+#   EvaluationAnswer（第 10 章）      面向离线评测跑批：要 chunks 全量、要路由轨迹、
+#                                     要归因画像、要耗时；异常不许抛出（防止批次熔断）
+#   MCPChatAnswer（本章）             面向外部 Agent 的一次工具调用：只要答案 + 拒答标志 +
+#                                     引用 + trace；异常必须抛出（工具调用失败要能看见）
+#
+# 一句话：**评测模型的字段是给"分析报表"用的，MCP 模型的字段是给"模型"用的。**
+# 与第 3 章 app/mcp_server/schemas.py 独立建 schema 是同一条思路：
+# 面向不同消费者，就应该有各自的门面。
+
+
+@dataclass(frozen=True)
+class MCPChatAnswer:
+    """MCP `ask_knowledge_base` 工具的非流式问答结果。
+
+    与评测路径不同的是：MCP 调用方是真实用户（持 JWT），需要按其权限标签过滤检索结果；
+    与 `stream_answer` 不同的是：不创建 conversation、不写 user / assistant 消息，
+    外部 Agent 自己管多轮上下文。
+    """
+
+    # 最终答案文本（可能已被 verify 整段替换成拒答文案）
+    answer: str
+    # 是否以"拒答"收场：前置拒答（没找到依据）或 verify 校验失败都会置 True
+    refused: bool
+    # 引用角标列表（拒答时为空）。元素形状与 SSE 链路一致（见 _serialize_citation）
+    citations: list[dict]
+    # LangSmith trace_id；未启用观测时为 None
+    trace_id: str | None
+
+
 def _serialize_agent_steps(state: RAGState) -> list[dict]:
     """SSE / metadata 共用的 agent_steps 载荷格式。
 
@@ -961,6 +997,174 @@ class ChatService:
                 #   确保下游执行器能拿到非空的故障定位信息，将本 case 标为 Failed。
                 error_message=str(exc).strip() or exc.__class__.__name__,
             )
+
+    # =========================================================================
+    # MCP 工具入口（第 13 章）：ask_knowledge_base 的非流式问答
+    # =========================================================================
+    # LangSmith 链路追踪装饰器：将当前方法作为 Chain 节点上报，用于监控与调试 MCP 问答链路
+    @traceable(name="ChatService.answer_for_mcp", run_type="chain")
+    async def answer_for_mcp(
+        self,
+        question: str,
+        *,
+        current_user: User,
+    ) -> MCPChatAnswer:
+        """`ask_knowledge_base` 工具入口：跑一次完整 RAG 拿非流式结果。
+
+        【步骤 1】与 stream_answer 的差异（MCP 复用同一张 RAG 图，但不复用 Web 的那套事务步骤）
+
+        Web 侧的问答链路是"为浏览器设计的"：
+            创建会话 → 落 user message → 跑图 → 边产 token 边推 SSE
+                → 落 assistant message → 落 citations
+        这套逻辑搬到 MCP 调用语义下有三处不合适：
+
+        1. **会污染我们的历史表**：MCP 调用方是外部 Agent，它自己管多轮上下文，
+           不该在 conversations / messages 里留下一堆没有人看的会话；
+        2. **协议形状不匹配**：MCP 工具协议是「一次调用、一个结果」，
+           不需要也不应该按 token 流式返回；
+        3. **无谓的事务负担**：Web 路径里有大量「写 user message → 等 LLM → 写 citations」
+           的事务步骤，对 MCP 这种无状态调用纯粹是负担。
+
+        因此本方法：**不创建 conversation、不写 user / assistant 消息、不发 SSE、强制 chat_history = [].**
+
+        【步骤 2】与 answer_for_evaluation 的差异（同为非流式，但身份不同）
+
+        1. **真实用户身份**：评测路径没有"当前登录用户"，所以显式注入通配标签
+           （WILDCARD_PERMISSION_TAG）看全量语料；MCP 路径是真实用户持 JWT 调用，
+           必须按 `compute_user_permission_tags(current_user)` 过滤检索结果 ——
+           ★ 这正是第 1 章 §3.5 定的头号风险对策：MCP 只是换了入口，权限口径与网页侧完全一致。
+        2. **不记录延迟指标 / error_message**：DAG 调用方（Agent）只需要结果本身；
+           而且下面【步骤 5】决定了失败必须抛出，不需要"把异常塞进返回值"这条评测专用通道。
+
+        【步骤 3】为什么用 `async for` 把流式增量聚合起来
+
+        RAG 图的生成节点是**流式**的（`stream_generate` 逐个 yield 文本增量），
+        而 MCP 要的是**一个完整字符串**。这里用列表缓冲再 join：
+        Web 侧要逐字下发所以不能缓冲，评测侧要完整文本所以必须缓冲 ——
+        MCP 属于后者，多花的一次 join 换来的是"一次调用一个结果"的协议语义。
+
+        【步骤 4】verify 只在"聚合完之后"做一致性校验
+
+        刻意**不是**边流边校验：校验器需要完整答案才能判断"事实是否都能由上下文支撑"。
+        若这里也像 Web 侧那样边流边推，就会出现"前半段已经发给用户、后半段又被判定为幻觉"的尴尬。
+
+        【步骤 5】异常必须向上抛出（★ 与评测路径最关键的差异）
+
+        评测路径 `answer_for_evaluation` 用 `except Exception` 把异常吞进 `error_message`，
+        因为一个 case 崩溃不能熔断整批评测。**MCP 不能这么做**：
+        工具调用失败却返回一个空答案，Agent 会把它当成"知识库里没有"讲给用户 —— 这是事故。
+        所以这里交给第 2 章的错误出口：异常一路冒出，由工具层兜成**协议层**的
+        `mcp.server.fastmcp.exceptions.ToolError` 返回给 Agent。
+        ⚠️ 服务层**不需要**知道 ToolError 这个协议概念，也不新增异常类 ——
+        工具层用 `except AppException as exc` 捕获后再翻译即可。
+
+        :param question: 用户/Agent 的自然语言提问
+        :param current_user: 第 2 章 resolve_current_user 解析出的当前用户（用于权限过滤）
+        :return: MCPChatAnswer（answer / refused / citations / trace_id）
+        :raises Exception: 图执行、生成或校验过程中的任何异常
+            （服务层不翻译，由工具层捕获后转成协议层的 ToolError）
+        """
+        # -------------------------------------------------------------------------
+        # 步骤 1：取权限标签与链路追踪 ID，装配图的初始状态
+        # -------------------------------------------------------------------------
+        permissions = compute_user_permission_tags(current_user)
+        trace_id = get_current_trace_id()
+
+        state: RAGState = {
+            # 【语法点 1：UUID(int=0) 是占位值，不是"空值"】
+            # RAGState 强类型要求 conversation_id 必须是 UUID，不能传 None；
+            # 而 MCP 调用不落任何会话，所以用一个全 0 UUID 占位。
+            # ⚠️ 图里有节点（如 load_context）会拿这个 id 去查历史消息 ——
+            #    查不到就退化成"没有上下文"，这正是我们要的（MCP 自己管多轮）。
+            #    但只要不走【落消息 / 落引用】这类持久化分支，就不会真的写出这条假会话。
+            "conversation_id": UUID(int=0),
+            "question": question,
+            # 【语法点 2：为什么强制空列表，而不是透传 Agent 传来的历史】
+            # MCP 的"多轮"由 Agent 自己维护（它可以把上文并进 question），
+            # 我们这边保持无状态：既避免上文污染我们的改写/检索，也让同一次调用可重放。
+            "chat_history": [],
+            # ★ 真实用户的可见范围（与网页侧同一函数、同一口径）
+            "permissions": permissions,
+            "trace_id": trace_id,
+        }
+
+        # -------------------------------------------------------------------------
+        # 步骤 2：驱动 RAG 图（检索 → 重排 → 裁决 → 生成所需上下文）
+        # -------------------------------------------------------------------------
+        final_state = await get_rag_graph().ainvoke(state)
+        # 【语法点 3：为什么必须有这行 type: ignore[arg-type]】
+        # ainvoke() 的静态返回类型是 dict[str, Any]，而 RAGState 是 TypedDict，
+        # TypedDict.update() 期望同类型映射 → mypy 会报 arg-type。
+        # 这是 LangGraph 的既有类型缝隙，与评测路径（answer_for_evaluation）用的是同一条写法。
+        state.update(final_state)  # type: ignore[arg-type]
+
+        # -------------------------------------------------------------------------
+        # 步骤 3：生成答案（拒答快速通道 / 流式聚合两条路）
+        # -------------------------------------------------------------------------
+        if state.get("refused"):
+            # 前置拒答：规划节点已把标准拒答文案写进 state["answer"]，
+            # 直接复用，跳过一次昂贵且无意义的 LLM 调用。
+            answer = state["answer"]
+        else:
+            # 【语法点 4：parts: list[str] + join 的写法为什么优于 answer += delta】
+            # 字符串在 Python 里不可变，循环里 += 会反复申请新对象（O(n²) 拷贝）；
+            # 收集到列表再 join 是一次性分配，长回答下差距明显。
+            parts: list[str] = []
+
+            # stream_generate 是 AsyncIterator[str]：逐条 yield 文本增量（delta）
+            async for delta in stream_generate(state):
+                parts.append(delta)
+
+            answer = "".join(parts)
+            # 回写 state：步骤 4 的校验器与后续任何读 state 的环节都以它为准
+            state["answer"] = answer
+
+        # -------------------------------------------------------------------------
+        # 步骤 4：后置事实校验（与 SSE 路径同一套护栏，但时机不同）
+        # -------------------------------------------------------------------------
+        if settings.verify_answer_enabled:
+            # 【语法点 5：list(state.get("retrieved_chunks", [])) 的两层防御】
+            # ① .get(..., [])：键不存在时给空列表，避免 KeyError；
+            # ② 外层 list(...)：只复制【列表容器】，防止校验器对列表增删而影响 state。
+            #    元素仍是同一批 RetrievedChunk 引用 —— 它是 frozen dataclass，天然不可变，无需深拷贝。
+            verify_result = await get_answer_verifier().verify(
+                question,
+                answer,
+                chunks=list(state.get("retrieved_chunks", [])),
+            )
+
+            # 校验不通过 = 答案无法由知识库佐证（幻觉）
+            if not verify_result.verified:
+                # 与 Web 侧完全对齐的三件事：换文案 → 回写 state → 置拒答标志
+                answer = REFUSAL_ANSWER
+                state["answer"] = answer
+                state["refused"] = True
+
+        # -------------------------------------------------------------------------
+        # 步骤 5：装配返回值（拒答时清空引用，避免"拒绝回答却附参考资料"）
+        # -------------------------------------------------------------------------
+        # 【语法点 6：bool(state.get("refused")) 为什么要强转】
+        # state 里这个键可能是 None（从未置位），而 MCPChatAnswer.refused 声明的是 bool；
+        # bool(...) 把 None / 缺省统一归一化成 False，保证契约稳定。
+        refused = bool(state.get("refused"))
+
+        citations = (
+            []
+            if refused
+            # enumerate(..., 1)：角标从 1 开始，与 prompt 里的「片段 N」严格一致 ——
+            # 这个 ordinal 会一路带到 MCPCitation.ordinal（第 3 章的 schema）。
+            else [
+                _serialize_citation(c, ordinal=i)
+                for i, c in enumerate(state.get("retrieved_chunks", []), 1)
+            ]
+        )
+
+        return MCPChatAnswer(
+            answer=answer,
+            refused=refused,
+            citations=citations,
+            trace_id=trace_id,
+        )
 
     # =========================================================================
     # 内部方法：流式链路的两段落库逻辑
