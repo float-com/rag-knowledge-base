@@ -13,6 +13,7 @@
    全量方法采用 `async/await` 搭配 asyncpg 异步驱动，避免数据库 I/O 阻塞 FastAPI 事件循环。
 """
 
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.permissions import WILDCARD_PERMISSION_TAG
-from app.db.models import Document, DocumentStatus
+from app.db.models import Document, DocumentChunk, DocumentStatus
 
 
 def build_permission_filter(
@@ -123,6 +124,25 @@ def build_permission_filter(
     )
 
 
+def _permission_where(
+    permission_tags: list[str] | None,
+) -> ColumnElement[bool] | None:
+    """`build_permission_filter` 的仓储内私有别名（第 13 期 · MCP 统计 SQL 用）。
+
+    :param permission_tags: 调用方有效权限标签；None = 不做权限过滤
+    :return: 可直接 .where(...) 的条件，或 None（表示"这个条件压根不存在"）
+
+    【为什么只是转发一层，而不是二份实现】
+    教程第 13 期第 7 节在仓储内部用的名字就是 `_permission_where`，
+    保留这个私有别名可以让"统计类查询"的代码与教程逐行对应。
+    但函数体只有一行转发 —— 真正的权限口径（标签重叠 OR 空标签即公开、通配短路）
+    仍然全项目只有 `build_permission_filter` 一处定义（见该函数上方的大段说明）。
+    一旦这里开始自己拼条件，就立刻退化成"第二套权限口径"，
+    那正是第 8/9 章反复强调要避免的分叉。
+    """
+    return build_permission_filter(permission_tags)
+
+
 class DocumentRepository:
     """文档实体数据库仓储类，封装针对 Document 表的原子化数据访问。"""
 
@@ -197,6 +217,100 @@ class DocumentRepository:
 
         # 语法（Python 原生返回）：返回已被数据库回填完完整字段属性的持久态实体
         return document
+
+    async def count(self, *, permission_tags: list[str] | None = None) -> int:
+        """统计"调用方可见"的文档总数。MCP `get_knowledge_base_stats` 用。
+
+        :param permission_tags: 调用方有效权限标签。None = 不做权限过滤（admin / 离线任务）
+        :return: 满足条件的文档条数
+
+        【为什么需要一个"全局计数"而不是复用 list_paginated】
+        `list_paginated` 会连带把当前页的 ORM 实体全查出来；而概览只关心一个数字。
+        为了一个 count 去加载整页文档，在知识库变大之后是纯浪费。
+
+        【权限条件必须拼上，理由与 list_paginated 完全一致】
+        只数个数不等于不泄漏：一份只对 HR 可见的文档，若被统计进总数，
+        调用方就能推断出"存在我无权访问的资料"。所以这里走同一个 `_permission_where`，
+        全项目仍然只有一份权限口径。
+
+        【为什么套一层 int(...)】
+        与 `UserRepository.count_all` 同样的理由：`func.count()` 的静态返回类型是宽泛的
+        `int | None`（聚合函数理论上可能返回 NULL），显式转 int 让类型检查器满意，
+        也免去调用方处理 None。实测 COUNT(*) 永远返回非空整数。
+        """
+        stmt = select(func.count()).select_from(Document)
+        perm_where = _permission_where(permission_tags)
+        if perm_where is not None:
+            stmt = stmt.where(perm_where)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_chunks(self, *, permission_tags: list[str] | None = None) -> int:
+        """统计可见 chunks 总数。仅命中 status='ready' 文档，与检索口径一致。
+
+        :param permission_tags: 调用方有效权限标签。None = 不做权限过滤
+        :return: 可见且可检索的切片总条数
+
+        【为什么切片计数也在 document_repo，而不是 chunk_repo】
+        按教程第 7 节：三项统计（文档数 / 切片数 / 最近入库时间）集中在这一个仓储，
+        好处是 `DocumentService.get_stats` 里只有清一色 `self.repo.xxx` 三行，读起来整齐。
+        （本项目最初放在 `DocumentChunkRepository`，考虑到那里已有一个
+        `get_stats(document_id)` 做单文档切片统计、怕"统计"同文件两种粒度；
+        但"三项聚合集中一处"的可读性更值得，故按教程统一到这里。）
+
+        【为什么要 join documents，还要带 status == "ready"】
+        权限标签挂在【父文档】上（切片没有自己的标签），不 join 就拼不出权限条件；
+        而 `status == "ready"` 是"可被检索"的守卫 —— 与 vector_search / keyword_search
+        的第一条 WHERE 完全一致。少了它，概览会把正在解析、甚至解析失败的文档切片
+        也算进"知识库规模"，Agent 据此判断"值不值得检索"就会失真。
+
+        【为什么权限条件不能省】
+        "知识库有多大"本身就是信息：无权文档的切片若被计入总数，
+        调用方就能推断出"存在我无权访问的资料"。
+        """
+        stmt = (
+            select(func.count())
+            .select_from(DocumentChunk)
+            .join(Document, Document.id == DocumentChunk.document_id)
+            # 与检索侧同一条就绪守卫（字符串比较，Document.status 是 Enum 映射的字符串列）
+            .where(Document.status == "ready")
+        )
+        perm_where = _permission_where(permission_tags)
+        if perm_where is not None:
+            stmt = stmt.where(perm_where)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def get_last_indexed_at(
+        self, *, permission_tags: list[str] | None = None
+    ) -> datetime | None:
+        """最近一次进入 ready 状态的文档时间。
+
+        :param permission_tags: 调用方有效权限标签。None = 不做权限过滤
+        :return: 最近一次 ready 文档的 updated_at；库为空（或全部不可见）时为 None
+
+        【为什么用 updated_at 而不是 created_at】
+        reindex 成功后 `updated_at` 会刷新，而 `created_at` 只反映"最初上传"。
+        外部 Agent 看到的"最近一次入库"语义里**包含增量重建**，
+        所以必须取 updated_at —— 否则一份文档改了内容重新索引，
+        概览里显示的仍是几个月前的上传时间。
+
+        【为什么不去 join ingestion_tasks 取 finished_at】
+        那会引入"任务记录被清理后时间就丢了"的依赖；用文档自身的状态时间更稳，
+        也与第 3 章 `MCPStats.last_indexed_at` 的 description（"最近一次进入 ready
+        状态的文档时间"）严格一致。
+
+        【为什么用 max(...) 而不是 order_by + limit 1】
+        聚合写法少一次排序开销，语义也更直白："在可见的 ready 文档里取最大的 updated_at"。
+        注意这里是标量聚合而非 count，所以用 `scalar_one_or_none()` ——
+        没有任何行时 max() 返回 NULL，得到 None 而不是 0。
+        """
+        stmt = (
+            select(func.max(Document.updated_at))
+            .where(Document.status == DocumentStatus.READY)
+        )
+        perm_where = _permission_where(permission_tags)
+        if perm_where is not None:
+            stmt = stmt.where(perm_where)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def update_status(
         self,

@@ -23,6 +23,8 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+# datetime：第 13 期 MCP 知识库概览的 last_ready_indexed_at 返回类型标注
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import and_, delete, func, select
@@ -31,7 +33,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 #   用于给"条件列表"做类型标注（list[ColumnElement[bool]]），让 IDE 与 mypy 都能看懂
 from sqlalchemy.sql.elements import ColumnElement
 # 引入文档与文档分块持久层 ORM 模型
-from app.db.models import Document, DocumentChunk
+# DocumentStatus：第 13 期统计"最近一次 ready"时要用枚举而不是裸字符串
+from app.db.models import Document, DocumentChunk, DocumentStatus
 # 【第 9 章】复用文档仓储里的权限过滤条件生成函数 —— 全项目只有这一处定义
 #   为什么不自己再写一份"空数组 OR 标签重叠"：
 #     权限条件一旦有第二个副本，就会出现"文档列表一套口径、检索另一套口径"的分叉，

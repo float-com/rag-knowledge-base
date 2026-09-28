@@ -30,6 +30,10 @@
 
 import hashlib
 from collections.abc import Sequence
+# dataclass：第 13 期新增 KnowledgeBaseStats 统计快照用（与 chunk_repo.ChunkStats 同一手法）
+from dataclasses import dataclass
+# datetime：KnowledgeBaseStats.last_indexed_at 的返回类型标注（可为 None）
+from datetime import datetime
 from pathlib import PurePath
 from uuid import UUID
 
@@ -71,6 +75,26 @@ _ACCEPTED_MIME_TYPES: dict[str, str] = {
     "text/html": ".html",
     "application/xhtml+xml": ".html",
 }
+
+@dataclass(frozen=True)
+class KnowledgeBaseStats:
+    """知识库整体规模快照，按调用者权限范围统计。
+
+    chunk_count 仅计入 `status='ready'` 的文档，与检索可见性一致；
+    last_indexed_at 取最近一次 ready 文档的 `updated_at`（含 reindex 后的刷新）。
+
+    【为什么用 frozen=True】
+    与 `ChunkStats`（chunk_repo）保持一致：统计结果是一次只读快照，
+    冻结后不会被下游（工具层 / 契约层）无意改写。
+
+    【为什么把三项放一个 dataclass，而不是三个返回值或一个 dict】
+    三项必然是"一起产生、一起使用"的，用 dataclass 表达这种内聚；
+    而且键名在**调用处**就会做静态检查（dict 拼错只能等运行时）。
+    """
+    document_count: int
+    chunk_count: int
+    last_indexed_at: datetime | None
+
 
 # 语法（类型标注字典常量）：dict[str, str]
 #   特性：维护受支持的标准文件后缀名（全小写）到标准 MIME-Type 的反向映射表，包含同义扩展名（如 .htm、.markdown）
@@ -631,6 +655,48 @@ class DocumentService:
         #   通俗来讲：顺便查一下这堆切块的体检报告（比如平均切了多少字、整体指标怎么样）。
         stats = await self.chunk_repo.get_stats(document_id)
         return items, total, stats
+
+    async def get_stats(
+        self, *, permission_tags: list[str] | None = None
+    ) -> KnowledgeBaseStats:
+        """聚合 documents / chunks 总数与最新入库时间。
+
+        :param permission_tags: admin 视角传 None 不限；普通用户传合并后的有效标签
+        :return: KnowledgeBaseStats（三项聚合的不可变快照）
+
+        【三项统计 SQL 共用同一个 `permission_tags`，保证可见性一致】
+        "知识库有多大"本身就是信息：一份只对 HR 可见的文档若被算进总数，
+        外部 Agent 就能推断出"存在我无权访问的资料"。
+        所以三个查询**共用同一个入参**，与文档列表 / 检索侧的可见范围严格一致 ——
+        这也是把它们收进同一个方法的理由：拆开调用就有漏传一个的风险。
+
+        【为什么走 Service 而不是让 MCP 工具直接拼三个仓储调用】
+        第 1 章定的纪律：MCP 工具层只做协议转换，**不碰数据访问**。
+        "哪些文档算可见""ready 才算可检索"都属于业务口径，
+        放这里才能与网页侧将来可能的复用共享同一份判断。
+
+        【调度关系】（三项全部走 `self.repo`，与教程第 7 节一致）
+        document_count  → DocumentRepository.count            （documents 表）
+        chunk_count     → DocumentRepository.count_chunks     （chunks join documents）
+        last_indexed_at → DocumentRepository.get_last_indexed_at（documents 表，max(updated_at)）
+
+        【为什么返回 dataclass 而不是 dict】
+        第 3 章的 `MCPStats` 是强类型契约，而 dict 的键名只能靠约定；
+        用 `@dataclass(frozen=True)` 包一层，键名拼错在**调用处**就会被静态检查抓到，
+        而不是等到 Pydantic 构造时才发现。frozen 与项目其余统计 DTO
+        （如 `ChunkStats`）保持一致：结果快照不该被下游无意篡改。
+        """
+        # 三项聚合各自下推到数据库（PostgreSQL 原生 count / max），不在进程内拉全量再数
+        document_count = await self.repo.count(permission_tags=permission_tags)
+        chunk_count = await self.repo.count_chunks(permission_tags=permission_tags)
+        last_indexed_at = await self.repo.get_last_indexed_at(
+            permission_tags=permission_tags
+        )
+        return KnowledgeBaseStats(
+            document_count=document_count,
+            chunk_count=chunk_count,
+            last_indexed_at=last_indexed_at,
+        )
 
     async def get_chunk(
         self,

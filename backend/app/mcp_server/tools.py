@@ -1,4 +1,4 @@
-"""【模块职责说明】MCP 工具注册层（第 5 章）——5 个知识库工具的实现。
+"""【模块职责说明】MCP 工具注册层（第 5～6 章）——5 个知识库工具的实现。
 
 本模块是第 13 期唯一"把协议层接到业务层"的地方，每个工具都遵循同一条流水线：
 
@@ -7,11 +7,19 @@
 ================================================================================
 
 不在模块里 `mcp = FastMCP(...)` 就地建实例，而是把实例**从外面传进来**。
-好处是：挂载它的地方（`app/mcp_server/server.py` 或 `app/main.py`）决定叫什么名字、
-挂到哪个路径，本模块只负责"有哪些工具"。要用的时候一行调用即可：
+好处是：挂载它的地方（服务装配层）决定叫什么名字、挂到哪个路径，本模块只负责"有哪些工具"。
+要用的时候一行调用即可：
 
     from app.mcp_server.tools import register_tools
     register_tools(mcp)
+
+5 个工具（本节已全部实现）：
+
+    ask_knowledge_base        问答（出参 MCPAnswer）
+    upload_document           上传（仅管理员，出参 MCPUploadResult）
+    list_documents            列文档（出参 MCPDocumentList）
+    get_document_status       查状态与入库进度（出参 MCPDocumentStatus）
+    get_knowledge_base_stats  知识库概览（出参 MCPStats）
 
 ================================================================================
 【步骤 2】每个工具都是同一套五步处理
@@ -21,10 +29,14 @@
         → require_admin(user)          步骤 2b：需要管理员的工具再加一道闸门
         → 参数校验                      步骤 2c：MCP 参数是外部传进来的，必须自己挡
         → 调对应的 service 方法         步骤 2d：业务逻辑一律在 app/services 里，这里只转译
-        → 把 dataclass / ORM 翻成 MCP schema  步骤 2e：出参显式构造（不是 model_validate）
+        → 把 dataclass / ORM 翻成 MCP schema  步骤 2e：出参见下方"两种翻译方式"
 
-⚠️ 本模块**不写任何业务逻辑**：不判权限、不拼 SQL、不算向量。一旦这里出现"第二套检索实现"
-   或"第二套权限判断"，网页侧修好的 bug 就不会自动修到 MCP 侧（第 12 期限流漏掉直传链路的教训）。
+【两种翻译方式，各有适用场景 —— 不是随手选的】
+
+    model_validate(orm_obj)     仅当该 schema 开了 from_attributes=True 且字段与 ORM 对齐时用
+                                （本项目目前只有 MCPDocumentItem 一个，见第 3 章）
+    显式逐字段构造               其余模型一律这么做：等于白名单脱敏，
+                                内部字段（retrieval_meta / score / chunk_id）不会因"名字恰好撞上"而外泄
 
 ================================================================================
 【步骤 3】错误出口统一走 _to_tool_error
@@ -37,26 +49,37 @@
     app.core.exceptions.*                        服务层的异常（本项目体系，带 http_status）
     mcp.server.fastmcp.exceptions.ToolError      协议层的异常（FastMCP → CallToolResult(isError=True)）
 服务层不感知 MCP 协议，翻译只发生在这一层（第 4 章的结论）。
+
+================================================================================
+【步骤 4】权限口径：_viewer_tags 是全模块唯一的标签来源
+================================================================================
+
+    admin → None（服务层约定：None = 不做过滤）
+    普通用户 → compute_user_permission_tags(user)
+
+★ 这条必须与 REST 侧完全一致（第 1 章 §3.5 的头号风险）：
+  MCP 只是换个入口，绝不能自己判一套可见范围，否则外部 Agent 会成为绕过权限体系的捷径。
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+from typing import Literal
+from uuid import UUID
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from app.api.schemas.documents import DocumentStatusValue
+from app.api.schemas.documents import DocumentStatusValue, IngestionTaskStatusValue
 from app.core.exceptions import AppException
 from app.core.logging import get_logger
+from app.db.models import DocumentStatus, IngestionTask, User
 from app.db.session import AsyncSessionLocal
 from app.mcp_server.auth import require_admin, resolve_current_user
 from app.mcp_server.schemas import (
     MCPAnswer,
     MCPCitation,
-    # 下面 4 个模型是下一节那三个工具的出参，本节尚未用到 —— 刻意保留，
-    # 因为 register_tools 的契约就是"5 个工具一次注册完"，import 块与本函数一一对应。
     MCPDocumentItem,
     MCPDocumentList,
     MCPDocumentStatus,
@@ -65,6 +88,7 @@ from app.mcp_server.schemas import (
 )
 from app.services.chat_service import ChatService
 from app.services.document_service import DocumentService
+from app.services.permission_service import compute_user_permission_tags, is_admin
 
 logger = get_logger(__name__)
 
@@ -128,10 +152,9 @@ def register_tools(mcp: FastMCP) -> None:
 
         # 【步骤 5：出参显式构造】把服务层的 dataclass（MCPChatAnswer）翻成
         # MCP 契约模型（MCPAnswer / MCPCitation）。
-        # ⚠️ 这里刻意【不用】model_validate：两个模型的字段名并不一一对应
-        # （服务层 dataclass 的字段是 answer/refused/citations/trace_id，
-        #  而 citation dict 里带着 chunk_id / score / retrieval_meta 等内部字段），
-        # 显式取字段等于**白名单脱敏** —— 内部调试信息不会因为"名字恰好相同"就漏出去。
+        # ⚠️ 这里刻意【不用】model_validate：服务层 citation 是 dict，里面带着
+        # chunk_id / score / retrieval_meta 等内部调试字段（第 4 章 _serialize_citation 产出的），
+        # 显式取字段等于**白名单脱敏** —— 内部信息不会因为"名字恰好相同"就漏出去。
         citations = [
             MCPCitation(
                 ordinal=int(c["ordinal"]),
@@ -225,9 +248,172 @@ def register_tools(mcp: FastMCP) -> None:
         )
 
     # =========================================================================
-    # 其余 3 个工具（list_documents / get_document_status / get_knowledge_base_stats）
-    # 见下一节，共用上面同一套五步处理与 _to_tool_error / _status_value
+    # 工具 3：list_documents —— 列出当前用户可见的文档
     # =========================================================================
+    @mcp.tool(
+        name="list_documents",
+        title="列出文档",
+        description="按更新时间倒序分页列出当前用户可见的文档。",
+    )
+    async def list_documents(
+        ctx: Context,
+        page: int = 1,
+        page_size: int = 20,
+        status: DocumentStatusValue | None = None,
+    ) -> MCPDocumentList:
+        """列出当前用户可见的文档（分页）。
+
+        【为什么这个工具不涉及新 service 逻辑】
+        它直接调既有的 `DocumentService.list_documents`：分页、状态过滤、权限过滤
+        全都在那一层做过且测过（第 11 期给它加过 permission_tags 参数）。
+        本工具只做三件事：认人 → 挡参数 → 把结果翻译成 MCP 契约。
+        """
+        # 【步骤 1：认人】与工具 1 一致；注意这里还【没有】算权限标签，
+        # 标签在调用服务时才通过 _viewer_tags(user) 现算（见该函数说明）。
+        user = await resolve_current_user(ctx)
+
+        # 【步骤 2：挡参数】为什么服务层有校验、这里还要再挡一次：
+        # MCP 的参数由**外部 Agent**填，模型很容易给出 page=0 或 page_size=1000；
+        # 若只依赖服务层兜底，Agent 拿到的会是一句模糊的失败原因。
+        # 在最外层给出**明确的边界提示**（"page 必须 >= 1"），模型才知道该怎么改参数重试。
+        if page < 1:
+            raise ToolError("page 必须 >= 1")
+        if page_size < 1 or page_size > 100:
+            raise ToolError("page_size 必须在 1-100 之间")
+
+        # 【步骤 3：调服务】注意 status 的翻译：
+        #   MCP 参数是 Literal 的五个字符串取值 → 服务层要的是 DocumentStatus 枚举成员，
+        #   所以必须 `DocumentStatus(status)` 显式转一次。
+        #   （这是"契约层与服务层类型不同"的一处真实例子：不是多余，而是两边各自合理。）
+        async with AsyncSessionLocal() as session:
+            service = DocumentService(session)
+            try:
+                items, total = await service.list_documents(
+                    page,
+                    page_size,
+                    status=DocumentStatus(status) if status else None,
+                    permission_tags=_viewer_tags(user),
+                )
+            except Exception as exc:
+                raise _to_tool_error(exc, default="文档列表查询失败") from exc
+
+        # 【步骤 4：出参翻译】★ 这里用 model_validate，与工具 1/2 的显式构造不同 —— 为什么？
+        # MCPDocumentItem 声明了 `model_config = ConfigDict(from_attributes=True)`（第 3 章），
+        # 而它的字段集合与 ORM Document 是**刻意对齐**的（id/name/status/mime_type/size/
+        # version/permission_tags/created_at/updated_at），没有内部字段需要拦。
+        # ⚠️ 所以两条路径的差别不是"随意"，而是取决于模型是否开了 from_attributes：
+        #    开了 → 可以直接吃 ORM 对象（本工具）；
+        #    没开 → 必须显式构造（工具 1 的 MCPCitation、工具 2 的 MCPUploadResult）。
+        return MCPDocumentList(
+            items=[MCPDocumentItem.model_validate(d) for d in items],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+
+    # =========================================================================
+    # 工具 4：get_document_status —— 查文档状态与入库进度
+    # =========================================================================
+    @mcp.tool(
+        name="get_document_status",
+        title="查询文档状态",
+        description=(
+            "返回文档当前状态与最近一次入库任务（ingest / reindex）的进度。"
+            "适合在 upload_document 后轮询直到 status='ready'。"
+        ),
+    )
+    async def get_document_status(
+        document_id: str,
+        ctx: Context,
+    ) -> MCPDocumentStatus:
+        """查文档状态与最近一次入库任务进度。
+
+        【步骤 1：认人】同上。
+
+        【步骤 2：解析 document_id】★ MCP 协议层传进来的是**字符串**，
+        而 service 层要的是 UUID —— 所以工具层必须显式 UUID() 解析一次。
+        见下方 `_parse_uuid`：解析失败要给"字段名 + 不合法"的明确文案，
+        而不是让 ValueError 冒成工具内部错误。
+        """
+        user = await resolve_current_user(ctx)
+        document_uuid = _parse_uuid(document_id, field="document_id")
+
+        async with AsyncSessionLocal() as session:
+            service = DocumentService(session)
+            try:
+                # 【步骤 3：查文档】get 会做权限过滤（传了 _viewer_tags）：
+                # 无权访问时抛 NotFoundError —— 与网页侧口径一致，
+                # 不区分"不存在"与"无权"，避免向外泄露"这份文档存在"。
+                document = await service.get(
+                    document_uuid, permission_tags=_viewer_tags(user)
+                )
+                # 【步骤 4：查最近任务】返回值可以为 None（文档从未入过库 / 任务被清理），
+                # 所以下面 latest_task_* 字段全部允许为空（第 3 章已按可空设计）。
+                latest = await service.get_latest_task(document.id)
+            except Exception as exc:
+                raise _to_tool_error(exc, default="文档状态查询失败") from exc
+
+        # 【步骤 5：出参翻译】这里的三个辅助函数各解决一类"类型不能直接相加"的问题：
+        #   _status_value       str → DocumentStatusValue（Literal 五态）
+        #   _task_type_value    str → Literal["ingest","reindex"]
+        #   _task_status_value  str → IngestionTaskStatusValue
+        # 全部是"ORM 上是普通字符串、契约上是 Literal"的收敛，
+        # 且都遵循同一条原则：**只去空白，不兜底**（未知取值让校验报出来）。
+        return MCPDocumentStatus(
+            document_id=document.id,
+            name=document.name,
+            status=_status_value(document.status),
+            version=document.version,
+            error_message=document.error_message,
+            latest_task_type=_task_type_value(latest),
+            latest_task_status=_task_status_value(latest),
+            latest_task_progress_total=latest.progress_total if latest else None,
+            latest_task_progress_done=latest.progress_done if latest else None,
+            latest_task_error_message=latest.error_message if latest else None,
+        )
+
+    # =========================================================================
+    # 工具 5：get_knowledge_base_stats —— 知识库概览
+    # =========================================================================
+    @mcp.tool(
+        name="get_knowledge_base_stats",
+        title="知识库概览",
+        description=(
+            "返回当前用户视角的文档总数 / chunk 总数 / 最近入库时间。"
+            "admin 看全量，普通用户严格按权限标签过滤后统计。"
+        ),
+    )
+    async def get_knowledge_base_stats(ctx: Context) -> MCPStats:
+        """知识库概览（严格按调用者权限范围统计）。
+
+        【步骤 1：认人】同上。
+
+        【为什么统计也要按权限过滤】
+        "知识库有多大"本身也是信息：一份只对 HR 可见的文档，
+        若被统计进总数，外部 Agent 就能推断出"存在我无权访问的资料"。
+        所以三项指标全部走 `_viewer_tags(user)` 的可见范围 —— 与列表、检索同口径。
+        """
+        user = await resolve_current_user(ctx)
+
+        async with AsyncSessionLocal() as session:
+            service = DocumentService(session)
+            try:
+                # 【步骤 2：三项聚合统一走服务层】
+                # DocumentService.get_stats 内部同时用到 self.repo 与 self.chunk_repo：
+                # 文档数与最近入库时间来自 documents 表，chunk 数来自 chunks join documents。
+                # 工具层只负责把这份快照翻译成契约对象。
+                stats = await service.get_stats(permission_tags=_viewer_tags(user))
+            except Exception as exc:
+                raise _to_tool_error(exc, default="知识库统计查询失败") from exc
+
+        # 【步骤 3：出参翻译】★ 这里用属性访问（stats.document_count）而不是下标 ——
+        # 因为服务层返回的是 KnowledgeBaseStats 这个 dataclass，
+        # 字段名拼错在**这一行**就会被静态检查抓到，而不是等到运行时 KeyError。
+        return MCPStats(
+            document_count=stats.document_count,
+            chunk_count=stats.chunk_count,
+            last_indexed_at=stats.last_indexed_at,
+        )
 
 
 def _to_tool_error(exc: Exception, *, default: str) -> ToolError:
@@ -289,6 +475,77 @@ class _Base64UploadFile:
     async def read(self) -> bytes:
         """返回完整文件字节（不移动游标，可重复读）。"""
         return self._content
+
+
+def _viewer_tags(user: User) -> list[str] | None:
+    """把用户翻译成"检索/查询时该传的权限标签"。
+
+    :param user: 已认证的当前用户
+    :return: admin → None（表示不做权限过滤）；普通用户 → 合并后的有效标签列表
+
+    【为什么 admin 要传 None 而不是 ["*"]】
+    服务层的约定是 **None = 不做权限过滤**（见 DocumentService.get / list_documents 的
+    permission_tags 参数说明）。而 ["*"] 是"通配标签"，语义上虽然也等于全可见，
+    但它要走一遍"数组重叠"的 SQL 运算 —— 既然 admin 本来就不需要过滤，
+    直接传 None 让 SQL 少一个条件更直接。
+
+    【为什么与 REST 侧同口径】
+    网页侧的路由也是这么算的（admin → None）。★ 这条必须一致：
+    一旦 MCP 侧自己判一套可见范围，就会出现"网页看不到、Agent 却能看到"的双口径漏洞
+    —— 这正是第 1 章 §3.5 定的头号风险，也是本模块唯一不能写错的一行。
+    """
+    return None if is_admin(user) else compute_user_permission_tags(user)
+
+
+def _task_type_value(task: IngestionTask | None) -> Literal["ingest", "reindex"] | None:
+    """任务类型 ORM 字符串 → 契约 Literal；无任务时为 None。
+
+    【为什么可以直接 .value】
+    任务类型在 ORM 上是 Enum（不是裸字符串），`.value` 拿到的正是
+    "ingest" / "reindex" 这两个字面量。ORM 与契约的取值集合本来就一致，
+    这里不需要像 _status_value 那样额外收敛。
+    """
+    return task.task_type.value if task else None
+
+
+def _task_status_value(
+    task: IngestionTask | None,
+) -> IngestionTaskStatusValue | None:
+    """任务状态 ORM 字符串 → 契约 Literal；无任务时为 None。
+
+    ⚠️ 与 _status_value 的区别要留意：这里**没有** strip() ——
+    任务状态来自 Enum 的 .value，不会带尾随空格；
+    而文档状态来自 ORM 的普通字符串列，才有去空白的必要。
+    """
+    return task.status.value if task else None
+
+
+def _parse_uuid(raw: str, *, field: str) -> UUID:
+    """把 MCP 传来的字符串解析成 UUID；失败时给出带字段名的明确文案。
+
+    :param raw: 协议层传进来的字符串（Agent 写在 JSON 里的值）
+    :param field: 字段名，只用于拼错误文案
+    :raises ToolError: 不是合法的 UUID 字符串
+
+    【为什么必须显式解析，而不是让 Pydantic 自动转】
+    本工具的入参声明是 `document_id: str`，**不是 UUID** —— 因为 MCP 的 JSON 里它就是个字符串。
+    若把它声明成 UUID，格式不合法会变成协议层的参数校验错误（模型看到的是一段 schema 报错），
+    不如"document_id 不是合法的 UUID"这句话可操作：模型能立刻明白要重新取一个正确的 id。
+
+    【为什么捕获 (TypeError, ValueError) 两个】
+    `uuid.UUID()` 对**类型不对**（如 None、int）抛 TypeError，对**格式不对**抛 ValueError。
+    只写 ValueError 的话，上游一旦传了非字符串就会冒成工具内部错误。
+    这里两个都收，统一转成一句可读文案。
+
+    【import 位置的说明】
+    教程把 `from uuid import UUID` 写在函数体内；本项目统一把 import 放在模块顶部
+    （见文件头 `from uuid import UUID`），因此这里只是就地使用、不再重复导入 ——
+    函数内 import 会让"这个依赖从哪来"变难追踪，也会让静态检查的未使用检测失效。
+    """
+    try:
+        return UUID(raw)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"{field} 不是合法的 UUID") from exc
 
 
 def _status_value(raw: str) -> DocumentStatusValue:
