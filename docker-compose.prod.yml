@@ -1,0 +1,232 @@
+# 生产部署专用编排（与本地开发的 docker-compose.yml 并存）
+#
+# 【为什么不直接改 docker-compose.yml】
+# 本地开发时 api 与 worker 跑在【宿主机】上，连接串写的是 localhost:5432 / localhost:6379，
+# 一旦撤掉端口映射，本地立刻就连不上库。所以生产形态单独成文件：
+#
+#     本地开发：docker compose up -d postgres redis    +  宿主机跑 uvicorn / celery
+#     生产部署：docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# 生产形态的三个关键差异（都是上线前必须解决的 P0）：
+#   ① 数据库与 Redis【不发布端口到宿主机】—— 只留在 compose 内网，外部扫不到 5432/6379
+#   ② 连接串走服务名（postgres / redis），api / worker 进容器，不再依赖 localhost
+#   ③ ★ 用独立的 .env.prod：这是唯一能真正换掉弱口令的办法（见下）
+#
+# =============================================================================
+# ★ 为什么必须用 --env-file .env.prod（这一条踩过坑，值得单独说）
+# =============================================================================
+# 第一版我在这里写了 `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?...}`，以为能用 ${VAR:?} 强制要求
+# 显式提供口令。实测【无效】：因为项目根目录已经有一个 .env（本地开发用的，里面是
+# POSTGRES_PASSWORD=rag），docker compose 会【自动读取 .env】并把它当作变量来源 ——
+# 于是 ${VAR:?} 拿到的是 "rag"，检查通过，弱口令照样生效。
+#
+# 结论：compose 的变量插值永远会先看自动加载的 .env，靠 :? 拦不住"存在的弱值"。
+# 正确做法是【换一个变量文件】：
+#
+#     cp .env.example .env.prod      # 然后逐项改成生产值
+#     docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# 注意顺序：--env-file 既提供插值变量（POSTGRES_PASSWORD 等），
+# 也通过 env_file 注入容器（见下面 api/worker 的 env_file），两处都用它。
+
+services:
+  postgres:
+    image: leikooo/postgres-pgvector-zhparser:latest
+    container_name: rag-kb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      # 生产值必须来自 .env.prod；这里不写 :-rag 兜底，缺了就连接失败而不是静默用弱口令
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_kb}
+    # ★ 只在内网暴露，不映射到宿主机
+    expose:
+      - "5432"
+    volumes:
+      - rag_kb_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag_kb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis/redis-stack-server:7.4.0-v0
+    container_name: rag-kb-redis
+    restart: unless-stopped
+    # ★ 同样不映射到宿主机
+    expose:
+      - "6379"
+    volumes:
+      - rag_kb_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # API 服务：与第 9 节的 MCP 挂载是同一个应用（/api/* 与 /mcp 一起对外）
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag-kb-api
+    restart: unless-stopped
+    environment:
+      # 【为什么这里不用 env_file，而是逐项列出】
+      # ① env_file 指向的文件必须【真实存在】，否则连 `config` 都跑不起来 ——
+      #    而生产密钥文件不该进仓库，等于给部署加了一道"先手动建文件"的隐性门槛；
+      # ② 用 --env-file .env.prod 时，compose 会把这些变量渲染进下面的 environment，
+      #    效果等价，但缺文件时报错信息清楚得多（"env file not found"）。
+      # 因此：所有配置项显式列出，值全部来自部署时提供的变量文件 / 环境变量。
+      #
+      # ---- 应用配置（生产值来自 .env.prod）----
+      APP_NAME: ${APP_NAME:-rag-knowledge-base}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: production          # ★ 触发 config.py 里的 JWT 硬失败检查
+      # ---- 连接串：容器内必须走服务名 ----
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_kb}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # ---- 鉴权与安全 ----
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
+      DEFAULT_ADMIN_DISPLAY_NAME: ${DEFAULT_ADMIN_DISPLAY_NAME:-管理员}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+      # ---- 模型与存储（缺一个状态就降级，属可选项）----
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      CHAT_API_KEY: ${CHAT_API_KEY:-}
+      CHAT_BASE_URL: ${CHAT_BASE_URL:-}
+      CHAT_MODEL: ${CHAT_MODEL:-}
+      RERANK_ENABLED: ${RERANK_ENABLED:-false}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+      RERANK_MODEL: ${RERANK_MODEL:-}
+      COS_SECRET_ID: ${COS_SECRET_ID:-}
+      COS_SECRET_KEY: ${COS_SECRET_KEY:-}
+      COS_REGION: ${COS_REGION:-}
+      COS_BUCKET: ${COS_BUCKET:-}
+      # ---- 可观测性（可选）----
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+      # ---- 文档处理参数 ----
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-50}
+      CHUNK_SIZE: ${CHUNK_SIZE:-600}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-80}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-false}
+    ports:
+      # 只有 api 需要对外；前面挂 Nginx / 网关时改成 expose 并让反代转发即可
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      # ★ 模型目录用【命名卷】而不是 ./models 绑宿主机目录：
+      #   根目录 .env 里的 HF_HOME 是 Windows 路径，容器内无法使用；
+      #   Dockerfile 已把 HF_HOME 指向 /models，这里把它持久化，容器重建不用重新下载。
+      #   首次部署需先预热（见 README 的“上线前检查单”）：
+      #     docker compose -f docker-compose.prod.yml run --rm api python scripts/preheat_models.py
+      - rag_kb_models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 启动顺序：先迁移，再起服务。迁移失败直接退出（不让服务带病启动）
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+
+  # ---------------------------------------------------------------------------
+  # Celery worker：文档解析 / 切分 / 向量化（第 12 期）
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag-kb-worker
+    restart: unless-stopped
+    environment:
+      # 与 api 同一套连接串与密钥：worker 也要连库、连 Redis、读同样的模型 Key。
+      # 【为什么重复一遍而不是抽 YAML 锚点】
+      # compose 支持 &anchor / *alias，但会让"某个变量只配了一半"变得难查；
+      # 这里服务数量少（2 个），显式列出反而更好审查 —— 上线检查单就是照着这两段核对。
+      APP_NAME: ${APP_NAME:-rag-knowledge-base}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_kb}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET: ${JWT_SECRET}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-10}
+      CHAT_API_KEY: ${CHAT_API_KEY:-}
+      CHAT_BASE_URL: ${CHAT_BASE_URL:-}
+      CHAT_MODEL: ${CHAT_MODEL:-}
+      RERANK_ENABLED: ${RERANK_ENABLED:-false}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+      RERANK_MODEL: ${RERANK_MODEL:-}
+      COS_SECRET_ID: ${COS_SECRET_ID:-}
+      COS_SECRET_KEY: ${COS_SECRET_KEY:-}
+      COS_REGION: ${COS_REGION:-}
+      COS_BUCKET: ${COS_BUCKET:-}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-50}
+      CHUNK_SIZE: ${CHUNK_SIZE:-600}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-80}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-false}
+    volumes:
+      - rag_kb_models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 生产用默认 prefork 池；本地 Windows 才需要 --pool=solo（Windows 不支持 prefork）
+    command: ["celery", "-A", "app.celery_app", "worker", "-l", "info", "--concurrency=2"]
+
+volumes:
+  rag_kb_pgdata:
+  rag_kb_redisdata:
+  # 模型权重（Docling 版面分析/表格识别），由 api / worker 共享
+  rag_kb_models:
+
+# =============================================================================
+# 生产 .env.prod 必须确认的项（复制 .env.example 后逐项修改）
+# =============================================================================
+#
+#   ENVIRONMENT=production                  ← 触发 JWT 硬失败检查（见 config.py）
+#   POSTGRES_PASSWORD=<强口令>              ← 不要再用 rag
+#   JWT_SECRET=<openssl rand -hex 32>       ← 至少 32 字符
+#   DEFAULT_ADMIN_PASSWORD=<强口令>         ← 不要再用 admin
+#   CORS_ORIGINS=https://你的前端域名       ← 不能留 localhost:5173
+#
+#   ⚠️ DATABASE_URL / REDIS_URL / CELERY_* 在 .env.prod 里可以保留 localhost 写法：
+#      本文件的 api / worker 已用 environment 段【覆盖】成服务名（postgres / redis）。
+#      但如果你直接在宿主机跑 uvicorn 连生产库，就必须自己把 host 改掉 ——
+#      那种"半容器半宿主机"的混合部署最容易连错库，建议统一走容器。
+#
+#   ⚠️ 已有数据卷时改口令（POSTGRES_PASSWORD 只在【初始化空卷】时生效）：
+#      docker exec rag-kb-postgres psql -U rag -d postgres -c "ALTER USER rag WITH PASSWORD '<新口令>';"
+#
+#   ⚠️ 首次部署要预热 Docling 模型（否则 PDF 解析必失败，第 12 期 BUG-05 那个坑）：
+#      docker compose --env-file .env.prod -f docker-compose.prod.yml \
+#        run --rm api python scripts/preheat_models.py

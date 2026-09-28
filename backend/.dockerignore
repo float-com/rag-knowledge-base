@@ -1,0 +1,37 @@
+# 构建上下文排除清单（backend/Dockerfile 用）
+#
+# 【为什么必须排除 .venv】
+# 本机的 .venv 是 Windows 版（里面是 .pyd / Scripts/*.exe），拷进 Linux 镜像毫无用处，
+# 而且有几百 MB。真正的依赖由镜像内的 uv sync 重新装。
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 本地缓存与测试产物
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.smoke/
+
+# 环境与密钥：绝不进镜像（运行期用 env_file 注入）
+.env
+.env.*
+!.env.example
+
+# 本地模型缓存目录（模型走命名卷，不烤进镜像）
+models/
+
+# 编辑器 / 版本控制
+.idea/
+.vscode/
+.git/
+.gitignore
+*.log
+
+# 本地数据库与临时文件
+*.db
+*.sqlite3
+tmp/
