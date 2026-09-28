@@ -56,6 +56,10 @@ from app.core.observability import configure_observability
 # 导入种子数据初始化（第 11 期）：库内无用户时建好内置角色与默认管理员
 from app.db.seed import seed_default_admin
 
+# 导入 MCP Server 实例（第 13 期）：第 9 节要挂载它的 ASGI 子应用、
+# 并在 lifespan 里启动它的 session manager
+from app.mcp_server import knowledge_mcp
+
 # 应用生命周期钩子所需的类型与装饰器
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -63,7 +67,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期钩子：启动时做种子初始化。
+    """应用生命周期钩子：启动时做种子初始化，启动期间维护 MCP session manager。
 
     【为什么种子初始化要放在 lifespan，而不是放在 create_app() 里】
     它是**异步**的（要查库、要写入），而 `create_app()` 是同步函数 ——
@@ -80,6 +84,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     种子初始化失败只意味着"可能登不进去"，而不该让整个服务起不来 ——
     那样连 /docs 都看不了，反而更难排查。记下异常堆栈，修好后重启即可重试
     （本函数幂等，重启是安全的重试方式）。
+
+    【第 13 期新增：`mcp_session_manager.run()` 是 FastMCP streamable HTTP 必需的后台任务组】
+    ⚠️ 少了这一段，任何工具调用都会因 ASGI scope 缺失抛 `RuntimeError`；
+    ⚠️ 必须用 `async with` 与 lifespan 绑定：它负责清理跨请求的超时连接，
+       放在 lifespan 之外就没有"应用退出时收尾"的时机。
+
+    【为什么这里访问的是 `knowledge_mcp.session_manager` 而不是先调 streamable_http_app()】
+    实测（fastmcp 2.14.7 / mcp 1.30.0）：session_manager 是**懒创建**的 ——
+    在 `streamable_http_app()` 被调用之前访问它会抛 RuntimeError。
+    而本文件在模块导入时就会 `from app.mcp_server import knowledge_mcp`，
+    再到 `create_app()` 里调 `streamable_http_app()`，都发生在 lifespan 启动之前，
+    所以走到这里时它已经就绪。
+    ⚠️ 另一个实测结论：多次调 `streamable_http_app()` 会返回**不同的** Starlette 实例，
+    但 `session_manager` 是**同一个**缓存对象 —— 所以"装配处取 app、这里取 manager"
+    这种分工是安全的，不会出现两个 manager 各管一半的情况。
     """
     logger = get_logger(__name__)
 
@@ -92,8 +111,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         logger.exception("种子初始化失败；后续可重新启动重试")
 
     # yield 之前是"启动完成前"的逻辑，之后是"关闭时"的逻辑。
-    # 本项目没有需要优雅关闭的资源（连接池由 SQLAlchemy 自行管理），因此 yield 后为空。
-    yield
+    # MCP session manager 在这两层之间运行：进入时启动后台任务组，退出时清理连接。
+    async with knowledge_mcp.session_manager.run():
+        yield
 
 
 def create_app() -> FastAPI:
@@ -201,6 +221,26 @@ def create_app() -> FastAPI:
     #   注意：这两组路由**全部要求 CurrentAdmin**（管理面），普通用户访问会得到 403。
     app.include_router(users.router, prefix="/api")
     app.include_router(roles.router, prefix="/api")
+
+    # 新增（MCP Server 同进程挂载，第 13 期第 9 节）：
+    #   app.mount("/mcp", knowledge_mcp.streamable_http_app(), name="mcp")
+    #   特性：把 FastMCP 的 ASGI 子应用挂到主应用的 /mcp 前缀下，
+    #         外部 Agent 用 Streamable HTTP transport 调用，鉴权复用 Authorization: Bearer JWT。
+    #
+    # 【为什么用 mount 而不是 include_router】
+    #   mount 挂的是**完整 ASGI 子应用**（有自己的路由表、自己的生命周期），
+    #   include_router 挂的是"本应用内的路由表"。MCP 子应用自带 /mcp 路径体系，
+    #   所以必须 mount。
+    #
+    # 【为什么最终路径是 /mcp 而不是 /mcp/mcp】
+    #   FastMCP 默认把 streamable HTTP 端点挂在 /mcp，外层再 mount 到 /mcp 就会变成两级。
+    #   第 8 节建实例时已把 `streamable_http_path="/"` 设为根，于是前缀只由这里决定。
+    #   ⚠️ 改这里的前缀时，两处要一起想，否则很容易出现 /mcp/mcp 这种"看起来能连、实际 404"。
+    #
+    # 【为什么挂在所有 /api 路由之后】
+    #   第 1 章定的回归底线 R1：挂载 MCP 不得影响 /api/* 的 OpenAPI 文档。
+    #   放在最后一眼就能看出"/api 的路由一条没动，只是多挂了一个独立子应用"。
+    app.mount("/mcp", knowledge_mcp.streamable_http_app(), name="mcp")
 
     # 打印一条成功初始化的就绪日志，通知运维人员或开发者服务已装配完毕
     logger.info("app initialized: %s", settings.app_name)
