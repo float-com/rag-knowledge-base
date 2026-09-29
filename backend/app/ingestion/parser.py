@@ -21,6 +21,14 @@
    LangChain 标准的 langchain_core.documents.Document 领域实体，无缝对接后续的切片分块（Chunking）
    与向量化（Embedding）流水线。
 
+5. 解析开销的可配置化与超时兜底（小内存部署的保命开关）：
+   Docling 默认把 OCR、表格识别全部打开，单次解析峰值可吃掉 1~1.5 GB 内存与全部 CPU 核心，
+   在 2 核 / 4G 的机器上足以把整机拖进 swap 抖动（接口全部无响应、SSH 都连不上）。
+   因此本模块把"要哪几项能力"（do_ocr / do_table_structure）与"单篇最长解析多久"
+   （document_timeout）三项上提到 app/core/config.py，由部署环境决定；
+   并在 _convert_sync 中把 Docling"超时但返回残缺结果"这一非异常路径显式转为失败。
+   ⚠️ .md / .docx 走的是不加载任何模型的 SimplePipeline，这些开关对它们没有影响。
+
 【注意】：
 本模块中导入的 Document 为 LangChain 框架的 langchain_core.documents.Document，
 专门用于文本切分、元数据携带和向向量化流水线传递数据片段；
@@ -30,10 +38,12 @@
 import asyncio
 import io
 
-from docling.datamodel.base_models import DocumentStream
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import DocumentStream, InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from langchain_core.documents import Document
 
+from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.logging import get_logger
 
@@ -73,19 +83,60 @@ class DocumentParseError(AppException):
 _converter: DocumentConverter | None = None
 
 
+def _build_pdf_pipeline_options() -> PdfPipelineOptions:
+    """按配置组装 PDF 解析管线的资源开关。
+
+    【为什么需要显式构造选项，而不是直接 DocumentConverter()】：
+    Docling 的默认 PDF 管线把 OCR、表格识别全部打开，单次解析峰值可吃到 1~1.5 GB 内存
+    与全部 CPU 核心。在 2 核 / 4G 的机器上，一个解析任务就足以把整机拖进 swap 抖动，
+    表现为接口全部无响应、SSH 都连不上。这里把三项交给 app/core/config.py 的配置决定，
+    让部署环境（而不是代码）来选择"要精度还是要活着"。
+
+    【三项配置的作用】：
+    - do_ocr            ：关掉即不再加载 OCR 模型；纯文字 PDF 不受影响，扫描件会解析为空。
+    - do_table_structure：关掉即不再加载 TableFormer 表格识别模型，省几百 MB 内存。
+    - document_timeout  ：单篇文档解析的硬超时，防止一个畸形文档把 worker 永久占住。
+    """
+    # 语法（外部框架 Docling）：PdfPipelineOptions() 构造 PDF 管线的选项对象（纯配置，不加载权重）
+    options = PdfPipelineOptions()
+
+    # 语法（属性赋值）：options.do_ocr / options.do_table_structure 均为 bool，默认 True
+    options.do_ocr = settings.docling_do_ocr
+    options.do_table_structure = settings.docling_do_table_structure
+
+    # 语法（三元表达式）：timeout > 0 时取配置值，否则置 None 表示"不限制"
+    #   注意 Docling 要求的是 float | None：传 0 会被当成"立即超时"，必须显式转成 None
+    timeout = settings.docling_document_timeout_seconds
+    options.document_timeout = timeout if timeout > 0 else None
+
+    return options
+
+
 def _get_converter() -> DocumentConverter:
     """获取 DocumentConverter 单例实例。
 
     【设计考量】：
     DocumentConverter 在实例化阶段会加载 OCR、版面分析与表格识别等多个 AI 深度学习模型，
     初始化耗时较长且显存/内存占用较重。使用单例模式常驻复用，避免每次解析请求都重复初始化模型。
+
+    【为什么只给 PDF 单独指定 format_options】：
+    OCR、表格识别这些重资源模型只存在于 PDF / 图片管线；.md、.docx 走的是不加载任何
+    神经网络权重的 SimplePipeline。因此只需覆盖 InputFormat.PDF 一项，其余格式保持
+    Docling 的默认行为即可。
     """
     # global 关键字作用：告诉 Python 在当前函数内部要修改的是外部的全局变量，而不是新建一个同名的局部变量（避免单例赋值失效）
     global _converter
     # 懒汉式判断：仅在首次被调用（仍为 None）时才去加载重量级资源
     if _converter is None:
-        # 实例化解析引擎：载入 OCR、版面分析与表格识别等多套深度模型权重（耗时较长、显存/内存占用大）
-        _converter = DocumentConverter()
+        # 语法（外部框架 Docling）：DocumentConverter(format_options={...})
+        #   参数1 (format_options: dict[InputFormat, FormatOption])：按输入格式覆盖管线配置
+        #   键 InputFormat.PDF：只覆盖 PDF 管线；值 PdfFormatOption(pipeline_options=...)
+        # 实例化解析引擎：载入版面分析等深度模型权重（耗时较长、内存占用大）
+        _converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=_build_pdf_pipeline_options())
+            }
+        )
     # 返回全局唯一的单例实例，供后续解析任务复用，避免重复初始化与高并发 OOM
     return _converter
 
@@ -97,7 +148,8 @@ def _convert_sync(filename: str, content: bytes) -> str:
     1. 内存流封装：将接收到的 raw bytes 封装进 io.BytesIO，再由 Docling 提供的 DocumentStream
        打包，实现纯内存读取，避免了写本地临时文件与落盘清理的 I/O 损耗。
     2. 模型转换：调用 DocumentConverter.convert 进行版面语义提取与格式还原。
-    3. Markdown 导出：调用 export_to_markdown() 将复杂版面、段落及表格统一拉平为 Markdown 文本。
+    3. 超时校验：识别 Docling 的"超时但返回部分结果"这一非异常路径，显式转为失败。
+    4. Markdown 导出：调用 export_to_markdown() 将复杂版面、段落及表格统一拉平为 Markdown 文本。
     """
     # 语法（Python 原生）：io.BytesIO(initial_bytes)
     #   参数1 (initial_bytes: bytes)：待包装的原始二进制字节数组，转为内存流对象（类比 Java 的 ByteArrayInputStream）
@@ -110,6 +162,19 @@ def _convert_sync(filename: str, content: bytes) -> str:
     # 语法（外部框架 Docling）：DocumentConverter.convert(source)
     #   参数1 (source: DocumentStream)：输入的数据流对象，同步触发版面分析与模型推理，返回结构化文档结果对象
     result = _get_converter().convert(source)
+
+    # 语法（外部框架 Docling）：result.has_timeout_errors() -> bool
+    #   方法说明：检查本次转换是否记录了 category=TIMEOUT 的错误
+    # 【为什么必须显式检查】：Docling 触及 document_timeout 时【不会抛异常】，
+    #   而是把"已经解析完的那部分"连同错误清单一起返回（status=PARTIAL_SUCCESS）。
+    #   若不检查，一篇 200 页的文档会以"残缺内容"被正常入库并标记成功，
+    #   后续检索会莫名召回不全，且日志里没有任何失败痕迹 —— 这比直接失败更难排查。
+    if result.has_timeout_errors():
+        # 语法（Python 原生异常）：raise TimeoutError(msg)
+        #   由外层 parse() 的 except Exception 捕获，统一包装为 DocumentParseError
+        raise TimeoutError(
+            f"解析超时（超过 {settings.docling_document_timeout_seconds:.0f} 秒），已中止"
+        )
 
     # 语法（外部框架 Docling）：result.document.export_to_markdown()
     #   属性访问 (document: DoclingDocument)：获取解析完成的根节点文档对象（包含段落、标题及表格树结构）

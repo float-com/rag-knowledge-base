@@ -152,6 +152,27 @@ class Settings(BaseSettings):
     # 只从 hf_home 读取已预热好的模型。模型预热完成后建议开启。
     hf_hub_offline: bool = False
 
+    # ===== Docling 解析引擎资源开关（PDF / 图片解析用） =====
+    # 【为什么这三项要可配置，而不是写死在 parser.py 里】：
+    # Docling 解析 PDF 时会加载版面分析、表格识别、OCR 多套深度模型，全开时单次解析
+    # 峰值可吃掉 1~1.5 GB 内存与全部 CPU 核心。在 2 核 / 4G 的服务器上，一个解析任务
+    # 就足以把整机拖进 swap 抖动 —— 表现为 API 无响应、SSH 都登不进去。
+    # 因此把"要哪几项能力"交给部署环境决定：本机开发全开，小内存服务器按需关掉。
+    #
+    # 是否启用 OCR（识别扫描件、图片里的文字）。
+    # 关闭后：纯文字 PDF 不受任何影响（文字层本来就能直接抽取）；
+    #         扫描件因抽不到文字会解析为空，最终按"解析结果为空"失败。
+    # 开启代价：额外加载 OCR 模型，CPU 推理极慢，通常是解析耗时的主要来源。
+    docling_do_ocr: bool = True
+    # 是否启用表格结构识别（把表格还原成 Markdown 表格）。
+    # 关闭后：表格会被当成普通文本段落拉平，丢失行列结构；
+    #         换来不再加载 TableFormer 模型（省几百 MB 内存与大量 CPU）。
+    docling_do_table_structure: bool = True
+    # 单篇文档解析的最长耗时（秒）。超时后 Docling 会中止解析并返回已解析的部分结果，
+    # parser.py 据此判定为失败 —— 宁可让这一篇文档失败，也不能让一个任务把整机拖死。
+    # 设为 0 或负数表示不限制（不建议在内存紧张的机器上关闭）。
+    docling_document_timeout_seconds: float = 120.0
+
     # ===== Chat 对话大模型配置（DashScope OpenAI 兼容协议） =====
     # 阿里云百炼 API-Key，用于大模型对话接口鉴权；若为空则可能复用 EMBEDDING_API_KEY
     chat_api_key: str = ""
