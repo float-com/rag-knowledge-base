@@ -18,7 +18,7 @@ from ragas.metrics import (  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.logging import get_logger  # noqa: E402
 from app.ingestion.embedder import get_embeddings  # noqa: E402
-from app.llm.models import get_chat_model  # noqa: E402
+from app.llm.models import get_judge_model  # noqa: E402
 
 logger = get_logger(__name__)
 
@@ -167,7 +167,7 @@ async def evaluate_batch(samples: list[RagasSample]) -> list[RagasMetrics]:
             evaluate,
             dataset=dataset,  # 刚刚打包好的 RAGAS 数据集
             metrics=_METRICS,  # 预设的指标集（忠实度、召回率、精确率、相关性等）
-            llm=get_chat_model(),  # 作为裁判员（Judge LLM）的大语言模型实例
+            llm=get_judge_model(),  # 裁判员（Judge LLM）：非流式 + 请求级超时，与问答客户端分开
             embeddings=get_embeddings(),  # 用于计算向量相似度的 Embedding 实例
             raise_exceptions=False,  # 【关键】：单条 case 评估报错时不中断整个批次，内部静默记为 NaN
             show_progress=False,  # 关闭 tqdm 进度条控制台输出，避免刷屏污染日志文件

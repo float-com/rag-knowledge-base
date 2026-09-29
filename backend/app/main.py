@@ -56,6 +56,11 @@ from app.core.observability import configure_observability
 # 导入种子数据初始化（第 11 期）：库内无用户时建好内置角色与默认管理员
 from app.db.seed import seed_default_admin
 
+# 导入启动自愈（第 13 期·上线后修复）：把上一个进程遗留的「进行中」记录收敛为失败态。
+# 【为什么需要】：评测与入库任务的状态写在数据库里，执行者却在进程里；
+# 进程被强杀后那行状态会永远停在"进行中"，前端卡死且「重试」按钮不可用。
+from app.db.recovery import recover_orphans
+
 # 导入 MCP Server 实例（第 13 期）：第 9 节要挂载它的 ASGI 子应用、
 # 并在 lifespan 里启动它的 session manager
 from app.mcp_server import knowledge_mcp
@@ -109,6 +114,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await seed_default_admin()
     except Exception:
         logger.exception("种子初始化失败；后续可重新启动重试")
+
+    # 启动自愈：收敛上一个进程遗留的孤儿任务（详见 app/db/recovery.py 的模块注释）。
+    # 【为什么必须放在这里（接请求之前）】：否则用户会先看到一堆"永远执行中"的僵尸记录，
+    #   而「重试」按钮又因状态不是 failed 而不可用 —— 2026-09-29 那天为这件事手工敲了三次 SQL。
+    # 【为什么失败不阻断启动】：它只清理历史残留，失败不该让整个服务起不来（与种子初始化同一取舍）。
+    try:
+        recovered = await recover_orphans()
+        if any(recovered.values()):
+            logger.warning("启动自愈：已收敛上次遗留的中断任务 %s", recovered)
+    except Exception:
+        logger.exception("启动自愈失败；可能仍有僵尸记录，重启可重试")
 
     # yield 之前是"启动完成前"的逻辑，之后是"关闭时"的逻辑。
     # MCP session manager 在这两层之间运行：进入时启动后台任务组，退出时清理连接。

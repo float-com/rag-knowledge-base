@@ -28,6 +28,9 @@ from app.core.exceptions import ConfigurationError
 # 模块级私有变量，作为 Chat 模型实例的单例缓存容器；未初始化时为 None
 _chat_model: BaseChatModel | None = None
 
+# 评测裁判专用的单例缓存（与问答客户端分开持有，理由见 get_judge_model 的文档字符串）
+_judge_model: BaseChatModel | None = None
+
 
 def get_chat_model() -> BaseChatModel:
     """
@@ -62,3 +65,52 @@ def get_chat_model() -> BaseChatModel:
     )
 
     return _chat_model
+
+
+def get_judge_model() -> BaseChatModel:
+    """获取或初始化【评测裁判专用】的 Chat 客户端（与问答客户端刻意分开）。
+
+    【为什么不能直接复用 get_chat_model() —— 一次线上事故的修复】
+    问答客户端为了 SSE 打字机效果开了 `streaming=True`，并且【没有设置 timeout】
+    （openai SDK 的默认超时是 600 秒）。这套参数用在 RAGAS 裁判上有两个致命问题：
+
+    1. **没有请求级超时**：RAGAS 一轮 50 题评测要发上千次裁判调用，
+       跨云链路上只要有个别请求"连上了但对端不回"，就会一直挂到超时上限 ——
+       实测现象就是"整轮评测跑了一小时还没结束"。
+    2. **流式是白付的开销**：裁判要的是"一次性完整输出"（结构化判定结果），
+       流式只会多一层聚合，不产生任何收益。
+
+    因此裁判单独用这个客户端：**非流式 + 请求级超时 + 收敛的重试次数**。
+
+    【为什么重试次数要压到 1】
+    RAGAS 自身还有一层 tenacity 重试（RunConfig.max_retries）。
+    若 SDK 也按默认重试 2 次，两层叠乘会让最坏耗时变成 3×3×45 秒 ≈ 6 分钟，
+    必然撞穿作业级超时。把重试交给 RAGAS 一层负责，整条链路才可预测。
+
+    :return: 实现了 BaseChatModel 接口的单例裁判模型对象
+    :raises ConfigurationError: 当未在环境变量中正确配置 CHAT_API_KEY 时触发
+    """
+    global _judge_model
+
+    # 快速路径：单例已构建则直接复用（与问答客户端同理，避免重复建连接池）
+    if _judge_model is not None:
+        return _judge_model
+
+    if not settings.chat_api_key:
+        raise ConfigurationError("Chat API key 未配置，请在 .env 设置 CHAT_API_KEY")
+
+    _judge_model = ChatOpenAI(
+        model=settings.chat_model,
+        api_key=settings.chat_api_key,
+        base_url=settings.chat_base_url,
+        # 裁判要的是确定性判定，温度同样设为 0
+        temperature=0,
+        # ★ 与问答客户端的关键区别 1：非流式。裁判不需要打字机效果。
+        streaming=False,
+        # ★ 与问答客户端的关键区别 2：请求级超时（秒）。挂住的请求快速失败，而非挂满 600 秒。
+        timeout=settings.ragas_request_timeout_seconds,
+        # ★ 与问答客户端的关键区别 3：SDK 级重试收敛为 1 次，把重试权交给 RAGAS（理由见上文）。
+        max_retries=settings.ragas_request_max_retries,
+    )
+
+    return _judge_model
