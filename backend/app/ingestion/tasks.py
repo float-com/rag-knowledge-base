@@ -45,14 +45,23 @@ Celery 的 worker 是【同步进程】，而本项目的业务流程全是 asyn
 
 from uuid import UUID
 
-# 【这两个 import 为什么可以放在模块顶层，而下面那个必须放进函数体】
-#   app.ingestion.pipeline                → 它不回头 import 本模块，没有环，顶层导入没问题；
-#   app.services.document_upload_service  → 它【顶层 import 了本模块】（为了拿到
-#                                            ingest_document_task 去投递），
-#                                            所以本模块若也顶层导入它，两边就形成循环导入。
-# 判断方法很简单，一句话：看对方会不会回头 import 我。
+# 【为什么本模块顶层的 import 只剩 celery_app 这一行】
+# 原本 app.ingestion.pipeline 也在顶层导入，当时的理由是"它不回头 import 本模块、没有环"。
+# 那个理由只回答了「会不会循环导入」，漏掉了「会不会把无关进程一起拖下水」：
+#
+#   app.services.document_service 在顶层 import 本模块（为了拿到 ingest_document_task 去投递），
+#   于是【FastAPI 进程】也会顺着本模块把 pipeline → parser → docling / torch / transformers
+#   整套深度学习推理栈加载一遍。实测线上 uvicorn 常驻 RSS 844 MB，其中绝大部分是它
+#   根本用不到的推理依赖 —— 真正需要这些的只有 worker 进程。
+#   在 2 核 / 3.6G 的服务器上，这 800 MB 直接把整机推到 OOM 边缘。
+#
+# 改成函数内导入之后：
+#   · FastAPI 进程：只拿到"任务对象"用于 .delay() 投递，不再加载任何推理依赖；
+#   · worker 进程：任务真正执行时才导入，且全局只导入一次（Python 的模块缓存）。
+#
+# 注意这与下面 finalize_upload_task 用函数内导入的理由【不同】：
+#   那里是为了躲循环导入，这里是为了躲无关进程的内存开销；结论相同，理由别混。
 from app.celery_app import celery_app
-from app.ingestion.pipeline import run_ingest_sync, run_reindex_sync
 
 
 # ==============================================================================
@@ -82,8 +91,13 @@ def ingest_document_task(self, document_id: str, task_id: str) -> None:
     - document_id：告诉 pipeline"要处理哪份文档"；
     - task_id    ：告诉 pipeline"去更新 ingestion_tasks 里的哪一行台账"。
       入库过程中所有的状态与进度（running / success / failed / progress_done）
-      都是靠它定位到那一行再回写的 —— 见 pipeline._mark_task 等辅助函数。
+      都是靠它定位到那一行再回写的 —— 见 pipeline._mark_* 等辅助函数。
+
+    【函数内延迟导入的原因】见模块顶部注释：把 docling / torch 这坨推理依赖
+    留给真正干活的 worker 进程，别让 FastAPI 进程为了一次 .delay() 也背一份。
     """
+    from app.ingestion.pipeline import run_ingest_sync
+
     run_ingest_sync(UUID(document_id), UUID(task_id))
 
 
@@ -101,6 +115,8 @@ def reindex_document_task(self, document_id: str, task_id: str) -> None:
        所以这个坑暂时踩不到。本节先把它注册进 worker，是为了让"任务清单"完整：
        worker 启动日志里的 [tasks] 列表一眼能看到这一章规划了哪三件事。
     """
+    from app.ingestion.pipeline import run_reindex_sync
+
     run_reindex_sync(UUID(document_id), UUID(task_id))
 
 
