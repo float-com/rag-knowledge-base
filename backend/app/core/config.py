@@ -260,6 +260,30 @@ class Settings(BaseSettings):
         """rerank_api_key 留空时回落到 chat_api_key。二者本来就是同一份 DashScope key。"""
         return self.rerank_api_key or self.chat_api_key
 
+    # ===== RAGAS 评测器运行参数（第 13 期上线后修复）=====
+    # 【为什么必须显式配置 —— 这是一次真实故障的修复，别当成普通参数】
+    # RAGAS 把「一道题 × 一个指标」当作一个作业，并用
+    #     asyncio.wait_for(..., timeout=run_config.timeout)      # ragas/metrics/base.py
+    # 给每个作业套了墙钟超时。作业一旦超时就被直接丢弃、该指标记成 NaN，
+    # 再经 ragas_runner._pick 清洗成 None，前端展示为「—」。
+    #
+    # 线上实测（2 核 / 3.6G 服务器 + 跨云调用裁判模型）：
+    #   ragas 默认值 timeout=180 / max_workers=16 / max_retries=10 不够用 ——
+    #   faithfulness 与 context_precision（每道题要发最多轮裁判请求的两项）
+    #   100% 超时，而请求少的 answer_relevancy / context_recall 正常出分；
+    #   【同一份代码在本地开发机上却全绿】，因为本地单次调用更快、180 秒够用。
+    #   证据就在日志里：ragas.executor | Exception raised in Job[N]: TimeoutError()
+    #
+    # 单作业最长耗时（秒）：180 → 600，给重指标留足时间
+    ragas_timeout_seconds: int = 600
+    # 并发作业数：16 → 4。并发过高会触发裁判模型侧限流，
+    # 限流后的重试退避又会把作业时间吃光 —— 降并发反而整体更快跑完
+    ragas_max_workers: int = 4
+    # 单次调用最大重试次数：10 → 3。快速失败，别把 600 秒全耗在退避等待上
+    ragas_max_retries: int = 3
+    # 重试退避间隔上限（秒）：60 → 15
+    ragas_max_wait_seconds: int = 15
+
     # ===== LangSmith 可观测性配置（第 9 期）=====
 
     # 1. 核心追踪总开关

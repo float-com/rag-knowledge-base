@@ -6,7 +6,7 @@ from dataclasses import dataclass
 # 这里集中静默 DeprecationWarning，避免污染日志。等 ragas 1.0 发布后再升级
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
 
-from ragas import evaluate  # noqa: E402
+from ragas import RunConfig, evaluate  # noqa: E402
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample  # noqa: E402
 from ragas.metrics import (  # noqa: E402
     answer_relevancy,
@@ -15,6 +15,7 @@ from ragas.metrics import (  # noqa: E402
     faithfulness,
 )
 
+from app.core.config import settings  # noqa: E402
 from app.core.logging import get_logger  # noqa: E402
 from app.ingestion.embedder import get_embeddings  # noqa: E402
 from app.llm.models import get_chat_model  # noqa: E402
@@ -142,6 +143,21 @@ async def evaluate_batch(samples: list[RagasSample]) -> list[RagasMetrics]:
     # -------------------------------------------------------------------------
     # 步骤 2：线程池运行评估（同步转异步）
     # -------------------------------------------------------------------------
+    # 【超时与并发必须显式下传 —— 这是一次线上故障的修复】
+    # RAGAS 把「一道题 × 一个指标」当作一个作业，默认给每个作业套 180 秒墙钟超时
+    # （ragas/metrics/base.py 的 asyncio.wait_for）。超时的作业被直接丢弃、
+    # 该指标记成 NaN，最终被 _pick 清洗成 None，前端显示"—"。
+    # 线上实测：2 核小服务器上 faithfulness 与 context_precision（每道题裁判请求最多的
+    # 两项）100% 超时，而请求少的另外两项正常 —— 同一份代码在本地却全绿。
+    # 日志证据：ragas.executor | Exception raised in Job[N]: TimeoutError()
+    # 因此这里把四项参数从配置读出来显式传入，取值理由见 app/core/config.py。
+    run_config = RunConfig(
+        timeout=settings.ragas_timeout_seconds,        # 单作业最长耗时（默认 600 秒）
+        max_workers=settings.ragas_max_workers,        # 并发作业数（默认 4，避免触发限流）
+        max_retries=settings.ragas_max_retries,        # 单次调用重试次数（默认 3，快速失败）
+        max_wait=settings.ragas_max_wait_seconds,      # 重试退避间隔上限（默认 15 秒）
+    )
+
     try:
         # 【为什么用 asyncio.to_thread？】：
         # ragas.evaluate 是 CPU 密集 + 同步网络 I/O（内部会同步调用 OpenAI/Embedding 接口）。
@@ -155,6 +171,7 @@ async def evaluate_batch(samples: list[RagasSample]) -> list[RagasMetrics]:
             embeddings=get_embeddings(),  # 用于计算向量相似度的 Embedding 实例
             raise_exceptions=False,  # 【关键】：单条 case 评估报错时不中断整个批次，内部静默记为 NaN
             show_progress=False,  # 关闭 tqdm 进度条控制台输出，避免刷屏污染日志文件
+            run_config=run_config,  # 【关键】：覆盖默认的超时/并发/重试参数（见上方注释）
         )
     except Exception:
         # 【整批崩盘兜底】：
